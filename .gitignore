@@ -1,0 +1,32 @@
+# build outputs / environments
+build/
+dist/
+release/
+.venv*/
+__pycache__/
+*.pyc
+tools/linux_vendor/
+
+# compiled native libraries (built by tools/build_native.py / build_linux.sh)
+*.dll
+*.dll.lastgood
+*.dll.old
+*.so
+*.so.old
+*.exp
+*.lib
+*.o
+native_build.json
+
+# personal / local files
+_to_delete/
+_ssa_backup_*/
+*.seeds
+*.session
+!tests/*.session
+*_report*.txt
+corrupt_debug.txt
+gpu_bench_*.txt
+FeaturesToAddList.txt
+CRUNCHINESS_CHANGES.md
+drawing_presets.json
