@@ -30,3 +30,7 @@ gpu_bench_*.txt
 FeaturesToAddList.txt
 CRUNCHINESS_CHANGES.md
 drawing_presets.json
+
+# test binaries / backups
+*.exe
+*.bak*
