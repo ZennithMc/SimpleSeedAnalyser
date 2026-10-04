@@ -31,6 +31,8 @@ from .map_engine import CLIMATE, SCALES, TILE, MapEngine, octave_arrays
 
 MIN_BPP, MAX_BPP = 1 / 32, 1024.0      # blocks per screen pixel
 STRUCT_MAX_BPP = 48.0                  # structures hidden when zoomed out further
+BOX_MAX_BPP = 4.0                      # real footprints of the structures from this zoom
+PIECES_MAX_BPP = 2.0                   # stronghold pieces from this zoom (03/10)
 ARROW_UNIFORM = {"White": "#f2f2f2", "Black": "#111111", "Cyan": "#33e0ff", "Yellow": "#ffe14d"}
 
 
@@ -311,14 +313,24 @@ class MapView(QWidget):
         p.fillRect(self.rect(), QColor(theme.BG0))
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         self.engine.begin_frame()
-        self._paint_layer(p, noise=False)
-        if self.ov["noise"]:
+        # with a noise layer the NOISE is computed first (it used to wait for
+        # the biome tiles under it — beta tester, 28/09), and under an opaque
+        # one the biomes are not computed at all (only cached ones are drawn)
+        seed_view = self.engine.seed_view
+        noise_on = bool(self.ov["noise"]) and not seed_view
+        opaque = noise_on and self.ov["opacity"] >= 0.999
+        if seed_view:                     # structure-seed view: no biomes (Alt+S)
+            p.fillRect(self.rect(), QColor("#161c26" if not theme.IS_LIGHT else "#dfe3ea"))
+        else:
+            self._paint_layer(p, noise=False, fetch=not opaque, boost=-4 if noise_on else 0)
+        if noise_on:
             p.setOpacity(self.ov["opacity"])
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-            self._paint_layer(p, noise=True)
+            self._paint_layer(p, noise=True, boost=2)
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
             p.setOpacity(1.0)
         self.engine.end_frame()
+        self._paint_grid(p)
         self._paint_origin(p)
         self._paint_arrows(p)
         self._paint_structures(p)
@@ -327,6 +339,10 @@ class MapView(QWidget):
         self._paint_measures(p)
         self._paint_struct_legend(p)
         self._paint_scale_bar(p)
+        if getattr(self, "_pieces_shown", False):
+            self._paint_height_legend(p)
+        if seed_view:
+            self._paint_seed_view_tag(p)
         p.setClipping(False)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -353,7 +369,9 @@ class MapView(QWidget):
             return self.engine.noise_tile(spec, self.ov["palette"], s, tx, tz, prio, fetch)
         return self.engine.tile(s, tx, tz, prio, fetch)
 
-    def _paint_layer(self, p: QPainter, noise: bool):
+    def _paint_layer(self, p: QPainter, noise: bool, fetch=True, boost=0):
+        """fetch=False: draw what is cached, request nothing (biomes under an
+        opaque noise layer). boost: priority offset (noise before biomes)."""
         s = self._tile_scale()
         animating = self._anim.isActive()
         tiles, span = self._visible_tiles(s)
@@ -361,20 +379,25 @@ class MapView(QWidget):
             sx, sy = self.to_screen(tx * span, tz * span)
             size = span / self.bpp
             target = QRectF(sx, sy, size + 0.6, size + 0.6)       # +0.6: no seams
-            pm = self._get(noise, s, tx, tz, 10 if i < 4 else 6)
+            pm = self._get(noise, s, tx, tz, (10 if i < 4 else 6) + boost, fetch)
             if pm is not None:
                 p.drawPixmap(target, pm, QRectF(pm.rect()))
             else:
                 self._paint_fallback(p, noise, s, tx, tz, target)
-        if not animating:                                          # prefetch ring
+        if not animating and fetch:                                # prefetch ring
             ring, _ = self._visible_tiles(s, ring=1)
             seen = set(tiles)
             for (tx, tz) in ring:
                 if (tx, tz) not in seen:
-                    self._get(noise, s, tx, tz, 0)
+                    self._get(noise, s, tx, tz, max(0, boost))
 
     def _paint_fallback(self, p, noise, s, tx, tz, target):
         """Stretch a coarser cached tile (or finer ones) over a tile still generating."""
+        if not noise:                     # quick coarse version of this very tile
+            pm = self.engine.preview(s, tx, tz)
+            if pm is not None:
+                p.drawPixmap(target, pm, QRectF(pm.rect()))
+                return
         for s2 in SCALES:
             if s2 <= s:
                 continue
@@ -399,6 +422,75 @@ class MapView(QWidget):
                         w = target.width() / r
                         p.drawPixmap(QRectF(target.x() + dx * w, target.y() + dz * w, w + 0.6, w + 0.6),
                                      pm, QRectF(pm.rect()))
+
+    # ── coordinate grid (like cubiomes-viewer), 01/10 ─────────────────────────
+    GRID_STEPS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+                  65536, 131072, 262144, 524288, 1048576)
+
+    def grid_step(self):
+        """Spacing in blocks actually drawn, or None (grid off).
+        ov['grid_step'] 0 = Auto (lines ≥ ~64 px apart); a fixed step that would
+        be too dense when zoomed out is doubled until lines are ≥ 8 px apart."""
+        if not self.visible.get("__grid"):
+            return None
+        want = int(self.ov.get("grid_step", 0) or 0)
+        if want <= 0:
+            return next((g for g in self.GRID_STEPS if g / self.bpp >= 64), self.GRID_STEPS[-1])
+        g = want
+        while g / self.bpp < 8 and g < (1 << 26):
+            g *= 2
+        return g
+
+    def _paint_grid(self, p: QPainter):
+        g = self.grid_step()
+        if g is None:
+            return
+        x0, z0 = self.to_world(0, 0)
+        x1, z1 = self.to_world(self.width(), self.height())
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        minor = QPen(QColor(255, 255, 255, 46), 1)
+        major = QPen(QColor(255, 255, 255, 92), 1)        # every 8 lines (region at chunk step)
+        axis = QPen(QColor(255, 255, 255, 150), 1)
+        dark = QPen(QColor(0, 0, 0, 60), 1)               # under each line: readable on snow
+        big = g * 8
+        lab = g / self.bpp >= 56
+        xs, zs = [], []
+        k = math.floor(x0 / g)
+        while k * g <= x1:
+            wx = k * g
+            sx = round(self.to_screen(wx, 0)[0])
+            pen = axis if wx == 0 else (major if wx % big == 0 else minor)
+            p.setPen(dark); p.drawLine(sx + 1, 0, sx + 1, self.height())
+            p.setPen(pen); p.drawLine(sx, 0, sx, self.height())
+            xs.append((sx, wx)); k += 1
+        k = math.floor(z0 / g)
+        while k * g <= z1:
+            wz = k * g
+            sy = round(self.to_screen(0, wz)[1])
+            pen = axis if wz == 0 else (major if wz % big == 0 else minor)
+            p.setPen(dark); p.drawLine(0, sy + 1, self.width(), sy + 1)
+            p.setPen(pen); p.drawLine(0, sy, self.width(), sy)
+            zs.append((sy, wz)); k += 1
+        if lab:                                            # coordinates along the edges
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setFont(theme.mono_font(7))
+            fm = p.fontMetrics()
+            for sx, wx in xs:
+                t = f"{wx:,}".replace(",", " ")
+                self._halo_text(p, sx + 3, fm.ascent() + 3, t)
+            for sy, wz in zs:
+                t = f"{wz:,}".replace(",", " ")
+                self._halo_text(p, 3, sy - 3, t)
+        p.restore()
+
+    @staticmethod
+    def _halo_text(p, x, y, t):
+        p.setPen(QColor(0, 0, 0, 170))
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            p.drawText(QPointF(x + dx, y + dy), t)
+        p.setPen(QColor(255, 255, 255, 220))
+        p.drawText(QPointF(x, y), t)
 
     def _paint_origin(self, p: QPainter):
         if self.visible.get("__origin"):
@@ -432,17 +524,173 @@ class MapView(QWidget):
         if -h <= sx <= self.width() + h and -h <= sy <= self.height() + h:
             p.drawPixmap(int(sx - h), int(sy - h), pm)
 
+    def _draw_footprint(self, p: QPainter, key, x, z):
+        """Real size of a structure: solid = exact, dashed = approximate."""
+        from .struct_boxes import footprint
+        fp = footprint(key, x, z, self.world.seed)
+        if fp is None:
+            return
+        bx0, bz0, bx1, bz1, exact = fp
+        sx0, sy0 = self.to_screen(bx0, bz0)
+        sx1, sy1 = self.to_screen(bx1 + 1, bz1 + 1)
+        if sx1 < 0 or sy1 < 0 or sx0 > self.width() or sy0 > self.height():
+            return
+        col = QColor(255, 110, 60, 230 if exact else 170)
+        pen = QPen(col, 1.6 if exact else 1.2)
+        if not exact:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.setPen(pen)
+        fill = QColor(col); fill.setAlpha(28 if exact else 14)
+        p.setBrush(fill)
+        p.drawRect(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0))
+        p.restore()
+
+    def _draw_pieces(self, p: QPainter, pieces):
+        """Every piece of a stronghold (like cubiomes-viewer), coloured by its
+        height; the portal room stands out (green, thick outline)."""
+        from .struct_boxes import grad_rgb
+        import stronghold_eyes as se
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        ylo = min(q[4] for q in pieces); yhi = max(q[4] for q in pieces)
+        span = max(1, yhi - ylo)
+
+        def height_rgb(y):
+            return grad_rgb((y - ylo) / span)
+        # legend: the stronghold nearest to the centre
+        d = min(abs(q[0] - self.cx) + abs(q[2] - self.cz) for q in pieces)
+        if d < getattr(self, "_legend_d", 1e18):
+            self._legend_d = d
+            self._legend_range = (ylo, yhi)
+            pr = next((q for q in pieces if q[6] == se.PORTAL_ROOM), None)
+            self._legend_portal = (pr[4], pr[1] + 3) if pr else None
+        top_piece = max(pieces, key=lambda q: q[4])
+        portal = None
+        for pc in sorted(pieces, key=lambda q: q[4]):          # higher pieces on top
+            x0, y0, z0, x1, y1, z1, t = pc
+            if t == se.PORTAL_ROOM:
+                portal = pc
+                continue
+            sx0, sy0 = self.to_screen(x0, z0)
+            sx1, sy1 = self.to_screen(x1 + 1, z1 + 1)
+            r, g, b = height_rgb(y1)
+            p.setPen(QPen(QColor(r, g, b, 235), 1))
+            p.setBrush(QColor(r, g, b, 60))
+            p.drawRect(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0))
+        if portal is not None:
+            x0, y0, z0, x1, y1, z1, t = portal
+            sx0, sy0 = self.to_screen(x0, z0)
+            sx1, sy1 = self.to_screen(x1 + 1, z1 + 1)
+            rect = QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0)
+            p.setPen(QPen(QColor(255, 255, 255, 240), 3))
+            p.setBrush(QColor(63, 214, 160, 150))
+            p.drawRect(rect)
+            r, g, b = height_rgb(y1)
+            p.setPen(QPen(QColor(r, g, b), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(rect.adjusted(3, 3, -3, -3))
+        # labels: the portal room top (under the room) and the highest point of the
+        # stronghold (on its highest piece) — merged when they are the same piece
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        tx0, _, tz0, tx1, ty1, tz1, _t = top_piece
+        if portal is not None:
+            x0, y0, z0, x1, y1, z1, t = portal
+            same = top_piece is portal or y1 == ty1 and (tx0, tz0) == (x0, z0)
+            txt = f"Portal Y {y1}" + (" = max" if same else "")
+            self._chips.append((self._srect(x0, z0, x1, z1), txt, QColor(63, 214, 160)))
+        if portal is None or not (top_piece is portal):
+            r, g, b = height_rgb(ty1)
+            self._chips.append((self._srect(tx0, tz0, tx1, tz1), f"max Y {ty1}", QColor(r, g, b)))
+        p.restore()
+
+    def _srect(self, x0, z0, x1, z1):
+        sx0, sy0 = self.to_screen(x0, z0)
+        sx1, sy1 = self.to_screen(x1 + 1, z1 + 1)
+        return QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0)
+
+    def _chip(self, p: QPainter, room: QRectF, text, col):
+        """A small rounded label inside the room (just above it while the room is
+        still too small on screen to hold it)."""
+        f = QFont(theme.ui_font(7)); f.setBold(True); p.setFont(f)
+        w = p.fontMetrics().horizontalAdvance(text) + 10
+        cx, cy = room.center().x(), room.center().y()
+        if w > room.width() + 6 or room.height() < 18:
+            cy = room.top() - 10
+        r = QRectF(cx - w / 2, cy - 8, w, 16)
+        if r.right() < 0 or r.left() > self.width() or r.bottom() < 0 or r.top() > self.height():
+            return
+        bg = QColor(16, 20, 28, 225)
+        p.setPen(QPen(col, 1.4)); p.setBrush(bg)
+        p.drawRoundedRect(r, 8, 8)
+        p.setPen(col.lighter(125))
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _paint_height_legend(self, p: QPainter):
+        """Height colours of the stronghold pieces (bottom left): from the lowest
+        to the highest piece top of the stronghold nearest the centre."""
+        from .struct_boxes import grad_rgb
+        from PySide6.QtGui import QLinearGradient
+        lo, hi = getattr(self, "_legend_range", (0, 1))
+        portal = getattr(self, "_legend_portal", None)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w, h = 230.0, 10.0
+        x, y = 14.0, self.height() - 80.0
+        bg = QColor(theme.BG1 or "#1b1f27"); bg.setAlpha(225)
+        p.setPen(QPen(QColor(theme.LINE2), 1)); p.setBrush(bg)
+        p.drawRoundedRect(QRectF(x - 8, y - 20, w + 16, 82), 8, 8)
+        g = QLinearGradient(x, 0, x + w, 0)
+        for k in range(11):
+            g.setColorAt(k / 10, QColor(*grad_rgb(k / 10)))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(g)
+        p.drawRoundedRect(QRectF(x, y, w, h), 3, 3)
+        f = QFont(theme.ui_font(7.5)); p.setFont(f)
+        p.setPen(QColor(theme.TEXT2 or theme.TEXT))
+        p.drawText(QPointF(x, y - 6), "Stronghold pieces: top Y, lowest → highest")
+        p.drawText(QRectF(x, y + h + 1, 60, 12), Qt.AlignmentFlag.AlignLeft, f"Y {lo}")
+        p.drawText(QRectF(x + w - 60, y + h + 1, 60, 12), Qt.AlignmentFlag.AlignRight, f"Y {hi}")
+        # the two heights that matter (stronghold nearest the centre)
+        fb = QFont(theme.ui_font(8.5)); fb.setBold(True); p.setFont(fb)
+        p.setPen(QColor(*grad_rgb(1.0)))
+        p.drawText(QPointF(x, y + h + 30), f"▲ Stronghold max Y {hi}")
+        if portal is not None:
+            p.setPen(QColor(63, 214, 160))
+            p.drawText(QPointF(x, y + h + 46),
+                       f"▣ Portal room top Y {portal[0]}   ·   frames Y {portal[1]}")
+        p.restore()
+
+    def _paint_seed_view_tag(self, p: QPainter):
+        """'Structure seed' chip (top left) while biomes are ignored."""
+        from PySide6.QtGui import QFont
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        f = QFont(theme.ui_font(9)); f.setBold(True); p.setFont(f)
+        txt = "Structure seed · potential positions, biomes ignored   Alt+S"
+        w = p.fontMetrics().horizontalAdvance(txt) + 22
+        r = QRectF((self.width() - w) / 2, 10, w, 26)      # top centre (buttons on the left)
+        bg = QColor(theme.BG1 or "#1b1f27"); bg.setAlpha(235)
+        p.setPen(QPen(QColor(theme.ACCENT), 1.2)); p.setBrush(bg)
+        p.drawRoundedRect(r, 13, 13)
+        p.setPen(QColor(theme.TEXT))
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, txt)
+        p.restore()
+
     def _paint_structures(self, p: QPainter):
         x0, z0 = self.to_world(0, 0)
         x1, z1 = self.to_world(self.width(), self.height())
         counts = self._struct_counts = {}
+        self._chips = []                      # stronghold labels, drawn over the icons
+        self._pieces_shown = False
+        self._legend_d = 1e18
         if self.bpp <= STRUCT_MAX_BPP:
             B = self.engine.STRUCT_BLOCK
             fetch = not self._anim.isActive()
-            show_z = self.visible.get("zombie_village", True)
+            # abandoned villages follow the Village switch (no switch of their
+            # own, 01/10); they keep their own icon
+            show_z = bool(self.visible.get("village"))
             for key, on in self.visible.items():
-                if key == "village":
-                    on = on or show_z               # abandoned villages come from the same list
                 if not on or key.startswith("__") or key not in cw.STRUCTURE_TYPES:
                     continue
                 if not self.world.structure_available(key):
@@ -451,6 +699,7 @@ class MapView(QWidget):
                     for bx in range(math.floor(x0 / B), math.floor(x1 / B) + 1):
                         pts = self.engine.structures(key, bx, bz, fetch) or ()
                         zset = self.engine.abandoned(bx, bz) if key == "village" and pts else ()
+                        bset = self.engine.with_basement(bx, bz) if key == "igloo" and pts else ()
                         for (x, z) in pts:
                             k = key
                             if zset and (x, z) in zset:
@@ -459,20 +708,38 @@ class MapView(QWidget):
                                     continue
                             elif key == "village" and not self.visible.get("village"):
                                 continue
+                            elif bset and (x, z) in bset:
+                                k = "igloo_basement"
                             if x0 <= x <= x1 and z0 <= z <= z1:
                                 counts[k] = counts.get(k, 0) + 1
+                            if self.bpp <= BOX_MAX_BPP:
+                                self._draw_footprint(p, key, x, z)
                             self._draw_icon(p, k, x, z)
         lm = self.engine.landmarks
+        if self.engine.seed_view:         # spawn / strongholds depend on biomes
+            return
         if self.visible.get("__strongholds"):
             info = lm.get("sh_info", {})
             show_eyes = self.bpp <= 64
+            pieces_on = self.bpp <= PIECES_MAX_BPP
             for (x, z) in lm.get("strongholds", ()):
                 if x0 <= x <= x1 and z0 <= z <= z1:
                     counts["stronghold"] = counts.get("stronghold", 0) + 1
+                if pieces_on and x0 - 200 <= x <= x1 + 200 and z0 - 200 <= z <= z1 + 200:
+                    pcs = self.engine.stronghold_pieces(x, z, not self._anim.isActive())
+                    if pcs:
+                        self._draw_pieces(p, pcs)
+                        self._pieces_shown = True
                 self._draw_icon(p, "stronghold", x, z)
                 ei = info.get((x, z))
                 if show_eyes and ei is not None:
                     self._draw_eye_badge(p, x, z, int(ei[0]))
+        if self._chips:
+            p.save()
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            for (rect, txt, col) in self._chips:
+                self._chip(p, rect, txt, col)
+            p.restore()
         if self.visible.get("__spawn") and lm.get("spawn"):
             self._draw_icon(p, "spawn", *lm["spawn"])
 
@@ -866,14 +1133,21 @@ class MapView(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         bg = QColor(theme.BG1); bg.setAlpha(225)
         p.setBrush(bg)
-        p.drawRoundedRect(QRectF(x - 10, y - 22, w + 20, 32), 6, 6)
+        p.setFont(theme.ui_font(8))
+        label = f"{blocks:,.0f} blocks".replace(",", " ") if blocks >= 1 else f"{blocks:g} block"
+        g = self.grid_step()
+        if g is not None:                                  # the grid spacing in use
+            label += "  ·  grid " + {16: "chunk", 512: "region"}.get(g, f"{g:,}".replace(",", " "))
+        tw = p.fontMetrics().horizontalAdvance(label) + 16
+        bw = max(w + 20, tw)                               # the box fits the text too
+        bx = min(x - 10, self.width() - self.right_inset - 8 - bw)
+        p.drawRoundedRect(QRectF(bx, y - 22, bw, 32), 6, 6)
+        x = bx + (bw - w) / 2
         p.setPen(QPen(QColor(theme.TEXT), 2))
         p.drawLine(QPointF(x, y), QPointF(x + w, y))
         p.drawLine(QPointF(x, y - 4), QPointF(x, y + 2))
         p.drawLine(QPointF(x + w, y - 4), QPointF(x + w, y + 2))
-        p.setFont(theme.ui_font(8))
-        label = f"{blocks:,.0f} blocks".replace(",", " ") if blocks >= 1 else f"{blocks:g} block"
-        p.drawText(QRectF(x - 10, y - 20, w + 20, 14), Qt.AlignmentFlag.AlignCenter, label)
+        p.drawText(QRectF(bx, y - 20, bw, 14), Qt.AlignmentFlag.AlignCenter, label)
 
     # ── structure legend (what the icons on screen are) ─────────────────────
     def legend_on(self):
@@ -901,13 +1175,12 @@ class MapView(QWidget):
                 continue
             rows.append((key, struct_icons.label(key),
                          None if zoomed_out else self._struct_counts.get(key, 0)))
-            if key == "village" and self.visible.get("zombie_village", True):
+            if key == "village":
                 rows.append(("zombie_village", struct_icons.label("zombie_village"),
                              None if zoomed_out else self._struct_counts.get("zombie_village", 0)))
-        if (self.visible.get("zombie_village", True) and not self.visible.get("village")
-                and self.world.structure_available("village")):
-            rows.append(("zombie_village", struct_icons.label("zombie_village"),
-                         None if zoomed_out else self._struct_counts.get("zombie_village", 0)))
+            if key == "igloo":
+                rows.append(("igloo_basement", struct_icons.label("igloo_basement"),
+                             None if zoomed_out else self._struct_counts.get("igloo_basement", 0)))
         return rows, zoomed_out
 
     def _paint_struct_legend(self, p: QPainter):
@@ -1389,6 +1662,11 @@ class MapView(QWidget):
             self.center_on(0, 0)
         elif k == Qt.Key.Key_G and e.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.goto_dialog()
+        elif (k in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down)
+              and getattr(self, "arrow_handler", None) is not None):
+            # a page can take the arrows (Sessions: ↑ / ↓ = previous / next
+            # result, ← / → nothing — moving the map was useless there, 01/10)
+            self.arrow_handler(k)
         else:
             step = 90 * self.bpp
             moves = {Qt.Key.Key_Left: (-step, 0), Qt.Key.Key_Right: (step, 0),

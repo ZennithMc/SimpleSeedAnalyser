@@ -34,6 +34,7 @@ SPEC = {
     "jungle_temple":    ("Jungle temple",     "#3f8f3a"),
     "swamp_hut":        ("Swamp hut",         "#7e6a45"),
     "igloo":            ("Igloo",             "#bfe2f3"),
+    "igloo_basement":   ("Igloo with basement", "#bfe2f3"),
     "monument":         ("Ocean monument",    "#1f9aa6"),
     "mansion":          ("Woodland mansion",  "#5b3a22"),
     "ruined_portal":    ("Ruined portal",     "#7a3fe0"),
@@ -167,6 +168,18 @@ def _glyph(k: str, p: QPainter, ink: QColor, bg: QColor):
         path = QPainterPath(); path.moveTo(4.5, 17.5); path.arcTo(QRectF(4.5, 7, 15, 21), 180, -180)
         path.closeSubpath(); p.drawPath(path)
         cut(lambda: p.drawPie(QRectF(9.6, 12.4, 4.8, 10), 0, 180 * 16))
+    elif k == "igloo_basement":                      # the igloo, a ladder, a small basement
+        path = QPainterPath(); path.moveTo(4.8, 13.6); path.arcTo(QRectF(4.8, 3.4, 14.4, 20.4), 180, -180)
+        path.closeSubpath(); p.drawPath(path)
+        cut(lambda: p.drawPie(QRectF(10.0, 9.0, 4.0, 9.2), 0, 180 * 16))
+        p.setBrush(QColor("#9a6a3a"))                # the basement, narrower than the dome
+        p.drawRect(QRectF(8.3, 16.6, 7.4, 3.0))
+        p.setBrush(QColor("#5a3a1e"))
+        p.drawRect(QRectF(9.4, 17.4, 1.5, 1.5)); p.drawRect(QRectF(13.1, 17.4, 1.5, 1.5))
+        lad = QPen(QColor("#7a5530"), 0.8); p.setPen(lad); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(QPointF(11.3, 13.6), QPointF(11.3, 16.6)); p.drawLine(QPointF(12.7, 13.6), QPointF(12.7, 16.6))
+        p.drawLine(QPointF(11.3, 15.1), QPointF(12.7, 15.1))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(fill)
     elif k == "monument":                            # underwater temple + waves
         p.drawRect(QRectF(5, 11, 14, 4))
         p.drawPolygon(_poly((7, 11), (12, 6.2), (17, 11)))

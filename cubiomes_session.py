@@ -236,6 +236,21 @@ _PARA_TO_NAME = {
 
 # ── Public API ───────────────────────────────────────────────────────
 
+
+# SSA's own lines (#SSAState / #SSA / #SSAx) are written behind « #Desc: »,
+# the only header (with #Time / #Title) cubiomes-viewer skips: a bare #SSAState
+# line made cubiomes-viewer 4.1.2 refuse the file (« Failed to parse line 14 »,
+# 01/10). Older SSA files without the prefix are read too.
+SSA_LINE_PREFIX = "#Desc: "
+
+
+def ssa_line(ln: str) -> str:
+    """The line with the « #Desc: » wrapper of an SSA line removed."""
+    if ln.startswith(SSA_LINE_PREFIX + "#SSA"):
+        return ln[len(SSA_LINE_PREFIX):]
+    return ln
+
+
 def parse_session_file(path: str) -> Dict:
     """Parse a complete .session file and return a dict with keys:
 
@@ -268,6 +283,7 @@ def parse_session_file(path: str) -> Dict:
     # Collect entries in file order: each entry is either ("hex", hex_str) or ("ssa", dict)
     cond_entries = []
     for ln in lines:
+        ln = ssa_line(ln)
         if ln.startswith("#"):
             # Metadata
             if ln.startswith("#MC:"):
@@ -377,7 +393,7 @@ def parse_conditions_from_text(text: str) -> Dict:
     import json as _json
     cond_entries = []
     for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        ln = ln.strip()
+        ln = ssa_line(ln.strip())
         if not ln:
             continue
         if ln.startswith("#Cond:"):
@@ -662,8 +678,10 @@ def _parse_condition_hex(hex_str: str):
         # C engine interprets as no constraint.
         INT_MIN_32 = -2147483648
         INT_MAX_32 =  2147483647
-        y_min_eff = float(ymin_raw) if ymin_raw > INT_MIN_32 else -1e30
-        y_max_eff = float(ymax_raw) if ymax_raw < INT_MAX_32 else  1e30
+        # no bound → the world limits (-64 / 320): same test, and values the
+        # editor can show (±1e30 made it fail to open, 01/10)
+        y_min_eff = int(max(-64, min(320, ymin_raw))) if ymin_raw > INT_MIN_32 else -64
+        y_max_eff = int(max(-64, min(320, ymax_raw))) if ymax_raw < INT_MAX_32 else 320
         in_range = bool(flags & 0x0020)   # FLG_IN_RANGE
         cond["params"] = {
             "y_min":  y_min_eff,

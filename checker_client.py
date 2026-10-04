@@ -23,19 +23,17 @@ _CHECKER_DIR = None
 
 
 def _default_checker_dir():
-    here = os.path.dirname(os.path.abspath(__file__))
-    # SSA lives in .../SimpleSeedAnalyser/SimpleSeedAnalyser ; the checker in
-    # .../SimpleSeedAnalyser/Sources to relie on/seed-checker-1.16.1/seed-checker-1.16.1
-    return os.path.normpath(os.path.join(
-        here, "..", "Sources to relie on",
-        "seed-checker-1.16.1", "seed-checker-1.16.1"))
+    # « Sources to relie on/seed-checker-1.16.1/seed-checker-1.16.1 », next to
+    # SSA or in one of its parent folders
+    return _default_checker_dir_for_mc(19)
 
 
 def _cfg_path():
     # user settings folder (next to the code it could not be written in an
     # installed app); the old location is still read if present
     old = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checker_path.txt")
-    d = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "SimpleSeedAnalyser")
+    import ssa_paths
+    d = ssa_paths.data_dir()
     new = os.path.join(d, "checker_path.txt")
     if not os.path.isfile(new) and os.path.isfile(old):
         return old
@@ -48,9 +46,17 @@ def _cfg_path():
 
 def _default_checker_dir_for_mc(mc):
     """The seed-checker project matching the MC version: 1.16.1 for 1.13-1.17
-    (mc <= 21), 1.18.1 for 1.18+ (mc >= 22)."""
+    (mc <= 21), 1.18.1 for 1.18+ (mc >= 22). « Sources to relie on » is looked
+    for next to SSA and in its parent folders (02/10: SSA is often nested one
+    level deeper than this used to assume, and the checker was never found)."""
     here = os.path.dirname(os.path.abspath(__file__))
     sub = "seed-checker-1.18.1" if mc >= 22 else "seed-checker-1.16.1"
+    d = here
+    for _ in range(5):
+        c = os.path.join(d, "Sources to relie on", sub, sub)
+        if os.path.isdir(c):
+            return os.path.normpath(c)
+        d = os.path.dirname(d)
     return os.path.normpath(os.path.join(here, "..", "Sources to relie on", sub, sub))
 
 

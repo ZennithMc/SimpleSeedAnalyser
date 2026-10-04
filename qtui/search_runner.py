@@ -21,6 +21,13 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 MODE_LABEL = {0: "Incremental", 1: "48-bit family", 2: "48-bit family"}
 FAMILY = 65536                     # seeds per 48-bit family
+# Safety: a too-broad session (e.g. one easy condition) finds millions of seeds;
+# every one is kept in memory, shown in the table and saved in the autosave →
+# the app got slow and crashed (beta tester, 28/09). The search PAUSES at this
+# many results unless the stop rule itself is a result count; the user can
+# continue with a 10× higher limit, up to SAFETY_MAX.
+SAFETY_FIRST = 100_000
+SAFETY_MAX = 10_000_000
 M48 = (1 << 48) - 1
 U64 = 1 << 64
 EFF = {0: "inc", 1: "fam48", 2: "blocks"}   # engine's effective mode codes
@@ -58,6 +65,7 @@ class SearchRunner(QObject):
         self._buf = []
         self._seen = set()
         self.found = 0
+        self.safety_limit = SAFETY_FIRST
         self._timer = QTimer(self, interval=80, timeout=self._pump)
         self._rate = []                    # (t, done) samples for the speed
         self.can_pause = True
@@ -94,6 +102,7 @@ class SearchRunner(QObject):
         if not _resume:
             self._seen.clear()
             self.found = 0
+            self.safety_limit = SAFETY_FIRST
             self.base_start = int(start)
             self._elapsed_before = 0.0
             self._done_before = 0
@@ -116,6 +125,10 @@ class SearchRunner(QObject):
         self._err = None
         self._done_flag = False
         self._limit_hit = False
+        self._safety_hit = False
+        self._overflow = []
+        while self.found >= self.safety_limit and self.safety_limit < SAFETY_MAX:
+            self.safety_limit *= 10                 # resumed past the limit (restored session)
         self._last = (0, 0)
         self._rate = []
         self._engine_modes = []
@@ -135,6 +148,19 @@ class SearchRunner(QObject):
             self.auto_paused = reason
             self._set_state("pausing")
             self._stop.set()
+
+    def _safety(self):
+        """Result count at which the search pauses by itself (safety)."""
+        if self.rule[0] == "results" and self.rule[1] > 0:
+            return max(self.rule[1], SAFETY_MAX)        # an explicit result count wins
+        return self.safety_limit
+
+    def raise_safety(self):
+        """×10 (up to SAFETY_MAX). Returns the new limit, or None if at the max."""
+        if self.safety_limit >= SAFETY_MAX:
+            return None
+        self.safety_limit = min(SAFETY_MAX, self.safety_limit * 10)
+        return self.safety_limit
 
     def limit_reached(self, rule=None):
         """Is the (new) limit already reached by what was done before?"""
@@ -242,11 +268,25 @@ class SearchRunner(QObject):
             with self._lock:
                 if key in self._seen:
                     return
+                target = self.rule[1] if (self.rule[0] == "results" and self.rule[1] > 0) \
+                    else self._safety()
+                if self.found >= target:
+                    # the engine takes a moment to stop (seeds in flight on every
+                    # thread): a limit of 5 gave 625 results, 2 000 gave 174 000.
+                    # Keep the extra matches aside; at the pause, those BEFORE
+                    # the resume point are added (they would never be found
+                    # again), the others are found again after Resume.
+                    self._overflow.append((key, s, details or ""))
+                    return
                 self._seen.add(key)
                 self._buf.append((s, details or ""))
                 self.found += 1
                 if self.rule[0] == "results" and self.rule[1] > 0 and self.found >= self.rule[1]:
                     self._limit_hit = True
+                    self._stop.set()
+                elif self.found >= self._safety():
+                    self._limit_hit = True
+                    self._safety_hit = True
                     self._stop.set()
 
         def on_progress(done, total):
@@ -293,11 +333,17 @@ class SearchRunner(QObject):
                 p["job"](self._run_start, self._run_count, p["threads"], self._stop,
                          on_match, on_progress, on_mode)
             else:
+                # result limit / safety cap applied inside the C engine (p96):
+                # it stops right after that many NEW matches instead of running
+                # a whole ring buffer ahead of the Python drain
+                target = self.rule[1] if (self.rule[0] == "results" and self.rule[1] > 0) \
+                    else self._safety()
+                cap = max(1, target - self.found) + self._refind_count()
                 cs.evaluate_session(run_conds, self._run_start, self._run_count, p["mc"],
                                     p["threads"], self._stop, on_match, on_progress,
                                     search_mode=p["engine_mode"], on_mode=on_mode,
                                     seed_list=p["seed_list"], on_resume=on_resume,
-                                    on_profile=on_profile)
+                                    on_profile=on_profile, max_found=cap)
         except Exception as e:                                 # reported, never swallowed
             import traceback
             traceback.print_exc()
@@ -390,12 +436,20 @@ class SearchRunner(QObject):
         now = time.perf_counter()
         elapsed = self._elapsed_before + (now - self._t0)
         done_all = self._done_before + done
-        self._rate.append((now, done_all))
-        while len(self._rate) > 2 and now - self._rate[0][0] > 3.0:
+        # speed (03/10): the engines report in blocks — a slow search moves its
+        # count every few seconds only, and the old 3 s window then showed 0 /s
+        # most of the time. Points are kept when the count CHANGES; the speed is
+        # measured from the oldest kept point (≥ 5 s back when possible) to now.
+        if not self._rate:                    # (reset after a GPU calibration too)
+            self._rate.append((now, done_all))
+        if done_all != self._rate[-1][1]:
+            self._rate.append((now, done_all))
+        while len(self._rate) > 2 and now - self._rate[1][0] > 5.0:
             self._rate.pop(0)
         sps = 0.0
-        if len(self._rate) >= 2 and self._rate[-1][0] > self._rate[0][0]:
-            sps = (self._rate[-1][1] - self._rate[0][1]) / (self._rate[-1][0] - self._rate[0][0])
+        t0r, d0r = self._rate[0]
+        if now > t0r and done_all > d0r:
+            sps = (done_all - d0r) / (now - t0r)
         # the engine reports families in 48-bit family mode: converted to seeds
         # above (26/09: the part before a pause was in seeds, the live part in
         # families -> mixed units after a resume); across pauses the earlier
@@ -422,6 +476,13 @@ class SearchRunner(QObject):
                     self._set_state("pausing")
                 else:
                     self._set_state("stopping")
+        if getattr(self, "_safety_hit", False) and self.state == "running":
+            self._limit_hit = False
+            if self.can_pause:
+                self.auto_paused = "safety"
+                self._set_state("pausing")
+            else:
+                self._set_state("stopping")
         self.progress.emit(dict(done=done_all, total=total_all, frac=frac, sps=sps, eta=eta,
                                 found=self.found, elapsed=elapsed, unit=unit))
         if self._done_flag:
@@ -435,7 +496,7 @@ class SearchRunner(QObject):
             return base
         if base is None or len(base[0]) != len(live[0]):
             return live
-        rows = [[a[0] + b[0], a[1] + b[1], a[2] + b[2]] for a, b in zip(base[0], live[0])]
+        rows = [[x + y for x, y in zip(a, b)] for a, b in zip(base[0], live[0])]
         return rows, base[1] + live[1]
 
     def _unit_mult(self):
@@ -471,6 +532,7 @@ class SearchRunner(QObject):
         eff = self._eff_now() or self.params.get("engine_mode") or self.params["mode"]
         if eff in ("inc", "blocks"):
             self.eff_mode = eff
+        self._merge_overflow(eff)
         if self.resume_point is not None and self.params["seed_list"] is None:
             # exact count: everything before the resume point is fully searched
             # (re-tested seeds after a pause are not counted twice). Offsets are
@@ -492,7 +554,8 @@ class SearchRunner(QObject):
             return
         if self.state == "pausing" or (getattr(self, "_limit_hit", False) and self.can_pause):
             self._limit_hit = False
-            why = {"time": "time limit reached", "results": "result limit reached"}.get(
+            why = {"time": "time limit reached", "results": "result limit reached",
+                   "safety": f"safety limit reached (over {self._safety():,} results)".replace(",", " ")}.get(
                 self.auto_paused, "paused")
             if self.resume_point is not None and self.can_pause:
                 self._set_state("paused")
@@ -507,6 +570,56 @@ class SearchRunner(QObject):
         else:
             self._set_state("done")
             self.message.emit(f"Done  ·  {summ}")
+
+    def _refind_count(self) -> int:
+        """Matches already shown that this run will find AGAIN (a resumed run
+        re-tests the chunks that were in progress): the engine's own match cap
+        must leave room for them."""
+        if not self._seen:
+            return 0
+        rs, b = int(self._run_start), int(getattr(self, "base_start", self._run_start))
+        if self.params.get("engine_mode", "inc") == "inc":
+            lim = (rs - b) % U64
+            again = lambda sd: (sd - b) % U64 >= lim
+        else:
+            m = 1 << 48
+            lim = (rs - (b & M48)) % m
+            again = lambda sd: ((sd & M48) - (b & M48)) % m >= lim
+        n = 0
+        with self._lock:
+            for key in self._seen:
+                sd = key[0] if isinstance(key, tuple) else key
+                if again(int(sd)):
+                    n += 1
+        return n
+
+    def _merge_overflow(self, eff):
+        """Matches that arrived after the result limit (see on_match): keep the
+        ones the resumed search would not find again."""
+        with self._lock:
+            extra, self._overflow = self._overflow, []
+        if not extra or self.resume_point is None or not self.can_pause:
+            return                              # stopped: the limit is what was asked
+        rp, b = int(self.resume_point), int(self.base_start)
+        if eff == "inc":
+            lim = (rp - b) % U64
+            before = lambda sd: (sd - b) % U64 < lim
+        elif eff in ("fam48", "blocks"):
+            m = 1 << 48
+            lim = (rp - (b & M48)) % m
+            before = lambda sd: ((sd & M48) - (b & M48)) % m < lim
+        else:
+            before = lambda sd: True            # unknown order: never lose a result
+        batch = []
+        with self._lock:
+            for key, sd, det in extra:
+                if key in self._seen or not before(sd):
+                    continue
+                self._seen.add(key)
+                self.found += 1
+                batch.append((sd, det))
+        if batch:
+            self.resultsReady.emit(batch)
 
     def _set_state(self, st):
         self.state = st

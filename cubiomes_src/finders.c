@@ -1477,6 +1477,91 @@ static const uint64_t g_monument_biomes1 =
     (1ULL << warm_ocean) |
     (1ULL << deep_warm_ocean);
 
+/* SSA (p92): the biome checks of isViableStructurePos in the 1.18+
+ * overworld only need to know whether the biome is one of a few. With
+ * sampleBiomeNoisePruned the climate is computed cheapest first and the check
+ * fails as soon as none of those biomes is possible (exact, see biomenoise.h).
+ * variant: 0 = isViableFeatureBiome(stype), 1..5 = 1.18 village type
+ * (plains, desert, savanna, taiga, snowy plains), 6 = deep ocean. */
+static const BiomePrune *g_vprune[64][FEATURE_NUM][7];
+static signed char g_vprune_st[64][FEATURE_NUM][7];
+static volatile int g_vprune_lock;
+
+static const BiomePrune *viablePrune(int mc, int stype, int variant)
+{
+    if (mc < MC_1_18 || mc >= 64 || stype < 0 || stype >= FEATURE_NUM ||
+        variant < 0 || variant > 6)
+        return NULL;
+    signed char st = __atomic_load_n(&g_vprune_st[mc][stype][variant], __ATOMIC_ACQUIRE);
+    if (st)
+        return st > 0 ? g_vprune[mc][stype][variant] : NULL;
+    while (__atomic_exchange_n(&g_vprune_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    if (!g_vprune_st[mc][stype][variant])
+    {
+        static const int vv[] = { plains, desert, savanna, taiga, snowy_tundra };
+        int ids[BPRUNE_MAX], n = 0, ok = 1, i;
+        if (variant >= 1 && variant <= 5)
+        {
+            ids[n++] = vv[variant-1];
+            if (vv[variant-1] == plains)
+                ids[n++] = meadow;
+        }
+        else if (variant == 6)
+        {
+            const int deep[] = { deep_ocean, deep_warm_ocean, deep_lukewarm_ocean,
+                                 deep_cold_ocean, deep_frozen_ocean };
+            for (i = 0; i < 5; i++)
+                ids[n++] = deep[i];
+        }
+        else
+        {
+            for (i = 0; i < 256 && ok; i++)
+            {
+                if (!isOverworld(mc, i) || !isViableFeatureBiome(mc, stype, i))
+                    continue;
+                if (n == BPRUNE_MAX)
+                    ok = 0;
+                else
+                    ids[n++] = i;
+            }
+        }
+        BiomePrune *bp = (BiomePrune*) malloc(sizeof(BiomePrune));
+        if (bp && ok && n > 0 && setupBiomePrune(bp, mc, ids, n))
+        {
+            g_vprune[mc][stype][variant] = bp;
+            __atomic_store_n(&g_vprune_st[mc][stype][variant], 1, __ATOMIC_RELEASE);
+        }
+        else
+        {
+            free(bp);
+            __atomic_store_n(&g_vprune_st[mc][stype][variant], -1, __ATOMIC_RELEASE);
+        }
+    }
+    __atomic_store_n(&g_vprune_lock, 0, __ATOMIC_RELEASE);
+    st = g_vprune_st[mc][stype][variant];
+    return st > 0 ? g_vprune[mc][stype][variant] : NULL;
+}
+
+/* getBiomeAt(g, scale, x, y, z) for scale 0 or 4 in the 1.18+ overworld, or
+ * -1 (none) when the biome is proven not to be one of the viable ones */
+static int viableBiomeAt(Generator *g, int stype, int variant, int scale,
+    int x, int y, int z)
+{
+    if (g->mc >= MC_1_18 && g->dim == DIM_OVERWORLD && g->bn.nptype == -1 &&
+        (scale == 0 || scale == 4))
+    {
+        const BiomePrune *bp = viablePrune(g->mc, stype, variant);
+        if (bp)
+        {
+            int id = sampleBiomeNoisePruned(&g->bn, x, y, z, NULL, SAMPLE_SSA_SCATTERED, bp,
+                (1u << bp->n) - 1);
+            return id == -2 ? none : id;
+        }
+    }
+    return getBiomeAt(g, scale, x, y, z);
+}
+
 int isViableStructurePos(int structureType, Generator *g, int x, int z, uint32_t flags)
 {
     int approx = 0; // enables approximation levels
@@ -1601,7 +1686,7 @@ L_feature:
             sampleX = chunkX * 4 + 2;
             sampleZ = chunkZ * 4 + 2;
         }
-        id = getBiomeAt(g, 0, sampleX, 319>>2, sampleZ);
+        id = viableBiomeAt(g, structureType, 0, 0, sampleX, 319>>2, sampleZ);
         if (id < 0 || !isViableFeatureBiome(g->mc, structureType, id))
             goto L_not_viable;
         goto L_viable;
@@ -1620,7 +1705,7 @@ L_feature:
             sampleX = x >> 2;
             sampleZ = z >> 2;
         }
-        id = getBiomeAt(g, 0, sampleX, 319>>2, sampleZ);
+        id = viableBiomeAt(g, structureType, 0, 0, sampleX, 319>>2, sampleZ);
         if (id < 0 || !isViableFeatureBiome(g->mc, structureType, id))
             goto L_not_viable;
         goto L_viable;
@@ -1671,7 +1756,7 @@ L_feature:
                 sampleX = (chunkX*32 + 2*sv.x + sv.sx-1) / 2 >> 2;
                 sampleZ = (chunkZ*32 + 2*sv.z + sv.sz-1) / 2 >> 2;
                 sampleY = 319 >> 2;
-                id = getBiomeAt(g, 0, sampleX, sampleY, sampleZ);
+                id = viableBiomeAt(g, Village, (int)i + 1, 0, sampleX, sampleY, sampleZ);
                 if (id == vv[i] || (id == meadow && vv[i] == plains)) {
                     viable = vv[i];
                     goto L_viable;
@@ -1739,7 +1824,7 @@ L_feature:
             sampleX = chunkX * 16 + 9;
             sampleZ = chunkZ * 16 + 9;
         }
-        id = getBiomeAt(g, 0, sampleX, 319>>2, sampleZ);
+        id = viableBiomeAt(g, structureType, 0, 0, sampleX, 319>>2, sampleZ);
         if (id < 0 || !isViableFeatureBiome(g->mc, structureType, id))
             goto L_not_viable;
         goto L_viable;
@@ -1771,7 +1856,7 @@ L_feature:
         }
         else if (g->mc >= MC_1_18)
         {   // check is done at y level of ocean floor - approx. with y = 36
-            id = getBiomeAt(g, 4, sampleX>>2, 36>>2, sampleZ>>2);
+            id = viableBiomeAt(g, Monument, 6, 4, sampleX>>2, 36>>2, sampleZ>>2);
             if (!isDeepOcean(id))
                 goto L_not_viable;
         }
@@ -1799,7 +1884,7 @@ L_feature:
             // TODO: get surface height
             sampleX = chunkX * 16 + 7;
             sampleZ = chunkZ * 16 + 7;
-            id = getBiomeAt(g, 4, sampleX>>2, 319>>2, sampleZ>>2);
+            id = viableBiomeAt(g, structureType, 0, 4, sampleX>>2, 319>>2, sampleZ>>2);
             if (id < 0 || !isViableFeatureBiome(g->mc, structureType, id))
                 goto L_not_viable;
         }
@@ -1829,7 +1914,7 @@ L_jigsaw:
             sampleX = (chunkX*32 + 2*sv.x + sv.sx - 1) / 2 >> 2;
             sampleZ = (chunkZ*32 + 2*sv.z + sv.sz - 1) / 2 >> 2;
             sampleY = sv.y >> 2;
-            id = getBiomeAt(g, 4, sampleX, sampleY, sampleZ);
+            id = viableBiomeAt(g, structureType, 0, 4, sampleX, sampleY, sampleZ);
         }
         if (id < 0 || !isViableFeatureBiome(g->mc, structureType, id))
             goto L_not_viable;
@@ -5099,6 +5184,65 @@ void genPotential(uint64_t *mL, uint64_t *mM, int layerId, int mc, uint32_t flag
 }
 
 
+/* SSA (p93): the gradient descents of getParaRange sample the same cells
+ * again and again (measured: 56 % of the samples on climate lines). The value
+ * of a cell is a pure function of its coordinates, so it is remembered for
+ * the duration of one getParaRange call: same values, same order of the
+ * callbacks, same result -- only the repeated noise evaluations are skipped. */
+#define PR_MEMO_BITS 14
+typedef struct { uint64_t key; double v; uint32_t gen; } PrMemoEnt;
+static __thread PrMemoEnt *pr_memo;
+static __thread uint32_t pr_gen, pr_fill;
+static __thread const DoublePerlinNoise *pr_para;
+
+static void pr_begin(const DoublePerlinNoise *para)
+{
+    if (!pr_memo)
+        pr_memo = (PrMemoEnt*) calloc(1u << PR_MEMO_BITS, sizeof(PrMemoEnt));
+    if (!pr_memo)
+        return;
+    if (++pr_gen == 0)
+    {   // generation counter wrapped: clear the table
+        memset(pr_memo, 0, (1u << PR_MEMO_BITS) * sizeof(PrMemoEnt));
+        pr_gen = 1;
+    }
+    pr_fill = 0;
+    pr_para = para;
+}
+
+static void pr_end(void)
+{
+    pr_para = NULL;
+}
+
+static inline double pr_sample(const DoublePerlinNoise *para, int x, int z)
+{
+    if (para != pr_para)
+        return sampleDoublePerlin(para, x, 0, z);
+    const uint32_t mask = (1u << PR_MEMO_BITS) - 1;
+    uint64_t key = ((uint64_t)(uint32_t)x << 32) | (uint32_t)z;
+    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> (64 - PR_MEMO_BITS));
+    for (;;)
+    {
+        PrMemoEnt *e = &pr_memo[h];
+        if (e->gen != pr_gen)
+        {
+            double v = sampleDoublePerlin(para, x, 0, z);
+            if (pr_fill < (1u << PR_MEMO_BITS) / 2)
+            {
+                e->gen = pr_gen;
+                e->key = key;
+                e->v = v;
+                pr_fill++;
+            }
+            return v;
+        }
+        if (e->key == key)
+            return e->v;
+        h = (h + 1) & mask;
+    }
+}
+
 double getParaDescent(const DoublePerlinNoise *para, double factor,
     int x, int z, int w, int h, int i0, int j0, int maxrad,
     int maxiter, double alpha, void *data, int (*func)(void*,int,int,double))
@@ -5123,7 +5267,7 @@ double getParaDescent(const DoublePerlinNoise *para, double factor,
     int dirx = 0, dirz = 0, dira;
     int k, i, j;
     double v, vd, va;
-    v = factor * sampleDoublePerlin(para, x+i0, 0, z+j0);
+    v = factor * pr_sample(para, x+i0, z+j0);
     if (func)
     {
         if (func(data, x+i0, z+j0, factor < 0 ? -v : v))
@@ -5135,13 +5279,13 @@ double getParaDescent(const DoublePerlinNoise *para, double factor,
     {
         if (dirx == 0) dirx = +1;
         if (i+dirx >= 0 && i+dirx < w)
-            vd = factor * sampleDoublePerlin(para, x+i+dirx, 0, z+j);
+            vd = factor * pr_sample(para, x+i+dirx, z+j);
         else vd = v;
         if (vd >= v)
         {
             dirx *= -1;
             if (i+dirx >= 0 && i+dirx < w)
-                vd = factor * sampleDoublePerlin(para, x+i+dirx, 0, z+j);
+                vd = factor * pr_sample(para, x+i+dirx, z+j);
             else vd = v;
             if (vd >= v)
                 dirx = 0;
@@ -5151,7 +5295,7 @@ double getParaDescent(const DoublePerlinNoise *para, double factor,
             dira = (int)(dirx * alpha * (v - vd));
             if (abs(dira) > 2 && i+dira >= 0 && i+dira < w)
             {   // try jumping by more than 1
-                va = factor * sampleDoublePerlin(para, x+i+dira, 0, z+j);
+                va = factor * pr_sample(para, x+i+dira, z+j);
                 if (va < vd)
                 {
                     i += dira;
@@ -5171,13 +5315,13 @@ double getParaDescent(const DoublePerlinNoise *para, double factor,
 
         if (dirz == 0) dirz = +1;
         if (j+dirz >= 0 && j+dirz < h)
-            vd = factor * sampleDoublePerlin(para, x+i, 0, z+j+dirz);
+            vd = factor * pr_sample(para, x+i, z+j+dirz);
         else vd = v;
         if (vd >= v)
         {
             dirz *= -1;
             if (j+dirz >= 0 && j+dirz < h)
-                vd = factor * sampleDoublePerlin(para, x+i, 0, z+j+dirz);
+                vd = factor * pr_sample(para, x+i, z+j+dirz);
             else vd = v;
             if (vd >= v)
                 dirz = 0;
@@ -5187,7 +5331,7 @@ double getParaDescent(const DoublePerlinNoise *para, double factor,
             dira = (int)(dirz * alpha * (v - vd));
             if (abs(dira) > 2 && j+dira >= 0 && j+dira < h)
             {   // try jumping by more than 1
-                va = factor * sampleDoublePerlin(para, x+i, 0, z+j+dira);
+                va = factor * pr_sample(para, x+i, z+j+dira);
                 if (va < vd)
                 {
                     j += dira;
@@ -5214,7 +5358,7 @@ double getParaDescent(const DoublePerlinNoise *para, double factor,
                 dirz = (c & 2) ? -1 : +1;
                 if (i+dirx < 0 || i+dirx >= w || j+dirz < 0 || j+dirz >= h)
                     continue;
-                vd = factor * sampleDoublePerlin(para, x+i+dirx, 0, z+j+dirz);
+                vd = factor * pr_sample(para, x+i+dirx, z+j+dirz);
                 if (vd < v)
                 {
                     v = vd;
@@ -5280,6 +5424,7 @@ int getParaRange(const DoublePerlinNoise *para, double *pmin, double *pmax,
         return 0;
     }
 
+    pr_begin(para);   // SSA (p93): memo of the samples of this call
     // Start with the largest noise period to get some bounds for pmin, pmax
     step = (int) (0.5 / lmin - FLT_EPSILON) + 1;
 
@@ -5351,7 +5496,7 @@ int getParaRange(const DoublePerlinNoise *para, double *pmin, double *pmax,
                 i = ii * step; if (i >= w) i = w-1;
                 if (skip[jj*ww+ii]) continue;
 
-                v = factor * sampleDoublePerlin(para, x+i, 0, z+j);
+                v = factor * pr_sample(para, x+i, z+j);
                 if (func)
                 {
                     int e = func(data, x+i, z+j, v);
@@ -5399,7 +5544,7 @@ int getParaRange(const DoublePerlinNoise *para, double *pmin, double *pmax,
                 i = ii * step; if (i >= w) i = w-1;
                 if (skip[jj*ww+ii]) continue;
 
-                v = -factor * sampleDoublePerlin(para, x+i, 0, z+j);
+                v = -factor * pr_sample(para, x+i, z+j);
                 if (func)
                 {
                     int e = func(data, x+i, z+j, -v);
@@ -5435,6 +5580,7 @@ int getParaRange(const DoublePerlinNoise *para, double *pmin, double *pmax,
 
     err = 0;
 L_end:
+    pr_end();
     if (skip)
         free(skip);
     return err;

@@ -238,13 +238,27 @@ int genBiomes(const Generator *g, int *cache, Range r)
 int getBiomeAt(const Generator *g, int scale, int x, int y, int z)
 {
     Range r = {scale, x, z, 1, 1, y, 1};
-    int *ids = allocCache(g, r);
+    // SSA (p92): small caches on the stack instead of calloc/free per call
+    // (same zero-filled buffer, same result)
+    int buf[512];
+    size_t len = getMinCacheSize(g, r.scale, r.sx, r.sy, r.sz);
+    int *ids;
+    if (len > 0 && len <= sizeof(buf) / sizeof(*buf))
+    {
+        ids = buf;
+        memset(ids, 0, len * sizeof(int));
+    }
+    else
+    {
+        ids = allocCache(g, r);
+    }
     int id = genBiomes(g, ids, r);
     if (id == 0)
         id = ids[0];
     else
         id = none;
-    free(ids);
+    if (ids != buf)
+        free(ids);
     return id;
 }
 

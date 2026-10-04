@@ -27,7 +27,7 @@ from PySide6.QtCore import (QAbstractListModel, QModelIndex, QObject, QRectF, QS
                             QTimer, Signal)
 from PySide6.QtGui import (QColor, QFont, QGuiApplication, QIcon, QImage, QKeySequence, QPainter,
                            QPixmap, QShortcut)
-from .widgets import user_path, remember_path
+from .widgets import AdaptiveButton, user_path, remember_path
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QCompleter,
                                QFileDialog, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListView, QMenu, QMessageBox, QProgressBar, QPushButton,
@@ -657,9 +657,19 @@ class DrawPage(QWidget):
         sw = QWidget(); sl = QHBoxLayout(sw); sl.setContentsMargins(0, 0, 0, 0); sl.setSpacing(2)
         sl.addWidget(self.start_seed)
         dice = QToolButton(); icons.bind(dice, "dice", 16); dice.setToolTip("Random start")
-        dice.clicked.connect(lambda: self.start_seed.setText(str(random_seed())))
         sl.addWidget(dice)
-        labeled("Start", sw)
+        # « Drawing / Saved » start, the Saved one shared with Sessions and Stronghold (03/10)
+        from .start_source import StartSource
+        self.start_src = StartSource("draw", self.start_seed, ("Drawing", "Saved"), (
+            "Drawing start: the start of this drawing — opening a drawing sets it.",
+            "Saved start: the same start as the Sessions and Stronghold pages, kept\n"
+            "between launches. Opening a drawing never changes it, and when a search\n"
+            "started from it stops, it moves on to the last seed searched — the next\n"
+            "search (on any page) continues from there."), self)
+        dice.clicked.connect(lambda: (self.start_seed.setText(str(random_seed())),
+                                      self.start_src.edited(self.start_seed.text())))
+        self.start_src.bind_dice(dice)
+        row.addLayout(self.start_src.layout(sw, "First seed of the search."))
         self.threads = QSpinBox(); self.threads.setRange(1, max(1, os.cpu_count() or 4))
         self.threads.setValue(max(1, (os.cpu_count() or 4) - 1))
         labeled("Threads", self.threads)
@@ -680,11 +690,11 @@ class DrawPage(QWidget):
         labeled("Stop after", rw, "A seeds limit ends the search; a results or time limit pauses it "
                                   "(Resume continues exactly where it stopped).")
         row.addStretch(1)
-        self.b_start = QPushButton("  Start"); self.b_start.setProperty("kind", "primary")
+        self.b_start = AdaptiveButton("  Start"); self.b_start.setProperty("kind", "primary")
         icons.bind(self.b_start, "play", 16, "#ffffff", "#ffffff"); self.b_start.clicked.connect(self._start_clicked)
-        self.b_pause = QPushButton("  Pause"); icons.bind(self.b_pause, "pause", 16)
+        self.b_pause = AdaptiveButton("  Pause"); icons.bind(self.b_pause, "pause", 16)
         self.b_pause.clicked.connect(self.pause)
-        self.b_stop = QPushButton("  Stop"); icons.bind(self.b_stop, "stop", 16)
+        self.b_stop = AdaptiveButton("  Stop"); icons.bind(self.b_stop, "stop", 16)
         self.b_stop.setProperty("kind", "danger"); self.b_stop.clicked.connect(self.stop)
         for b in (self.b_start, self.b_pause, self.b_stop):
             row.addWidget(b, 0, Qt.AlignmentFlag.AlignBottom)
@@ -1185,6 +1195,7 @@ class DrawPage(QWidget):
             self.results.set_rows([])
             self.sinfo = dict(sig=_sig_hash(self.model), mc=spec.mc, large=spec.large, start=start,
                               done=0, elapsed=0.0, tested=0, passed=0)
+            self.start_src.search_started()
         s = self.sinfo
         try:
             eng = de.DrawEngine(spec, min_score=p["min_score"], top_k=p["top_k"])
@@ -1309,8 +1320,17 @@ class DrawPage(QWidget):
                                                          if self.state == "paused" else ""))
 
     def _run_state(self, st):
+        prev = self.state
         self.state = st
         running = st in ("running", "pausing")
+        if prev in ("running", "pausing") and st in ("done", "stopped", "paused") \
+                and self.sinfo is not None:
+            # a search from the Saved start moves it on (paused: the field keeps
+            # the paused search's start, the Saved value already moves on)
+            v = (int(self.sinfo["start"]) + int(self.sinfo["done"])) % (1 << 64)
+            v = v - (1 << 64) if v >= 1 << 63 else v
+            self.start_src.search_ended(v, move_field=(st != "paused"))
+        self.start_src.set_enabled(not running)
         can_resume = self._resumable()
         self.b_start.setEnabled(not running)
         self.b_start.setText("  Resume" if can_resume else "  Start")
@@ -1372,7 +1392,7 @@ class DrawPage(QWidget):
         if ui.get("top_k"):
             self.top_k.setValue(int(ui["top_k"]))
         if ui.get("start") is not None:
-            self.start_seed.setText(str(ui["start"]))
+            self.start_src.set_other(ui["start"])        # never replaces the Saved start
         if ui.get("map_pct") is not None:
             self.op_slider.setValue(int(ui["map_pct"]))
         for c in reversed(ui.get("recent") or []):
@@ -1397,7 +1417,8 @@ class DrawPage(QWidget):
         st = (s or {}).get("state") or "idle"
         self._run_state(st if s else "idle")
         self._sync_canvas_controls()
-        QTimer.singleShot(0, self.fit)
+        if not getattr(self, "_no_fit", False):     # (startup: the saved map view wins)
+            QTimer.singleShot(0, self.fit)
 
     def _halt_for_io(self):
         """A running search is paused (and waited for) before the drawing is
@@ -1536,7 +1557,11 @@ class DrawPage(QWidget):
         try:
             d = read_json(p)
             path = d.get("path")
-            self.load_dict(d, path if path and os.path.exists(path) else None)
+            self._no_fit = True                  # the map keeps the view saved at close
+            try:
+                self.load_dict(d, path if path and os.path.exists(path) else None)
+            finally:
+                self._no_fit = False
             self.model.dirty = bool(d.get("dirty", False))
         except Exception:
             self.model.new(48, 48, 64)

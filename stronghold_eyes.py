@@ -84,7 +84,9 @@ class JavaRandom:
         while True:
             u = self.next(31)
             r = u % bound
-            if u - r + m >= 0:
+            # Java: `u - r + m < 0` in 32-bit int arithmetic -> the sum can
+            # overflow, and then the draw is REJECTED (03/10: was never rejected)
+            if u - r + m < (1 << 31):
                 return r
 
     def nextLong(self) -> int:
@@ -1516,6 +1518,91 @@ def _use_old_filler(mc_version: int) -> bool:
     return mc_version <= 20
 
 
+def sh_count(scan) -> int:
+    """How many strongholds per seed a search looks at (03/10): False / 0 / 1 =
+    the first one, 3 = the first ring (the 3 nearest), True / 128 = all 128.
+    `scan_128` arguments everywhere accept these values."""
+    if scan is True:
+        return 128
+    if not scan:
+        return 1
+    n = int(scan)
+    return 1 if n <= 1 else 3 if n <= 3 else 128
+
+
+def strongholds_arr(cdll, ctx, mc, seeds, count):
+    """The first `count` strongholds of each seed (numpy int64 array), flattened:
+    (fseed uint64, fx int32, fz int32). Native cb_strongholds_n_arr, or the
+    128 one cut to `count` per seed with an older library."""
+    import ctypes as C
+    import numpy as np
+    n = int(len(seeds))
+    count = sh_count(count)
+    has_n = hasattr(cdll, "cb_strongholds_n_arr")
+    per = count if has_n else 128
+    cap = n * per
+    fs = np.zeros(cap, np.uint64)
+    fx = np.zeros(cap, np.int32)
+    fz = np.zeros(cap, np.int32)
+    args = (fs.ctypes.data_as(C.POINTER(C.c_uint64)), fx.ctypes.data_as(C.POINTER(C.c_int32)),
+            fz.ctypes.data_as(C.POINTER(C.c_int32)), cap)
+    sp = seeds.ctypes.data_as(C.POINTER(C.c_int64))
+    if has_n:
+        k = int(cdll.cb_strongholds_n_arr(ctx, int(mc), sp, n, int(count), *args))
+    else:
+        k = int(cdll.cb_strongholds128_arr(ctx, int(mc), sp, n, *args))
+    k = min(k, cap)
+    fs, fx, fz = fs[:k], fx[:k], fz[:k]
+    if not has_n and count < 128 and k:
+        idx = np.arange(k)
+        start = np.where(np.r_[True, fs[1:] != fs[:-1]], idx, 0)
+        rank = idx - np.maximum.accumulate(start)
+        keep = rank < count
+        fs, fx, fz = fs[keep], fx[keep], fz[keep]
+    return fs, fx, fz
+
+
+class RoomY(int):
+    """A Top Y threshold for the top of the PORTAL ROOM (not of the whole
+    stronghold): an int everywhere, its type carries the choice to the worker
+    processes (pickled as RoomY). 03/10."""
+    __slots__ = ()
+
+    def __repr__(self):
+        return f"RoomY({int(self)})"
+
+
+TOPY_ROOM = 256                                  # flag in the native `inflate`
+
+
+def topy_what(min_max_y) -> int:
+    """1 = the threshold is for the portal room top, 0 = the stronghold top."""
+    return 1 if isinstance(min_max_y, RoomY) else 0
+
+
+def _inflate_arg(mc_version: int, min_max_y=None) -> int:
+    """`inflate` for the native topY (gaider_layouts / topy_gpu), with the
+    portal-room flag when the threshold is a RoomY."""
+    return _inflate_for_mc(mc_version) | (TOPY_ROOM if topy_what(min_max_y) else 0)
+
+
+def native_room_ok() -> bool:
+    """gaider_layouts knows the portal-room flag (rebuilt since 03/10)."""
+    try:
+        import gaider_layouts as _gl
+        _gl._load()
+        return _gl._LIB is not None and hasattr(_gl._LIB, "gaider_topy_room")
+    except Exception:
+        return False
+
+
+def topy_of(info, min_max_y):
+    """The Top Y a result shows: the stronghold top or the portal room top."""
+    if info is None:
+        return None
+    return info["room_top_y"] if topy_what(min_max_y) else info["highest_y"]
+
+
 def _inflate_for_mc(mc_version: int) -> int:
     """1.17.x UNIQUEMENT : NoiseAffectingStructureStart gonfle la bounding box
     de 12 avant moveBelowSeaLevel -> strongholds +12 blocs. Ne en 1.17,
@@ -1552,6 +1639,7 @@ def get_stronghold_portal_full(world_seed: int, bx: int, bz: int,
         "frame_y":   pr.bbox.minY + 3 + n6,
         "lowest_y":  gMinY + n6,
         "highest_y": gMaxY + n6,
+        "room_top_y": pr.bbox.maxY + n6,          # top of the portal room (03/10)
         "offset":    n6,
     }
 
@@ -1581,7 +1669,7 @@ def get_end_portal_frames(world_seed: int, bx: int, bz: int,
 
 
 def get_stronghold_eyes_and_maxy(world_seed: int, bx: int, bz: int,
-                                 mc_version: int = 28):
+                                 mc_version: int = 28, what: int = 0):
     """Retourne (eyes, highest_y) en UNE seule generation full-BFS.
     highest_y = point le plus haut du donjon apres moveBelowSeaLevel (= ce que
     get_stronghold_portal_full appelle "highest_y"). Perf : 1 generation par
@@ -1600,6 +1688,8 @@ def get_stronghold_eyes_and_maxy(world_seed: int, bx: int, bz: int,
                                _inflate_for_mc(mc_version))
     gMaxY = max(p.bbox.maxY for p in gen.pieces)
     eyes = sum(_eyes_per_frame(int(world_seed), gen, mc_version))
+    if what:                                    # top of the portal room (03/10)
+        return eyes, gen.portal_room_piece.bbox.maxY + n6
     return eyes, gMaxY + n6
 
 
@@ -2128,7 +2218,7 @@ def _validate_one(seed, min_eyes, callback, mc_version, min_max_y=None):
         _maxy = None
         if min_max_y is not None:
             _info = get_stronghold_portal_full(seed, bx, bz, mc_version)
-            _maxy = _info["highest_y"] if _info is not None else None
+            _maxy = topy_of(_info, min_max_y)
             if _maxy is None or _maxy < min_max_y:
                 return
         callback(seed, eyes, bx, bz, _maxy)
@@ -2156,7 +2246,7 @@ def _validate_group(seeds, min_eyes, mc_version, min_max_y=None):
             _maxy = None
             if min_max_y is not None:
                 _info = get_stronghold_portal_full(seed, bx, bz, mc_version)
-                _maxy = _info["highest_y"] if _info is not None else None
+                _maxy = topy_of(_info, min_max_y)
                 if _maxy is None or _maxy < min_max_y:
                     continue
             matches.append((seed, eyes, bx, bz, _maxy))
@@ -2197,7 +2287,7 @@ def _seed_list_eye_worker(args):
                 bx, bz = shs[0]
             else:
                 bx, bz = get_first_stronghold_pos(seed)
-            eyes, maxy = get_stronghold_eyes_and_maxy(seed, bx, bz, mc)
+            eyes, maxy = get_stronghold_eyes_and_maxy(seed, bx, bz, mc, what=topy_what(min_max_y))
         except Exception:
             continue
         if eyes < min_eyes:
@@ -2253,6 +2343,12 @@ def _sl_native_init():
                 C.POINTER(C.c_uint64), C.POINTER(C.c_int32), C.POINTER(C.c_int32),
                 C.c_int]
             cdll.cb_strongholds128_arr.restype = C.c_int
+        if hasattr(cdll, "cb_strongholds_n_arr"):       # first N per seed (03/10)
+            cdll.cb_strongholds_n_arr.argtypes = [
+                C.c_void_p, C.c_int, C.POINTER(C.c_int64), C.c_int, C.c_int,
+                C.POINTER(C.c_uint64), C.POINTER(C.c_int32), C.POINTER(C.c_int32),
+                C.c_int]
+            cdll.cb_strongholds_n_arr.restype = C.c_int
         ctx = cdll.cb_create()
         _SL_NATIVE = (cdll, ctx, glib)
     except Exception:
@@ -2295,7 +2391,7 @@ def _seed_list_maxy_native_worker(args):
         cxs.ctypes.data_as(C.POINTER(C.c_int32)),
         czs.ctypes.data_as(C.POINTER(C.c_int32)),
         1 if _use_old_filler(mc) else 0, sea, 10, miny,
-        _inflate_for_mc(mc), thr,
+        _inflate_arg(mc, min_max_y), thr,
         out_s.ctypes.data_as(C.POINTER(C.c_int64)),
         out_y.ctypes.data_as(C.POINTER(C.c_int32))))
     pos = {int(seeds[i]): (int(bx[i]), int(bz[i])) for i in range(n)}
@@ -2304,7 +2400,7 @@ def _seed_list_maxy_native_worker(args):
         s = int(out_s[k])
         sbx, sbz = pos[s]
         # exact eyes on the (few) survivors only
-        eyes, _maxy = get_stronghold_eyes_and_maxy(s, sbx, sbz, mc)
+        eyes, _maxy = get_stronghold_eyes_and_maxy(s, sbx, sbz, mc, what=topy_what(min_max_y))
         if eyes < min_eyes:
             continue
         out.append((s, eyes, sbx, sbz, int(out_y[k])))
@@ -2359,7 +2455,7 @@ def _seed_list_eye_native_worker(args):
         s = int(out_s[k])
         sbx, sbz = pos[s]
         # exact eyes (+ maxy) on the candidates only
-        eyes, maxy = get_stronghold_eyes_and_maxy(s, sbx, sbz, mc)
+        eyes, maxy = get_stronghold_eyes_and_maxy(s, sbx, sbz, mc, what=topy_what(min_max_y))
         if eyes < min_eyes:
             continue
         out.append((s, eyes, sbx, sbz, maxy))
@@ -2368,7 +2464,8 @@ def _seed_list_eye_native_worker(args):
 
 def _seed_list_128_python(args):
     """Pure-Python fallback for the all-128 seedlist scan (correct, slow)."""
-    sublist, min_eyes, min_max_y, mc = args
+    sublist, min_eyes, min_max_y, mc = args[:4]
+    count = sh_count(args[4]) if len(args) > 4 else 128
     try:
         import cubiomes_wrap as _cw
         clib = _cw.make_worker_lib()
@@ -2379,12 +2476,12 @@ def _seed_list_128_python(args):
         seed = int(seed)
         try:
             clib.setup_and_seed(mc, seed)
-            shs = clib.find_strongholds(max_count=128)
+            shs = clib.find_strongholds(max_count=count)
         except Exception:
             continue
         for (bx, bz) in shs:
             try:
-                eyes, maxy = get_stronghold_eyes_and_maxy(seed, bx, bz, mc)
+                eyes, maxy = get_stronghold_eyes_and_maxy(seed, bx, bz, mc, what=topy_what(min_max_y))
             except Exception:
                 continue
             if eyes < min_eyes:
@@ -2410,26 +2507,16 @@ def _seed_list_128_worker(args):
     import cubiomes_wrap as _cw_l; _cw_l.apply_large_ctx(cdll, ctx)   # large biomes world
     if not hasattr(cdll, "cb_strongholds128_arr"):
         return _seed_list_128_python(args)
-    sublist, min_eyes, min_max_y, mc = args
+    sublist, min_eyes, min_max_y, mc = args[:4]
+    count = args[4] if len(args) > 4 else 128      # 3 = the first ring (03/10)
     seeds = np.asarray(sublist, dtype=np.int64)
     n = int(len(seeds))
     if n == 0:
         return []
-    CAP = n * 128
-    fseed = np.zeros(CAP, dtype=np.uint64)
-    fx = np.zeros(CAP, dtype=np.int32)
-    fz = np.zeros(CAP, dtype=np.int32)
-    k = int(cdll.cb_strongholds128_arr(
-        ctx, int(mc), seeds.ctypes.data_as(C.POINTER(C.c_int64)), n,
-        fseed.ctypes.data_as(C.POINTER(C.c_uint64)),
-        fx.ctypes.data_as(C.POINTER(C.c_int32)),
-        fz.ctypes.data_as(C.POINTER(C.c_int32)), CAP))
-    k = min(k, CAP)
+    fseed, fx, fz = strongholds_arr(cdll, ctx, mc, seeds, count)
+    k = int(len(fseed))
     if k == 0:
         return []
-    fseed = fseed[:k]
-    fx = fx[:k]
-    fz = fz[:k]
     fcx = (fx >> 4).astype(np.int32)
     fcz = (fz >> 4).astype(np.int32)
     fss = fseed.astype(np.int64)            # uint64 -> signed int64 (reinterpret)
@@ -2442,7 +2529,7 @@ def _seed_list_128_worker(args):
             fcx.ctypes.data_as(C.POINTER(C.c_int32)),
             fcz.ctypes.data_as(C.POINTER(C.c_int32)),
             1 if _use_old_filler(mc) else 0, sea, 10, miny,
-            _inflate_for_mc(mc), -1_000_000,
+            _inflate_arg(mc, min_max_y), -1_000_000,
             out_s.ctypes.data_as(C.POINTER(C.c_int64)),
             out_y.ctypes.data_as(C.POINTER(C.c_int32)))
         passing = np.nonzero(out_y >= int(min_max_y))[0]
@@ -2461,7 +2548,7 @@ def _seed_list_128_worker(args):
     out = []
     for i in passing.tolist():
         s = int(fss[i]); sbx = int(fx[i]); sbz = int(fz[i])
-        eyes, maxy = get_stronghold_eyes_and_maxy(s, sbx, sbz, mc)
+        eyes, maxy = get_stronghold_eyes_and_maxy(s, sbx, sbz, mc, what=topy_what(min_max_y))
         if eyes < min_eyes:
             continue
         if min_max_y is not None and (maxy is None or maxy < min_max_y):
@@ -2491,7 +2578,7 @@ def _eyes_128_from_positions_worker(args):
         for i in range(k):
             s = int(fss[i]); bx = int(fx[i]); bz = int(fz[i])
             try:
-                eyes, maxy = get_stronghold_eyes_and_maxy(s, bx, bz, mc)
+                eyes, maxy = get_stronghold_eyes_and_maxy(s, bx, bz, mc, what=topy_what(min_max_y))
             except Exception:
                 continue
             if eyes < min_eyes:
@@ -2517,7 +2604,7 @@ def _eyes_128_from_positions_worker(args):
             fcx.ctypes.data_as(C.POINTER(C.c_int32)),
             fcz.ctypes.data_as(C.POINTER(C.c_int32)),
             1 if _use_old_filler(mc) else 0, sea, 10, miny,
-            _inflate_for_mc(mc), -1_000_000,
+            _inflate_arg(mc, min_max_y), -1_000_000,
             out_s.ctypes.data_as(C.POINTER(C.c_int64)),
             out_y.ctypes.data_as(C.POINTER(C.c_int32)))
         passing = np.nonzero(out_y >= int(min_max_y))[0]
@@ -2536,7 +2623,7 @@ def _eyes_128_from_positions_worker(args):
     out = []
     for i in passing.tolist():
         s = int(fss[i]); bx = int(fx[i]); bz = int(fz[i])
-        eyes, maxy = get_stronghold_eyes_and_maxy(s, bx, bz, mc)
+        eyes, maxy = get_stronghold_eyes_and_maxy(s, bx, bz, mc, what=topy_what(min_max_y))
         if eyes < min_eyes:
             continue
         if min_max_y is not None and (maxy is None or maxy < min_max_y):
@@ -2555,7 +2642,7 @@ def _exact_eyes_worker(args):
     for i in range(len(fss)):
         s = int(fss[i]); bx = int(fx[i]); bz = int(fz[i])
         try:
-            eyes, maxy = get_stronghold_eyes_and_maxy(s, bx, bz, mc)
+            eyes, maxy = get_stronghold_eyes_and_maxy(s, bx, bz, mc, what=topy_what(min_max_y))
         except Exception:
             continue
         if eyes < min_eyes:
@@ -2659,17 +2746,8 @@ def _seed_list_positions_worker(args):
     cdll, ctx, glib = nat
     import cubiomes_wrap as _cw_l; _cw_l.apply_large_ctx(cdll, ctx)   # large biomes world
     if scan_128 and hasattr(cdll, "cb_strongholds128_arr"):
-        CAP = n * 128
-        fs = np.zeros(CAP, np.uint64)
-        fx = np.zeros(CAP, np.int32)
-        fz = np.zeros(CAP, np.int32)
-        k = int(cdll.cb_strongholds128_arr(
-            ctx, int(mc), seeds.ctypes.data_as(C.POINTER(C.c_int64)), n,
-            fs.ctypes.data_as(C.POINTER(C.c_uint64)),
-            fx.ctypes.data_as(C.POINTER(C.c_int32)),
-            fz.ctypes.data_as(C.POINTER(C.c_int32)), CAP))
-        k = min(k, CAP)
-        return (n, fs[:k].astype(np.int64), fx[:k].copy(), fz[:k].copy())
+        fs, fx, fz = strongholds_arr(cdll, ctx, mc, seeds, scan_128)
+        return (n, fs.astype(np.int64), fx.copy(), fz.copy())
     if not hasattr(cdll, "seedlist_first_stronghold"):
         return empty
     fx = np.zeros(n, np.int32)
@@ -2754,7 +2832,7 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
                              use_crunch_prefilter=False,
                              crunch_threshold=0.035, min_max_y=None,
                              seed_list=None, scan_128=False, exact_eyes=False,
-                             ignore_eyes=None):
+                             ignore_eyes=None, chunk_callback=None):
     """
     Itère sur [seed_start, seed_start+seed_count) et appelle
     callback(seed, eyes, bx, bz) pour chaque seed avec >= min_eyes.
@@ -2848,7 +2926,7 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
         # 128 EXACT stronghold positions per seed (the CPU bottleneck = biome snap);
         # eye-count + exact validation run in parallel CPU workers. Replaces the old
         # positions-bound 128-GPU (which gave ~0 speedup vs CPU). 100% accurate.
-        if scan_128 and use_gpu:
+        if scan_128 and use_gpu and sh_count(scan_128) == 128:   # (the GPU snaps all 128)
             try:
                 import biome_gpu as _bg
                 if _bg.available() and _bg.supported_version(mc_version):
@@ -2875,6 +2953,8 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
             buf = list(islice(src, CS))
             if not buf:
                 raise StopIteration
+            if worker_fn is _seed_list_128_worker:      # + how many strongholds (03/10)
+                return (buf, min_eyes, min_max_y, mc_version, sh_count(scan_128))
             return (buf, min_eyes, min_max_y, mc_version)
 
         done = 0
@@ -3054,6 +3134,8 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
     done = 0
     pool = None
     args_gen = _args_iter()
+    if chunk_callback is not None:            # this path reports its blocks (resume)
+        chunk_callback(seed_start, 0)
     try:
         # Création du pool. Sur Windows (spawn), chaque worker importera
         # `search_worker` qui ne dépend que de `stronghold_eyes` → rapide.
@@ -3091,6 +3173,8 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
                     i_start, i_end, results = fut.result()
                     for item in results:
                         callback(*item)
+                    if chunk_callback is not None:   # fully checked block (resume, 03/10)
+                        chunk_callback(seed_start + i_start, i_end - i_start)
                     done += (i_end - i_start)
                     if progress_callback:
                         progress_callback(done, total)
@@ -3131,6 +3215,8 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
                 (seed_start, i, end, min_eyes, mc_version, fast_mode, min_max_y))
             for item in results:
                 callback(*item)
+            if chunk_callback is not None:
+                chunk_callback(seed_start + i, end - i)
             if progress_callback:
                 progress_callback(end, total)
             i = end
@@ -3154,4 +3240,41 @@ def eyes_maxy_batch(seed, mc, positions):
             out[(int(x), int(z))] = get_stronghold_eyes_and_maxy(int(seed), int(x), int(z), int(mc))
         except Exception:
             pass
+    return out
+
+
+PIECE_NAMES = {STRAIGHT: "Corridor", PRISON_HALL: "Prison", LEFT_TURN: "Left turn",
+               RIGHT_TURN: "Right turn", ROOM_CROSSING: "Room crossing",
+               STRAIGHT_STAIRS_DOWN: "Stairs", STAIRS_DOWN: "Spiral stairs",
+               FIVE_CROSSING: "Five-way crossing", CHEST_CORRIDOR: "Chest corridor",
+               LIBRARY: "Library", PORTAL_ROOM: "Portal room",
+               FILLER_CORRIDOR: "Filler corridor"}
+
+
+def stronghold_pieces(world_seed: int, bx: int, bz: int, mc_version: int = 28):
+    """Every piece of the stronghold at its FINAL place (after moveBelowSeaLevel),
+    for the map (03/10): [(x0, y0, z0, x1, y1, z1, type), …] with the portal room
+    flagged by its type (PORTAL_ROOM). Same full generation as the Top Y."""
+    cx, cz = int(bx) >> 4, int(bz) >> 4
+    gen, rng = _generate_full_bfs(int(world_seed), cx, cz,
+                                  pre118=_use_old_filler(mc_version))
+    if gen.portal_room_piece is None:
+        return []
+    sea, miny = _sea_min_for_mc(mc_version)
+    n6 = _move_below_sea_level(gen, rng, sea, miny, 10, _inflate_for_mc(mc_version))
+    out = []
+    for p in gen.pieces:
+        b = p.bbox
+        out.append((b.minX, b.minY + n6, b.minZ, b.maxX, b.maxY + n6, b.maxZ, int(p.type)))
+    return out
+
+
+def stronghold_pieces_batch(seed, mc, positions):
+    """[(x, z), …] -> {(x, z): pieces} (map helper process)."""
+    out = {}
+    for x, z in positions:
+        try:
+            out[(int(x), int(z))] = stronghold_pieces(int(seed), int(x), int(z), int(mc))
+        except Exception:
+            out[(int(x), int(z))] = []
     return out

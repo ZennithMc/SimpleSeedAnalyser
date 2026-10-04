@@ -96,6 +96,7 @@
 #define CTYPE_LOGIC_NOT           18
 #define CTYPE_CRUNCHINESS         19
 #define CTYPE_NOISE_SAMPLE        20
+#define CTYPE_CLIMATE_AREA        21   /* Locate climate center: coarse flood fill (01/10) */
 
 #define VARIANT_NONE          0
 #define VARIANT_ABANDONED     1
@@ -112,12 +113,9 @@
 #define NP_MAX_LOCAL    6
 #define MAX_THREADS     128
 
-#ifndef MC_1_9
-#  define MC_1_9 9
-#endif
-#ifndef MC_1_18
-#  define MC_1_18 21
-#endif
+/* (p92) MC_1_9 / MC_1_18 were re-#defined here as 9 / 21: those names are
+ * enum members of biomes.h, so #ifndef was always true and « MC_1_18 » meant
+ * 1.17 in this file. The cubiomes enum values are used now. */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * SsaCond — must match the Python ctypes.Structure layout exactly
@@ -200,6 +198,11 @@ typedef struct {
     int              bf_ready;
     StructureConfig  sconf;
     int              sconf_ready;
+    /* p92: exact climate pruning of the biome conditions (1.18+ overworld)
+     * bp_state 0 = not set up, 1 = bp usable, -1 = no pruning (bp unused) */
+    int              bp_state;
+    BiomePrune       bp;
+    int              bp_id[BPRUNE_MAX];
 } CondCache;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -233,6 +236,11 @@ typedef struct {
     BiomeNoise   climate_cache[NP_MAX][CLIM_NSLOT];
     int          climate_cache_nmax[NP_MAX][CLIM_NSLOT]; /* -2 = invalide */
     uint64_t     climate_cache_seed[NP_MAX][CLIM_NSLOT];
+    /* p93: climate octaves shared by all octave counts, built on demand
+     * (before: one full re-seeding per (para, nmax) slot; nmax 4/6/8 shared
+     * slot 3 and re-seeded each other at every switch) */
+    ClimLazy          clazy[NP_MAX];
+    DoublePerlinNoise cview[NP_MAX][CLIM_NSLOT];
     /* Cache pour le bruit climat chargé dans g.bn (utilisé par noise_sample
      * Monte-Carlo, qui lit g->bn.climate[para] via monteCarloBiomes). */
     uint64_t     gbn_seed;
@@ -268,9 +276,24 @@ typedef struct SsaProf_s {
     uint64_t pass_stamp[MAX_CONDS];
     int64_t  reached[MAX_CONDS];
     int64_t  passed[MAX_CONDS];
+    /* the condition's OWN test, per check (29/09): a relative condition is
+     * checked once per parent position, and passed[] above counts the whole
+     * branch — with no result every branch showed 0 %, the stats said
+     * nothing about which condition blocks */
+    int64_t  checks[MAX_CONDS];
+    int64_t  checks_ok[MAX_CONDS];
     uint64_t ticks[MAX_CONDS];
     uint64_t total_ticks;           /* whole seed tests (timed seeds) */
 } SsaProf;
+
+static inline void prof_check(SsaEnv *env, int cond_1idx, int ok)
+{
+    SsaProf *pf = env->prof;
+    int i = cond_1idx - 1;
+    if (!pf || i < 0 || i >= MAX_CONDS) return;
+    pf->checks[i]++;
+    if (ok) pf->checks_ok[i]++;
+}
 
 static inline void prof_seed_begin(SsaProf *pf)
 {
@@ -286,6 +309,27 @@ static inline int clim_slot_for_nmax(int nmax) {
     if (nmax == 2) return 1;
     if (nmax <= 0) return 2;   /* full (-1) */
     return 3;                   /* autre valeur */
+}
+
+/* p93: the climate noise (para, nmax) of the current seed. Octaves come from
+ * the shared on-demand cache (same noise, same values as setClimateParaSeed,
+ * see climLazyGet); para NP_DEPTH keeps the old per-slot generator. The
+ * pointer is valid until the next call for the same (para, slot). */
+static const DoublePerlinNoise *clim_dp(SsaEnv *env, int para, int nmax)
+{
+    int slot = clim_slot_for_nmax(nmax);
+    if (para != NP_DEPTH &&
+        climLazyGet(&env->clazy[para], &env->cview[para][slot], env->seed,
+                    env->large, para, nmax))
+        return &env->cview[para][slot];
+    BiomeNoise *bn = &env->climate_cache[para][slot];
+    if (!(env->climate_cache_seed[para][slot] == env->seed &&
+          env->climate_cache_nmax[para][slot] == nmax)) {
+        setClimateParaSeed(bn, env->seed, env->large, para, nmax);
+        env->climate_cache_seed[para][slot] = env->seed;
+        env->climate_cache_nmax[para][slot] = nmax;
+    }
+    return &bn->climate[para];
 }
 
 /* Forward declarations */
@@ -478,6 +522,156 @@ static int f_confine(void *d, int x, int z, double p) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * p92 — fast exact biome sampling for the 1.18+ overworld
+ *
+ * ssa_biome_at() = getBiomeAt(g, scale, x, y, z) (same coordinates and
+ * sampling flags as genBiomeNoiseScaled for a 1×1 range) without its
+ * malloc/free, and, given candidates, sampleBiomeNoisePruned(): the climate
+ * parameters are computed cheapest first and the cell is dropped (-2) as soon
+ * as they prove none of the candidate biomes can be there — exact bounds taken
+ * from the climate tree itself (see getBiomeLeafLimits), not the approximate
+ * getBiomeParaLimits table. Result identical to getBiomeAt, validated on
+ * millions of cells for every version (tests/biome_prune_check.c).
+ * Requires g->bn to be the full biome noise (nptype == -1).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static inline int ssa_biome_at(const Generator *g, const BiomePrune *bp,
+                               uint32_t alive, int scale, int x, int y, int z,
+                               uint32_t xf)
+{
+    if (scale == 1) {
+        int x4, y4, z4;
+        voronoiAccess3D(g->sha, x, y, z, &x4, &y4, &z4);
+        x = x4; y = y4; z = z4; scale = 4;
+    }
+    if (scale == 4)
+        return bp ? sampleBiomeNoisePruned(&g->bn, x, y, z, NULL, xf, bp, alive)
+                  : sampleBiomeNoise(&g->bn, NULL, x, y, z, NULL, 0);
+    int s = scale / 4, mid = s / 2;
+    uint64_t dat = 0;
+    x = x * s + mid; z = z * s + mid;
+    return bp ? sampleBiomeNoisePruned(&g->bn, x, y, z, &dat, SAMPLE_NO_SHIFT | xf, bp, alive)
+              : sampleBiomeNoise(&g->bn, NULL, x, y, z, &dat, SAMPLE_NO_SHIFT);
+}
+
+/* the candidate biomes of a condition: every biome whose presence can change
+ * the answer (bits of the 64-bit id masks, as in checkForBiomes) */
+static void cache_setup_prune(CondCache *cache, int mc, uint64_t b, uint64_t m)
+{
+    int n = 0, ok = 1;
+    for (int id = 0; id < 256 && ok; id++) {
+        int bit = id < 128 ? (int)((b >> (id & 63)) & 1) * (id < 64)
+                           : (int)((m >> ((id - 128) & 63)) & 1) * (id < 192);
+        if (!bit) continue;
+        if (n >= BPRUNE_MAX) { ok = 0; break; }
+        cache->bp_id[n++] = id;
+    }
+    if (ok && n > 0 && mc >= MC_1_18 && setupBiomePrune(&cache->bp, mc, cache->bp_id, n))
+        cache->bp_state = 1;
+    else
+        cache->bp_state = -1;
+}
+
+/* checkForBiomes() for the 1.18+ overworld, exact same decision: in
+ * cubiomes the answer depends only on the set of biomes of the area (it scans
+ * everything unless a required biome set is complete with no exclusion, or an
+ * excluded biome is seen). Here: coarse-to-fine scan (positives stop early),
+ * cells that cannot hold a still-useful biome are skipped after T/H/…, 1:1
+ * cells share their 1:4 Voronoi source cell. Returns -1 when not applicable
+ * (caller falls back to checkForBiomes). */
+/* p93: the coarse-to-fine scan visits cells far apart → scattered Perlin
+ * (same values, ~2× faster here than the switch gradient) */
+#define FCB_XF SAMPLE_SSA_SCATTERED
+static int fast_check_biomes(SsaEnv *env, CondCache *cache, Range r, int dim)
+{
+    Generator *g = &env->g;
+    const BiomeFilter *bf = &cache->bf;
+    if (env->mc < MC_1_18 || dim != DIM_OVERWORLD || (bf->flags & BF_APPROX))
+        return -1;
+    if (r.scale != 1 && r.scale != 4 && r.scale != 16 && r.scale != 64 && r.scale != 256)
+        return -1;
+    if (g->dim != dim || g->seed != env->seed)
+        applySeed(g, dim, env->seed);
+    if (g->bn.nptype != -1)
+        return -1;
+    volatile int *stop = env->stop_flag;
+    if (stop && *stop) return 0;
+
+    const uint64_t breq = bf->biomeToFind, mreq = bf->biomeToFindM;
+    const uint64_t bexc = bf->biomeToExcl, mexc = bf->biomeToExclM;
+    const uint64_t bany = bf->biomeToPick, many = bf->biomeToPickM;
+    if (!cache->bp_state)
+        cache_setup_prune(cache, env->mc, breq | bexc | bany, mreq | mexc | many);
+    const BiomePrune *bp = cache->bp_state > 0 ? &cache->bp : NULL;
+    const int has_exc = (bexc | mexc) != 0;
+    uint64_t b = 0, m = 0;
+    uint32_t alive = 0;
+
+#define FCB_DONE_NEG()  (((b & bexc) | (m & mexc)) != 0)
+#define FCB_REQ_OK()    ((b & breq) == breq && (m & mreq) == mreq)
+#define FCB_ANY_OK()    ((bany | many) == 0 || (b & bany) || (m & many))
+#define FCB_ALIVE() do { alive = 0; if (bp) for (int q = 0; q < bp->n; q++) { \
+        int id_ = cache->bp_id[q]; \
+        uint64_t bb_ = id_ < 128 ? b : m, mk_ = 1ULL << (id_ & 63); \
+        uint64_t ex_ = id_ < 128 ? bexc : mexc, rq_ = id_ < 128 ? breq : mreq, an_ = id_ < 128 ? bany : many; \
+        if ((ex_ & mk_) || ((rq_ & mk_) && !(bb_ & mk_)) || ((an_ & mk_) && !FCB_ANY_OK())) \
+            alive |= 1u << q; } } while (0)
+
+    if (!has_exc && FCB_REQ_OK() && FCB_ANY_OK())
+        return 1;                          /* nothing to look for */
+    FCB_ALIVE();
+
+    int *memo = NULL;
+    Range s = r;
+    if (r.scale == 1) {
+        s = getVoronoiSrcRange(r);
+        size_t ns = (size_t)s.sx * s.sz * (s.sy > 0 ? s.sy : 1);
+        memo = (int*) malloc(ns * sizeof(int));
+        if (!memo) return -1;
+        memset(memo, 0xff, ns * sizeof(int));          /* -1 = not sampled */
+    }
+    int top = 1;
+    while (top < 16 && top * 2 <= (r.sx > r.sz ? r.sx : r.sz)) top *= 2;
+    int ret = -2, polls = 0;
+    for (int st = top; st >= 1 && ret == -2; st >>= 1) {
+        for (int j = 0; j < r.sz && ret == -2; j += st) {
+            if (stop && (++polls & 63) == 0 && *stop) { ret = 0; break; }
+            for (int i = 0; i < r.sx; i += st) {
+                if (st < top && (i % (2*st)) == 0 && (j % (2*st)) == 0)
+                    continue;                          /* seen at a coarser step */
+                int id;
+                if (memo) {
+                    int x4, y4, z4;
+                    voronoiAccess3D(g->sha, r.x + i, r.y, r.z + j, &x4, &y4, &z4);
+                    int k = ((y4 - s.y) * s.sz + (z4 - s.z)) * s.sx + (x4 - s.x);
+                    id = memo[k];
+                    if (id == -1)
+                        id = memo[k] = bp ? sampleBiomeNoisePruned(&g->bn, x4, y4, z4, NULL, FCB_XF, bp, alive)
+                                          : sampleBiomeNoise(&g->bn, NULL, x4, y4, z4, NULL, 0);
+                } else {
+                    id = ssa_biome_at(g, bp, alive, r.scale, r.x + i, r.y, r.z + j, FCB_XF);
+                }
+                if (id < 0) continue;
+                uint64_t ob = b, om = m;
+                if (id < 128) b |= 1ULL << id; else m |= 1ULL << (id - 128);
+                if (b == ob && m == om) continue;
+                if (FCB_DONE_NEG()) { ret = 0; break; }
+                if (!has_exc && FCB_REQ_OK() && FCB_ANY_OK()) { ret = 1; break; }
+                FCB_ALIVE();
+            }
+        }
+    }
+    free(memo);
+    if (ret == -2)
+        ret = (!FCB_DONE_NEG() && FCB_REQ_OK() && FCB_ANY_OK()) ? 1 : 0;
+    if (stop && *stop) ret = 0;
+#undef FCB_DONE_NEG
+#undef FCB_REQ_OK
+#undef FCB_ANY_OK
+#undef FCB_ALIVE
+    return ret;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Monte Carlo biome sampler callback
  * ═══════════════════════════════════════════════════════════════════════════ */
 typedef struct {
@@ -487,6 +681,8 @@ typedef struct {
     int32_t at_x, at_z;
     int64_t rmax_sq;
     Pos *out; int *nout; int cap;   /* yield: accepted positions (nullable) */
+    int fast;                       /* p92: ssa_biome_at (1.18+ overworld) */
+    const BiomePrune *bp; uint32_t alive;
 } MonteData;
 
 static int monte_eval(Generator *g, int scale, int x, int y, int z, void *data) {
@@ -504,7 +700,13 @@ static int monte_eval(Generator *g, int scale, int x, int y, int z, void *data) 
     }
     /* Use y from the range as cubiomes-viewer does (was hardcoded 320 before
      * which is above the world ceiling and gave garbage biome IDs). */
-    int id = getBiomeAt(g, scale, x, y, z);
+    int id;
+    if (d->fast) {
+        id = ssa_biome_at(g, d->bp, d->alive, scale, x, y, z, SAMPLE_SSA_SCATTERED);
+        if (id == -2) return 0;            /* neither included nor excluded */
+    } else {
+        id = getBiomeAt(g, scale, x, y, z);
+    }
     for (int i = 0; i < d->n_excl; i++) if (d->excl[i] == id) return 0;
     for (int i = 0; i < d->n_incl; i++) {
         if (d->incl[i] == id) {
@@ -529,7 +731,7 @@ static int monte_eval(Generator *g, int scale, int x, int y, int z, void *data) 
  * sélective que le simple "∃ un point" que SSA utilisait avant.
  * ═══════════════════════════════════════════════════════════════════════════ */
 typedef struct {
-    const BiomeNoise *bn;   /* climate noise seeded for (seed, para, nmax) */
+    const DoublePerlinNoise *dp;   /* climate noise for (seed, para, nmax) */
     int      para;          /* NP_* climat */
     double   vmin, vmax;    /* bornes en unités x10000 */
     int      invert;
@@ -548,7 +750,8 @@ static int monte_noise_eval(Generator *g, int scale, int x, int y, int z, void *
         if (dx*dx + dz*dz >= d->rmax_sq) return -1;  /* hors disque → ignoré */
     }
     (void)g;
-    double v = sampleDoublePerlin(&d->bn->climate[d->para], x, 0, z) * 10000.0;
+    /* p93: scattered samples → table-gradient Perlin (same value, ~4× faster) */
+    double v = sampleDoublePerlinScattered(d->dp, x, 0, z) * 10000.0;
     int ok = (v > d->vmin && v < d->vmax);
     if (d->invert) ok = !ok;
     if (ok) {
@@ -787,6 +990,153 @@ done:
 /* ═══════════════════════════════════════════════════════════════════════════
  * eval_condition — evaluate one node, return 1 on pass, 0 on fail
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Locate climate center — coarse flood fill of ONE climate parameter (01/10)
+ *
+ * The world is cut into cells of `s` blocks (c->biome_scale, 4…1024). Starting
+ * from the cell holding the reference position, the 4-connected cells whose
+ * value is in the range (outside it with « invert ») form the region; it is
+ * explored only inside the condition's area (default ±128 cells). Each cell is
+ * sampled once, at its centre block, at the climate's 1:4 resolution, with the
+ * condition's octave limit — the same sampling as « Locate climate extreme ».
+ *   pass  : region ≥ need cells (c->biome_min_size)
+ *           and, with a maximum (c->biome_tolerance > 0), ≤ max cells and not
+ *           cut by the area border (its real size would be unknown)
+ *   push  : the centroid of the region (centre block of the mean cell) — the
+ *           children are tested there. Without children (c->min_count == 0)
+ *           and without a maximum, the fill stops as soon as `need` cells are
+ *           reached and the start cell is pushed (same pass/fail, much faster).
+ * Memory: a bitmap and a queue allocated for this call only (thread-safe, no
+ * shared state); Stop is checked every 4 096 cells.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+#define CA_DEFAULT_HALF 128              /* cells each side when the area is 0 */
+#define CA_MAX_CELLS    (1 << 20)        /* exploration window cap (1024 × 1024) */
+
+static inline int64_t ca_floordiv(int64_t a, int64_t b) {
+    int64_t q = a / b;
+    return (a % b != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+}
+
+static int eval_climate_area(SsaEnv *env, const SsaCond *c, int cond_idx,
+                             int32_t at_x, int32_t at_z)
+{
+    int para = c->climate_para;
+    if (para < 0 || para >= NP_MAX) return 0;
+    int64_t s = c->biome_scale;
+    if (s < 4) s = 4;
+    if (s > 1024) s = 1024;
+    const DoublePerlinNoise *dp = clim_dp(env, para, c->climate_nmax);
+    double vmin = (c->climate_mode & 4) ? c->climate_vmin : -INFINITY;
+    double vmax = (c->climate_mode & 8) ? c->climate_vmax : +INFINITY;
+    int inv = c->climate_invert;
+
+    /* exploration window, in cells */
+    int64_t ci0 = ca_floordiv(at_x, s), cj0 = ca_floordiv(at_z, s);
+    int64_t gx1, gz1, gx2, gz2, rmax_sq = 0;
+    if (c->rmax > 0) {
+        int64_t rb = c->rmax - 1;
+        gx1 = ca_floordiv(at_x - rb, s); gx2 = ca_floordiv(at_x + rb, s);
+        gz1 = ca_floordiv(at_z - rb, s); gz2 = ca_floordiv(at_z + rb, s);
+        rmax_sq = rb * rb + 1;
+    } else if (c->x1 == c->x2 && c->z1 == c->z2) {
+        gx1 = ci0 - CA_DEFAULT_HALF; gx2 = ci0 + CA_DEFAULT_HALF;
+        gz1 = cj0 - CA_DEFAULT_HALF; gz2 = cj0 + CA_DEFAULT_HALF;
+    } else {
+        int64_t a = (int64_t)at_x + c->x1, b = (int64_t)at_x + c->x2;
+        int64_t d = (int64_t)at_z + c->z1, e = (int64_t)at_z + c->z2;
+        gx1 = ca_floordiv(a < b ? a : b, s); gx2 = ca_floordiv(a < b ? b : a, s);
+        gz1 = ca_floordiv(d < e ? d : e, s); gz2 = ca_floordiv(d < e ? e : d, s);
+    }
+    /* the start cell is always inside; the window is capped around it */
+    if (ci0 < gx1) gx1 = ci0;
+    if (ci0 > gx2) gx2 = ci0;
+    if (cj0 < gz1) gz1 = cj0;
+    if (cj0 > gz2) gz2 = cj0;
+    while ((gx2 - gx1 + 1) * (gz2 - gz1 + 1) > CA_MAX_CELLS) {
+        if (gx2 - gx1 >= gz2 - gz1) {
+            if (ci0 - gx1 > gx2 - ci0) gx1++; else gx2--;
+        } else {
+            if (cj0 - gz1 > gz2 - cj0) gz1++; else gz2--;
+        }
+    }
+    int64_t W = gx2 - gx1 + 1, H = gz2 - gz1 + 1;
+
+#define CA_IN_WINDOW(i, j) ((i) >= gx1 && (i) <= gx2 && (j) >= gz1 && (j) <= gz2 && \
+        (!rmax_sq || ({ int64_t _dx = (i) * s + s / 2 - at_x, _dz = (j) * s + s / 2 - at_z; \
+                        _dx * _dx + _dz * _dz < rmax_sq; })))
+#define CA_SAMPLE_OK(i, j) ({ double _v = sampleDoublePerlinScattered(dp, \
+        (double)(((i) * s + s / 2) >> 2), 0, (double)(((j) * s + s / 2) >> 2)) * 10000.0; \
+        int _in = (_v >= vmin && _v <= vmax); inv ? !(_v > vmin && _v < vmax) : _in; })
+
+    /* the start cell first: rejects most seeds for the price of one sample */
+    if (!CA_SAMPLE_OK(ci0, cj0)) return 0;
+
+    int64_t need = c->biome_min_size > 0 ? c->biome_min_size : 1;
+    int64_t maxc = c->biome_tolerance > 0 ? c->biome_tolerance : 0;
+    int want_center = c->min_count > 0 || maxc > 0;
+    if (need <= 1 && !want_center) { env_push(env, cond_idx, (int32_t)(ci0 * s + s / 2),
+                                              (int32_t)(cj0 * s + s / 2)); return 1; }
+
+    int64_t ncell = W * H;
+    uint8_t *seen = (uint8_t *)calloc((size_t)((ncell + 7) >> 3), 1);
+    int32_t *q = NULL; int64_t qcap = 4096;
+    q = (int32_t *)malloc((size_t)qcap * sizeof(int32_t));
+    if (!seen || !q) { free(seen); free(q); return 0; }
+#define CA_MARK(k)  (seen[(k) >> 3] |= (uint8_t)(1u << ((k) & 7)))
+#define CA_SEEN(k)  (seen[(k) >> 3] & (1u << ((k) & 7)))
+
+    int64_t k0 = (cj0 - gz1) * W + (ci0 - gx1);
+    CA_MARK(k0);
+    int64_t qh = 0, qt = 0;
+    q[qt++] = (int32_t)k0;
+    int64_t count = 0, sx = 0, sz = 0;
+    int border = 0, ok = 0, aborted = 0;
+    volatile int *stop = env->stop_flag;
+    static const int DI[4] = {1, -1, 0, 0}, DJ[4] = {0, 0, 1, -1};
+    while (qh < qt) {
+        int64_t k = q[qh++];
+        int64_t i = gx1 + k % W, j = gz1 + k / W;
+        count++; sx += i; sz += j;
+        if (!want_center && count >= need) { ok = 1; break; }
+        if (maxc && count > maxc) break;                  /* too big */
+        if (stop && (count & 4095) == 0 && *stop) { aborted = 1; break; }
+        for (int d = 0; d < 4; d++) {
+            int64_t ni = i + DI[d], nj = j + DJ[d];
+            if (!CA_IN_WINDOW(ni, nj)) { border = 1; continue; }
+            int64_t nk = (nj - gz1) * W + (ni - gx1);
+            if (CA_SEEN(nk)) continue;
+            CA_MARK(nk);
+            if (!CA_SAMPLE_OK(ni, nj)) continue;
+            if (qt >= qcap) {
+                int64_t nc = qcap * 2;
+                int32_t *t = (int32_t *)realloc(q, (size_t)nc * sizeof(int32_t));
+                if (!t) { aborted = 1; break; }
+                q = t; qcap = nc;
+            }
+            q[qt++] = (int32_t)nk;
+        }
+        if (aborted) break;
+    }
+    if (!ok && !aborted && qh >= qt) {                    /* whole region seen */
+        ok = count >= need && (!maxc || (count <= maxc && !border));
+    }
+    free(seen); free(q);
+#undef CA_MARK
+#undef CA_SEEN
+#undef CA_IN_WINDOW
+#undef CA_SAMPLE_OK
+    if (!ok || aborted) return 0;
+    if (want_center) {
+        /* centre block of the mean cell (floor division keeps negatives right) */
+        int64_t mi = ca_floordiv(sx, count), mj = ca_floordiv(sz, count);
+        env_push(env, cond_idx, (int32_t)(mi * s + s / 2), (int32_t)(mj * s + s / 2));
+    } else {
+        env_push(env, cond_idx, (int32_t)(ci0 * s + s / 2), (int32_t)(cj0 * s + s / 2));
+    }
+    return 1;
+}
+
 static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
                            int32_t at_x, int32_t at_z,
                            const SsaCond *all_conds, int n_conds,
@@ -802,19 +1152,9 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
         int para = c->climate_para;
         if (para < 0 || para >= NP_MAX) return 0;
         int nmax = c->climate_nmax;
-        int slot = clim_slot_for_nmax(nmax);
-        BiomeNoise *bn;
-        if (env->climate_cache_seed[para][slot] == env->seed &&
-            env->climate_cache_nmax[para][slot] == nmax) {
-            bn = &env->climate_cache[para][slot];
-        } else {
-            bn = &env->climate_cache[para][slot];
-            setClimateParaSeed(bn, env->seed, env->large, para, nmax);
-            env->climate_cache_seed[para][slot] = env->seed;
-            env->climate_cache_nmax[para][slot] = nmax;
-        }
+        const DoublePerlinNoise *dpn = clim_dp(env, para, nmax);
         int32_t rx = (at_x + c->x1) >> 2, rz = (at_z + c->z1) >> 2;
-        double p = sampleDoublePerlin(&bn->climate[para], rx, 0, rz) * 10000.0;
+        double p = sampleDoublePerlinScattered(dpn, rx, 0, rz) * 10000.0;
         double vmin = (c->climate_mode & 4) ? c->climate_vmin : -INFINITY;
         double vmax = (c->climate_mode & 8) ? c->climate_vmax : +INFINITY;
         if (!(p >= vmin && p <= vmax)) return 0;
@@ -837,6 +1177,9 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
     int32_t cx_def = (int32_t)(((int64_t)x1 + x2) >> 1), cz_def = (int32_t)(((int64_t)z1 + z2) >> 1);
 
     switch (c->ctype) {
+
+    case CTYPE_CLIMATE_AREA:
+        return eval_climate_area(env, c, cond_idx, at_x, at_z);
 
     case CTYPE_SCALE_TO_NETHER:
         env_push(env, cond_idx, at_x/8, at_z/8);
@@ -1079,7 +1422,9 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
         r.sz = (z2 >> s_shift) - r.z + 1; if (r.sz < 1) r.sz = 1;
         r.y = (s_shift > 0) ? (c->biome_y >> 2) : c->biome_y;
         r.sy = 1;
-        int ok = checkForBiomes(&env->g, NULL, r, dim, env->seed,
+        int ok = fast_check_biomes(env, cache, r, dim);
+        if (ok < 0)
+            ok = checkForBiomes(&env->g, NULL, r, dim, env->seed,
                                   &cache->bf, (volatile char*)env->stop_flag) > 0;
         env_set_dim(env, DIM_OVERWORLD);
         if (c->exclude) {
@@ -1117,6 +1462,29 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
         d.at_x = at_x; d.at_z = at_z; d.rmax_sq = rmax_sq;
         d.out = env->sample_out; d.nout = &env->sample_n; d.cap = env->sample_cap;
         env->sample_out = NULL;           /* one call only (not the children) */
+        d.fast = 0; d.bp = NULL; d.alive = 0;
+        if (env->mc >= MC_1_18) {
+            Generator *g = &env->g;
+            if (g->dim != DIM_OVERWORLD || g->seed != env->seed)
+                applySeed(g, DIM_OVERWORLD, env->seed);
+            if (g->bn.nptype == -1) {
+                CondCache *cache = &caches[cond_idx - 1];
+                if (!cache->bp_state) {
+                    uint64_t bb = 0, mm = 0; int bad = 0;
+                    for (int i = 0; i < c->n_incl + c->n_excl; i++) {
+                        int id = i < c->n_incl ? c->biomes_incl[i] : c->biomes_excl[i - c->n_incl];
+                        if (id < 0 || id >= 192 || (id >= 64 && id < 128)) { bad = 1; break; }
+                        if (id < 128) bb |= 1ULL << id; else mm |= 1ULL << (id - 128);
+                    }
+                    if (bad) cache->bp_state = -1;
+                    else cache_setup_prune(cache, env->mc, bb, mm);
+                }
+                d.fast = 1;
+                if (cache->bp_state > 0) {
+                    d.bp = &cache->bp; d.alive = (1u << cache->bp.n) - 1;
+                }
+            }
+        }
         uint64_t rng; setSeed(&rng, env->seed);
         int ok = monteCarloBiomes(&env->g, r, &rng, c->coverage, c->confidence,
                                     monte_eval, &d) == 1;
@@ -1190,14 +1558,7 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
          * « large cherry islands »: 0 results, 3 of cubiomes-viewer's seeds
          * rejected (their cherry grove was found only at the ~50 000th spiral
          * position, after many noise samples). */
-        int slot = clim_slot_for_nmax(nmax);
-        BiomeNoise *nbn = &env->climate_cache[para][slot];
-        if (!(env->climate_cache_seed[para][slot] == env->seed &&
-              env->climate_cache_nmax[para][slot] == nmax)) {
-            setClimateParaSeed(nbn, env->seed, env->large, para, nmax);
-            env->climate_cache_seed[para][slot] = env->seed;
-            env->climate_cache_nmax[para][slot] = nmax;
-        }
+        const DoublePerlinNoise *ndp = clim_dp(env, para, nmax);
         int s_shift = 2;  /* scale 4, comme CV (s=2) */
         Range r;
         r.scale = 1 << s_shift;
@@ -1208,7 +1569,7 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
         r.sz = (z2 >> s_shift) - r.z + 1; if (r.sz < 1) r.sz = 1;
         r.y = c->biome_y >> 2; r.sy = 1;
         MonteNoiseData d;
-        d.bn = nbn;
+        d.dp = ndp;
         d.para = para;
         d.vmin = (c->climate_mode & 4) ? c->climate_vmin : -INFINITY;
         d.vmax = (c->climate_mode & 8) ? c->climate_vmax : +INFINITY;
@@ -1233,20 +1594,7 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
         int nmax = c->climate_nmax;
         /* Cache lookup multi-nmax : on garde un slot par nmax distinct, donc
          * alterner nmax=1/2/full sur le même para ne casse plus le cache. */
-        int slot = clim_slot_for_nmax(nmax);
-        BiomeNoise *bn_ptr;
-        if (env->climate_cache_seed[para][slot] == env->seed &&
-            env->climate_cache_nmax[para][slot] == nmax) {
-            bn_ptr = &env->climate_cache[para][slot];
-        } else {
-            bn_ptr = &env->climate_cache[para][slot];
-            /* Pas de memset : setClimateParaSeed initialise climate[para]+oct,
-             * et on ne lit que ce DoublePerlinNoise via sampleDoublePerlin.
-             * Memset de 24 KB par miss = pur gaspillage. */
-            setClimateParaSeed(bn_ptr, env->seed, env->large, para, nmax);
-            env->climate_cache_seed[para][slot] = env->seed;
-            env->climate_cache_nmax[para][slot] = nmax;
-        }
+        const DoublePerlinNoise *cdp = clim_dp(env, para, nmax);
         int rx = x1 >> 2, rz = z1 >> 2;
         int rw = (x2 >> 2) - rx + 1; if (rw < 1) rw = 1;   /* viewer extent */
         int rh = (z2 >> 2) - rz + 1; if (rh < 1) rh = 1;
@@ -1264,7 +1612,7 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
             /* getParaRange applique un facteur ×10000 sur l'échantillon avant
              * de le comparer aux bornes ; on reproduit exactement la même
              * convention ici pour rester bit-identique au chemin général. */
-            double p = sampleDoublePerlin(&bn_ptr->climate[para], rx, 0, rz) * 10000.0;
+            double p = sampleDoublePerlinScattered(cdp, rx, 0, rz) * 10000.0;
             int pass1;
             if (c->climate_invert) pass1 = !(p > vmin && p < vmax);
             else                   pass1 =  (p >= vmin && p <= vmax);
@@ -1317,13 +1665,13 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
              * Ainsi la sortie est toujours exacte, et on gagne sur le cas commun. */
             int step_x = (rw > 64) ? (rw / 64) : 1;
             int step_z = (rh > 64) ? (rh / 64) : 1;
-            DoublePerlinNoise *dp = &bn_ptr->climate[para];
+            const DoublePerlinNoise *dp = cdp;
             int found_x = rx, found_z = rz;
             int decided = 0, satisfied = 0;
             int exists_mode = (single_min_upper || single_max_lower);
             for (int dz = 0; dz < rh && !decided; dz += step_z) {
                 for (int dx = 0; dx < rw; dx += step_x) {
-                    double p = sampleDoublePerlin(dp, rx+dx, 0, rz+dz) * 10000.0;
+                    double p = sampleDoublePerlinScattered(dp, rx+dx, 0, rz+dz) * 10000.0;
                     int point_ok;
                     if (single_min_upper)      point_ok = (p <= vmax);
                     else if (single_min_lower) point_ok = (p >= vmin);
@@ -1365,7 +1713,7 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
         double p_lo = +INFINITY, p_hi = -INFINITY;
         double *p_min = loc_min ? &p_lo : NULL;
         double *p_max = loc_max ? &p_hi : NULL;
-        getParaRange(&bn_ptr->climate[para], p_min, p_max,
+        getParaRange(cdp, p_min, p_max,
                       rx, rz, rw, rh, &info, f_track_mm);
         double evalmin = loc_min ? info.vmin : info.vmax;
         double evalmax = loc_max ? info.vmax : info.vmin;
@@ -1399,18 +1747,10 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
             if (c->cn_ok_lo[i] == INT_MIN_V && c->cn_ok_hi[i] == INT_MAX_V &&
                 c->cn_ex_lo[i] == INT_MIN_V && c->cn_ex_hi[i] == INT_MAX_V)
                 continue;
-            int nmax = -1;
-            int slot = clim_slot_for_nmax(nmax);
-            BiomeNoise *bn_ptr = &env->climate_cache[i][slot];
-            if (!(env->climate_cache_seed[i][slot] == env->seed &&
-                  env->climate_cache_nmax[i][slot] == nmax)) {
-                setClimateParaSeed(bn_ptr, env->seed, env->large, i, nmax);
-                env->climate_cache_seed[i][slot] = env->seed;
-                env->climate_cache_nmax[i][slot] = nmax;
-            }
+            const DoublePerlinNoise *ndp = clim_dp(env, i, -1);
             double pmin, pmax;
             Confine cf = { (double)c->cn_ex_lo[i], (double)c->cn_ex_hi[i] };
-            if (getParaRange(&bn_ptr->climate[i], &pmin, &pmax, rx, rz, rw, rh, &cf, f_confine))
+            if (getParaRange(ndp, &pmin, &pmax, rx, rz, rw, rh, &cf, f_confine))
                 return 0;                       /* left the exclusion bounds */
             if (pmin > (double)c->cn_ok_hi[i] || pmax < (double)c->cn_ok_lo[i]) return 0;
             if (pmin < (double)c->cn_ex_lo[i] || pmax > (double)c->cn_ex_hi[i]) return 0;
@@ -1546,6 +1886,7 @@ static int eval_node_impl(SsaEnv *env, const SsaCond *conds, int n_conds,
                 if (!inst) { if (parent_idx <= MAX_CONDS) env->positions[parent_idx] = sv; return 0; }
                 int n = struct_collect(env, c, cond_1idx, caches, at_x, at_z,
                                        inst, STRUCT_SPLIT_MAX, STRUCT_SPLIT_MAX, NULL, NULL);
+                prof_check(env, cond_1idx, n > 0);
                 if (n > STRUCT_SPLIT_MAX) n = STRUCT_SPLIT_MAX;
                 for (int k = 0; k < n && !res; k++) {
                     env_push(env, cond_1idx, inst[k].x, inst[k].z);
@@ -1561,6 +1902,7 @@ static int eval_node_impl(SsaEnv *env, const SsaCond *conds, int n_conds,
                 Pos first; int64_t xs = 0, zs = 0;
                 int n = struct_collect(env, c, cond_1idx, caches, at_x, at_z,
                                        &first, 1, 0, &xs, &zs);
+                prof_check(env, cond_1idx, n >= min_count);
                 if (n >= min_count) {
                     int32_t cx = (int32_t)(xs / n), cz = (int32_t)(zs / n);
                     env_push(env, cond_1idx, cx, cz);
@@ -1634,6 +1976,7 @@ static int eval_node_impl(SsaEnv *env, const SsaCond *conds, int n_conds,
             if (parent_idx <= MAX_CONDS) env_push(env, parent_idx, at_x, at_z);
             env->sample_out = inst; env->sample_cap = YIELD_MAX; env->sample_n = 0;
             int r = eval_condition(env, c, cond_1idx, at_x, at_z, conds, n_conds, caches);
+            prof_check(env, cond_1idx, r);
             env->sample_out = NULL;
             int n = env->sample_n;
             int res = 0;
@@ -1670,6 +2013,7 @@ static int eval_node_impl(SsaEnv *env, const SsaCond *conds, int n_conds,
         if (parent_idx <= MAX_CONDS) env_push(env, parent_idx, at_x, at_z);
         int r = eval_condition(env, c, cond_1idx, at_x, at_z,
                                 conds, n_conds, caches);
+        prof_check(env, cond_1idx, r);
         if (!r) {
             if (parent_idx <= MAX_CONDS) env->positions[parent_idx] = sv;
             return 0;
@@ -1740,6 +2084,7 @@ static int eval_node_impl(SsaEnv *env, const SsaCond *conds, int n_conds,
         if (parent_idx <= MAX_CONDS) env_push(env, parent_idx, at_x, at_z);
         int r = eval_condition(env, c, cond_1idx, at_x, at_z,
                                 conds, n_conds, caches);
+        prof_check(env, cond_1idx, r);
         if (parent_idx <= MAX_CONDS) env->positions[parent_idx] = sv;
         return r;
     }
@@ -1967,6 +2312,7 @@ static int clust_node(SsaEnv *env, const SsaCond *conds, int n_conds, CondCache 
         }
     }
 
+    prof_check(env, cond_1idx, branch ? n > 0 : avg_ok);
     int res = 0;
     if (branch) {
         if (n > CLUST_MAX) n = CLUST_MAX;
@@ -2207,6 +2553,41 @@ EXPORT float ssa_crunch_yfrac(int64_t seed, int climate, int octave_pair,
         return crunch_yfrac_for_octave(b_lo, b_hi, hidx);
     else
         return crunch_yfrac_for_octave(a_lo, a_hi, hidx);
+}
+
+/* p96: everything the GPU crunchiness pre-filter needs to compute EXACTLY the
+ * score of compute_crunchiness_score(): the climate hash (normal / large) and,
+ * for each active octave pair i in order, its octave hash and the A / B
+ * weights (0 when the pair / stream is not selected in the mask). Before, the
+ * kernel used fixed Commission weights on octaves first..first+2 (ignoring
+ * zero amplitudes, Large Biomes and the user's weights): not a superset of the
+ * CPU test -> GPU searches missed most results. Returns the number of pairs. */
+EXPORT int ssa_crunch_gpu_params(int climate, int large, uint32_t octave_mask,
+                                 const float *weights, uint64_t *clim_hash,
+                                 uint64_t *oct_lo, uint64_t *oct_hi,
+                                 float *w_a, float *w_b, int max_pairs)
+{
+    if (climate < 0 || climate >= 6 || climate == 4 || max_pairs <= 0) return 0;
+    const CrunchClimateInfo *info = &crunch_climate_info[climate];
+    int v = large ? 1 : 0;
+    clim_hash[0] = md5_climate[climate][v][0];
+    clim_hash[1] = md5_climate[climate][v][1];
+    int first_octave = large ? info->first_octave_large : info->first_octave_normal;
+    int hash_base = first_octave + 12;
+    int n = 0, active_idx = 0;
+    for (int amp_i = 0; amp_i < info->n_amps; amp_i++) {
+        if (info->amplitudes[amp_i] == 0.0) continue;
+        int hidx = hash_base + amp_i;
+        if (hidx < 0 || hidx >= 13) { active_idx++; continue; }
+        if (active_idx >= 6 || n >= max_pairs) break;
+        oct_lo[n] = md5_octave_n[hidx][0];
+        oct_hi[n] = md5_octave_n[hidx][1];
+        w_a[n] = (octave_mask & (1u << active_idx)) ? weights[2*active_idx] : 0.0f;
+        w_b[n] = (octave_mask & (1u << (16 + active_idx))) ? weights[2*active_idx + 1] : 0.0f;
+        n++;
+        active_idx++;
+    }
+    return n;
 }
 
 /* Returns the number of active (non-zero-amplitude) octave pairs for the
@@ -2472,6 +2853,15 @@ static int cond_cost_heuristic(const SsaCond *c) {
             break;
         }
         case CTYPE_CLIMATE_NOISE:   v = 6; break;
+        case CTYPE_CLIMATE_AREA: {  /* the start cell rejects most seeds; a pass
+                                       samples ~need cells (all with children) */
+            int n = c->climate_nmax;
+            double pt = (n == 1) ? 1 : (n == 2) ? 2 : (n > 0 && n <= 4) ? 4
+                      : (n > 0 && n <= 8) ? 8 : 18;
+            double need = c->biome_min_size > 0 ? c->biome_min_size : 1;
+            v = pt * (1.0 + 0.3 * need);
+            break;
+        }
         case CTYPE_NOISE_SAMPLE: {  /* Monte-Carlo: a few dozen points */
             int n = c->climate_nmax > 0 ? c->climate_nmax : 12;
             v = 8 + 2.0 * n;
@@ -2638,6 +3028,11 @@ typedef struct {
 
     volatile int64_t progress;
     volatile int64_t found_count;
+    /* p96: stop by itself once this many matches were found (0 = no limit).
+     * The result limit / safety cap used to be applied by Python after the
+     * drain: on a session where every seed matches, the engine was a whole
+     * ring (1 M matches) ahead → 1.5 M results shown for a 100 k limit. */
+    volatile int64_t max_found;
 
     /* Lock-free match ring buffer — avoids Python GIL per-match. */
 #define RING_CAP (1 << 20)
@@ -2655,6 +3050,8 @@ typedef struct {
     int64_t          iter_origin;  /* first seed/low of the scan (resume math) */
     /* merged profiler (under work_mutex) */
     int64_t          prof_reached[MAX_CONDS];
+    int64_t          prof_checks[MAX_CONDS];
+    int64_t          prof_checks_ok[MAX_CONDS];
     int64_t          prof_passed[MAX_CONDS];
     uint64_t         prof_ticks[MAX_CONDS];
     uint64_t         prof_total;
@@ -2668,6 +3065,8 @@ static void prof_merge(EngineState *st, SsaProf *pf, int n)
     for (int i = 0; i < n; i++) {
         st->prof_reached[i] += pf->reached[i]; pf->reached[i] = 0;
         st->prof_passed[i]  += pf->passed[i];  pf->passed[i] = 0;
+        st->prof_checks[i]  += pf->checks[i];  pf->checks[i] = 0;
+        st->prof_checks_ok[i] += pf->checks_ok[i]; pf->checks_ok[i] = 0;
         st->prof_ticks[i]   += pf->ticks[i];   pf->ticks[i] = 0;
     }
     st->prof_total += pf->total_ticks; pf->total_ticks = 0;
@@ -2704,6 +3103,14 @@ static int64_t now_ns(void) {
 #endif
 }
 
+/* Stop arrived DURING this seed's test: the evaluation was cut short (a spiral,
+ * a stronghold scan, a biome check return « fail » when interrupted), so its
+ * answer is meaningless — under a NOT it even turned into a PASS: every seed in
+ * flight at Stop was published as a result (CoffeeAddicted 30/09, consecutive
+ * false seeds, one run per thread). Its chunk is left unfinished, so a resume
+ * tests it again. */
+#define STOP_DURING_TEST() do { if (*st->stop_flag) goto done; } while (0)
+
 static void worker_run(EngineState *st) {
     SsaEnv env;
     memset(&env, 0, sizeof(env));
@@ -2720,7 +3127,7 @@ static void worker_run(EngineState *st) {
     for (int i = 0; i < NP_MAX; i++) {
         for (int s = 0; s < CLIM_NSLOT; s++) {
             env.climate_cache_nmax[i][s] = -2;
-            env.climate_cache_seed[i][s] = 0xdeadbeefcafebabeULL;
+            env.climate_cache_seed[i][s] = 0xdeadbeefcafebabeULL; env.clazy[i].valid = 0;
         }
     }
     uint32_t flags = st->large ? LARGE_BIOMES : 0;
@@ -2787,7 +3194,9 @@ static void worker_run(EngineState *st) {
                 env.sn_end_ready = 0;
                 env.current_dim = -2;
                 /* Pos-only check: no applySeed needed yet for getStructurePos */
-                if (!ssa_test_seed_pos_only(&env, st->conds, st->n_conds, caches))
+                int pok = ssa_test_seed_pos_only(&env, st->conds, st->n_conds, caches);
+                STOP_DURING_TEST();
+                if (!pok)
                     continue;  /* skip all 65536 highs */
 
                 /* Now expand: test each high with full check */
@@ -2821,11 +3230,13 @@ static void worker_run(EngineState *st) {
                     env.current_dim = DIM_OVERWORLD;
                     int bok = ssa_test_seed_sorted(&env, st->conds, st->n_conds, caches, st->toplevel_order, st->n_toplevel);
                     if (prof && prof->timing) prof->total_ticks += SSA_TICKS() - pt0;
+                    STOP_DURING_TEST();
                     if (bok) {
                         MUTEX_LOCK(st->result_mutex);
                         if (st->callback) st->callback((int64_t)full, st->user_data);
                         ring_push(st, (int64_t)full);
                         st->found_count++;
+                        if (st->max_found > 0 && st->found_count >= st->max_found) *st->stop_flag = 1;
                         MUTEX_UNLOCK(st->result_mutex);
                     }
                 }
@@ -2845,11 +3256,14 @@ static void worker_run(EngineState *st) {
                 env.sn_end_ready = 0;
                 env.current_dim = -2;
                 /* No applySeed needed: getStructurePos is pure RNG arithmetic */
-                if (ssa_test_seed_pos_only(&env, st->conds, st->n_conds, caches)) {
+                int fok = ssa_test_seed_pos_only(&env, st->conds, st->n_conds, caches);
+                STOP_DURING_TEST();
+                if (fok) {
                     MUTEX_LOCK(st->result_mutex);
                     if (st->callback) st->callback((int64_t)low, st->user_data);
                     ring_push(st, (int64_t)low);
                     st->found_count++;
+                    if (st->max_found > 0 && st->found_count >= st->max_found) *st->stop_flag = 1;
                     MUTEX_UNLOCK(st->result_mutex);
                 }
             }
@@ -2891,7 +3305,9 @@ static void worker_run(EngineState *st) {
                 if (pos_only) {
                     /* Fast pre-check: no applySeed yet */
                     env.current_dim = -2;
-                    if (!ssa_test_seed_pos_only(&env, st->conds, st->n_conds, caches)) {
+                    int qok = ssa_test_seed_pos_only(&env, st->conds, st->n_conds, caches);
+                    STOP_DURING_TEST();
+                    if (!qok) {
                         if (prof && prof->timing) prof->total_ticks += SSA_TICKS() - pt0;
                         continue;
                     }
@@ -2911,11 +3327,13 @@ static void worker_run(EngineState *st) {
                 env.current_dim = -2;
                 int iok = ssa_test_seed_sorted(&env, st->conds, st->n_conds, caches, st->toplevel_order, st->n_toplevel);
                 if (prof && prof->timing) prof->total_ticks += SSA_TICKS() - pt0;
+                STOP_DURING_TEST();
                 if (iok) {
                     MUTEX_LOCK(st->result_mutex);
                     if (st->callback) st->callback(seed, st->user_data);
                     ring_push(st, seed);
                     st->found_count++;
+                    if (st->max_found > 0 && st->found_count >= st->max_found) *st->stop_flag = 1;
                     MUTEX_UNLOCK(st->result_mutex);
                 }
             }
@@ -3147,6 +3565,13 @@ EXPORT SsaEngine *ssa_engine_create(
     return eng;
 }
 
+/* p96: the engine stops by itself after n matches (0 = no limit). Set it
+ * right after ssa_engine_create. */
+EXPORT void ssa_engine_set_max_found(SsaEngine *eng, int64_t n) {
+    if (eng) eng->state.max_found = n > 0 ? n : 0;
+    if (eng && n > 0 && eng->state.found_count >= n) eng->stop_flag = 1;
+}
+
 EXPORT void ssa_engine_stop(SsaEngine *eng) {
     if (eng) eng->stop_flag = 1;
 }
@@ -3181,6 +3606,27 @@ EXPORT int ssa_engine_profile(SsaEngine *eng, int64_t *out, int max_conds) {
         out[3 * i + 2] = (int64_t)st->prof_ticks[i];
     }
     out[3 * n] = (int64_t)st->prof_total;
+    MUTEX_UNLOCK(st->work_mutex);
+    return n;
+}
+
+/* Same as ssa_engine_profile with 5 values per condition: seeds reached,
+ * seeds whose branch passed, own CPU ticks, own checks, own checks passed;
+ * then the total ticks. */
+EXPORT int ssa_engine_profile2(SsaEngine *eng, int64_t *out, int max_conds) {
+    if (!eng || !out) return 0;
+    EngineState *st = &eng->state;
+    int n = st->n_conds < max_conds ? st->n_conds : max_conds;
+    if (n > MAX_CONDS) n = MAX_CONDS;
+    MUTEX_LOCK(st->work_mutex);
+    for (int i = 0; i < n; i++) {
+        out[5 * i] = st->prof_reached[i];
+        out[5 * i + 1] = st->prof_passed[i];
+        out[5 * i + 2] = (int64_t)st->prof_ticks[i];
+        out[5 * i + 3] = st->prof_checks[i];
+        out[5 * i + 4] = st->prof_checks_ok[i];
+    }
+    out[5 * n] = (int64_t)st->prof_total;
     MUTEX_UNLOCK(st->work_mutex);
     return n;
 }
@@ -3297,6 +3743,7 @@ EXPORT int ssa_ctype_biome_filter(void)       { return CTYPE_BIOME_FILTER; }
 EXPORT int ssa_ctype_biome_sample(void)       { return CTYPE_BIOME_SAMPLE; }
 EXPORT int ssa_ctype_biome_center(void)       { return CTYPE_BIOME_CENTER; }
 EXPORT int ssa_ctype_climate_minmax(void)     { return CTYPE_CLIMATE_MINMAX; }
+EXPORT int ssa_ctype_climate_area(void)       { return CTYPE_CLIMATE_AREA; }
 EXPORT int ssa_ctype_crunchiness(void)        { return CTYPE_CRUNCHINESS; }
 EXPORT int ssa_ctype_climate_noise(void)      { return CTYPE_CLIMATE_NOISE; }
 EXPORT int ssa_ctype_noise_sample(void)       { return CTYPE_NOISE_SAMPLE; }
@@ -3336,10 +3783,54 @@ EXPORT int ssa_village_abandoned(int mc, int large, uint64_t seed, int x, int z)
  * Mono-thread (le parallélisme massif est déjà fait par le GPU en amont ; ici on
  * ne traite qu'une fraction des seeds). Renvoie le nombre de seeds retenues.
  * ─────────────────────────────────────────────────────────────────────────── */
+static int64_t test_seeds_batch_impl(
+        const SsaCond *conds, int n_conds, int mc, int large,
+        const int64_t *in_seeds, int64_t n_in,
+        int64_t *out_seeds, int64_t out_cap, SsaProf *prof);
+
 EXPORT int64_t ssa_test_seeds_batch(
         const SsaCond *conds, int n_conds, int mc, int large,
         const int64_t *in_seeds, int64_t n_in,
         int64_t *out_seeds, int64_t out_cap) {
+    return test_seeds_batch_impl(conds, n_conds, mc, large, in_seeds, n_in,
+                                 out_seeds, out_cap, NULL);
+}
+
+/* Same, with the per-condition statistics of the search engine (01/10): the
+ * GPU pipelines validate their survivors here, and their sessions had no stats.
+ * prof_out = 5 * n_conds + 1 int64 counters, ADDED to (atomically: several
+ * validator threads share one buffer) — per condition: seeds reached, branch
+ * passed, own ticks (sampled 1 seed in 32), checks, checks passed; then the
+ * ticks of the whole seed tests. Same counting as ssa_engine_profile2. */
+EXPORT int64_t ssa_test_seeds_batch_prof(
+        const SsaCond *conds, int n_conds, int mc, int large,
+        const int64_t *in_seeds, int64_t n_in,
+        int64_t *out_seeds, int64_t out_cap, int64_t *prof_out) {
+    if (!prof_out)
+        return test_seeds_batch_impl(conds, n_conds, mc, large, in_seeds, n_in,
+                                     out_seeds, out_cap, NULL);
+    SsaProf *pf = (SsaProf *)calloc(1, sizeof(SsaProf));
+    int64_t kept = test_seeds_batch_impl(conds, n_conds, mc, large, in_seeds, n_in,
+                                         out_seeds, out_cap, pf);
+    if (pf) {
+        int n = n_conds < MAX_CONDS ? n_conds : MAX_CONDS;
+        for (int i = 0; i < n; i++) {
+            __atomic_fetch_add(&prof_out[5 * i],     pf->reached[i],   __ATOMIC_RELAXED);
+            __atomic_fetch_add(&prof_out[5 * i + 1], pf->passed[i],    __ATOMIC_RELAXED);
+            __atomic_fetch_add(&prof_out[5 * i + 2], (int64_t)pf->ticks[i], __ATOMIC_RELAXED);
+            __atomic_fetch_add(&prof_out[5 * i + 3], pf->checks[i],    __ATOMIC_RELAXED);
+            __atomic_fetch_add(&prof_out[5 * i + 4], pf->checks_ok[i], __ATOMIC_RELAXED);
+        }
+        __atomic_fetch_add(&prof_out[5 * n], (int64_t)pf->total_ticks, __ATOMIC_RELAXED);
+        free(pf);
+    }
+    return kept;
+}
+
+static int64_t test_seeds_batch_impl(
+        const SsaCond *conds, int n_conds, int mc, int large,
+        const int64_t *in_seeds, int64_t n_in,
+        int64_t *out_seeds, int64_t out_cap, SsaProf *prof) {
     if (n_conds <= 0 || n_conds > MAX_CONDS || n_in <= 0) return 0;
 
     /* Ordre d'évaluation des enfants, propre à CET appel (thread-safe) */
@@ -3372,13 +3863,14 @@ EXPORT int64_t ssa_test_seeds_batch(
     SsaEnv env;
     memset(&env, 0, sizeof(env));
     env.co = co;
+    env.prof = prof;                    /* per-condition stats (NULL = off) */
     env.mc = mc; env.large = large;
     env.current_dim = -2;
     env.gbn_seed = ~0ULL; env.gbn_nmax = -999;
     for (int i = 0; i < NP_MAX; i++)
         for (int s = 0; s < CLIM_NSLOT; s++) {
             env.climate_cache_nmax[i][s] = -2;
-            env.climate_cache_seed[i][s] = 0xdeadbeefcafebabeULL;
+            env.climate_cache_seed[i][s] = 0xdeadbeefcafebabeULL; env.clazy[i].valid = 0;
         }
     uint32_t flags = large ? LARGE_BIOMES : 0;
     setupGenerator(&env.g, mc, flags);
@@ -3396,8 +3888,17 @@ EXPORT int64_t ssa_test_seeds_batch(
          * biomes of the FIRST seed of the batch → every biome / viability test
          * of the GPU-survivor validation used the wrong world. */
         env.current_dim = -2;
-        if (ssa_test_seed_sorted(&env, conds, n_conds, caches,
-                                  toplevel_order, n_toplevel)) {
+        prof_seed_begin(prof);
+        /* every seed is timed here (02/10): the counter restarts at each call and
+         * the GPU validators call with a few survivors at a time, so the engine's
+         * « 1 seed in 32 » sampling never fired → no time at all (« — » in the
+         * stats). The survivors are few and costly: timing them all is free. */
+        if (prof) prof->timing = 1;
+        uint64_t pt0 = (prof && prof->timing) ? SSA_TICKS() : 0;
+        int ok = ssa_test_seed_sorted(&env, conds, n_conds, caches,
+                                      toplevel_order, n_toplevel);
+        if (prof && prof->timing) prof->total_ticks += SSA_TICKS() - pt0;
+        if (ok) {
             if (kept < out_cap) out_seeds[kept] = in_seeds[i];
             kept++;
         }
@@ -3449,7 +3950,7 @@ EXPORT int ssa_eval_single(const SsaCond *conds, int mc, int large, int64_t seed
     for (int i = 0; i < NP_MAX; i++)
         for (int k = 0; k < CLIM_NSLOT; k++) {
             env.climate_cache_nmax[i][k] = -2;
-            env.climate_cache_seed[i][k] = 0xdeadbeefcafebabeULL;
+            env.climate_cache_seed[i][k] = 0xdeadbeefcafebabeULL; env.clazy[i].valid = 0;
         }
     setupGenerator(&env.g, mc, large ? LARGE_BIOMES : 0);
     env.seed = (uint64_t)seed;
@@ -3505,7 +4006,7 @@ static int explain_impl(const SsaCond *conds, int n_conds, int mc, int large, in
     for (int i = 0; i < NP_MAX; i++)
         for (int s = 0; s < CLIM_NSLOT; s++) {
             env->climate_cache_nmax[i][s] = -2;
-            env->climate_cache_seed[i][s] = 0xdeadbeefcafebabeULL;
+            env->climate_cache_seed[i][s] = 0xdeadbeefcafebabeULL; env->clazy[i].valid = 0;
         }
     setupGenerator(&env->g, mc, large ? LARGE_BIOMES : 0);
     env->seed = (uint64_t)seed;
@@ -3612,7 +4113,7 @@ EXPORT int64_t ssa_expand_lows(
         for (int i = 0; i < NP_MAX; i++)
             for (int s = 0; s < CLIM_NSLOT; s++) {
                 env.climate_cache_nmax[i][s] = -2;
-                env.climate_cache_seed[i][s] = 0xdeadbeefcafebabeULL;
+                env.climate_cache_seed[i][s] = 0xdeadbeefcafebabeULL; env.clazy[i].valid = 0;
             }
         setupGenerator(&env.g, mc, flags);
 

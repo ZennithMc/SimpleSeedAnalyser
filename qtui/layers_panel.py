@@ -85,17 +85,50 @@ class LayersPanel(QWidget):
             b.clicked.connect(lambda _=False, v=val: self._set_all(v))
             row.addWidget(b)
         lay.addLayout(row)
+        from condition_types import DISABLED_TYPES
         for key in SURFACE:
+            if key in DISABLED_TYPES:            # temporarily hidden (abandoned camp, 01/10)
+                self.map.visible[key] = False
+                continue
             if key in cw.STRUCTURE_TYPES:
                 label = struct_icons.label(key)
-                lay.addWidget(self._toggle(key, label, key))
-                if key == "village":             # zombie villages: own icon, own switch
-                    zb = self._toggle("zombie_village", "Abandoned village", "zombie_village")
-                    zb.setToolTip("Zombie villages (≈ 2 % of villages): no villagers, cobwebs,\n"
-                                  "zombie villagers. Shown with their own icon.")
-                    lay.addWidget(zb)
+                tg = self._toggle(key, label, key)
+                if key == "village":             # abandoned villages: own icon, same switch (01/10)
+                    tg.setToolTip("Also shows abandoned (zombie) villages, ≈ 2 % of villages,\n"
+                                  "with their own icon.")
+                lay.addWidget(tg)
         lay.addWidget(body("Structures appear when zoomed in (≤ 48 blocks per pixel).",
                            muted=True, small=True))
+        # coordinate grid (like cubiomes-viewer), 01/10
+        grow = QHBoxLayout(); grow.setSpacing(6)
+        self.grid = QCheckBox("Grid")
+        self.grid.setIcon(icons.icon("grid", 16))
+        self.grid.setChecked(bool(self.map.visible.get("__grid")))
+        self.grid.setToolTip("Coordinate lines on the map, with their X / Z along the edges.\n"
+                             "Every 8th line is brighter (with Chunks: the 512-block regions);\n"
+                             "X = 0 and Z = 0 are the brightest.")
+        self.grid_step = QComboBox()
+        for lab, v in (("Auto", 0), ("Chunks (16)", 16), ("64", 64), ("256", 256),
+                       ("Regions (512)", 512), ("1 024", 1024), ("4 096", 4096), ("16 384", 16384)):
+            self.grid_step.addItem(lab, v)
+        i = self.grid_step.findData(int(self.map.ov.get("grid_step", 0) or 0))
+        self.grid_step.setCurrentIndex(max(0, i))
+        self.grid_step.setToolTip("Line spacing in blocks. Auto follows the zoom; a fixed spacing\n"
+                                  "that would be too dense when zoomed out is doubled until readable.")
+        self.grid_step.setEnabled(self.grid.isChecked())
+
+        def _grid_on(on):
+            self.map.visible["__grid"] = on
+            self.grid_step.setEnabled(on)
+            self.map.update(); self.changed.emit()
+
+        def _grid_step(_i):
+            self.map.ov["grid_step"] = int(self.grid_step.currentData() or 0)
+            self.map.update(); self.changed.emit()
+        self.grid.toggled.connect(_grid_on)
+        self.grid_step.currentIndexChanged.connect(_grid_step)
+        grow.addWidget(self.grid); grow.addWidget(self.grid_step, 1)
+        lay.addSpacing(4); lay.addLayout(grow)
         self.legend = QCheckBox("Legend on the map")
         self.legend.setIcon(icons.icon("legend", 16))
         self.legend.setToolTip("A small card on the map: the icons shown and how many of each are on screen.")
@@ -180,13 +213,13 @@ class LayersPanel(QWidget):
         lay.addSpacing(12); lay.addWidget(hline()); lay.addSpacing(10)
 
         # ── crunchiness of the seed (classic UI's heatmap, 27/09) ──────
-        from .crunch_view import CrunchView, GradientLegend
-        lay.addWidget(section_title("Crunchiness"))
+        from .crunch_view import CrunchView, DelayedTipTitle, GradientLegend
+        lay.addWidget(DelayedTipTitle(section_title("Crunchiness"),
+            "Each cell: one octave (streams A, B) of a climate noise, |y − 0.5| of its\n"
+            "lattice offset. Score: the weighted mean of these octave offsets —\n"
+            "the Crunchiness condition's scale: 0 = crunchy, ≈ 0.25 = random, 0.5 = bland.\n"
+            "Click a cell or a score to show it on the map."))
         self.crunch = CrunchView()
-        self.crunch.setToolTip("Fractional Y of each octave's Perlin lattice, streams A and B.\n"
-                               "y ≈ 0.5 → crunchy octave, y near 0 or 1 → bland.\n"
-                               "Score = weighted mean per climate (1 = very crunchy).\n"
-                               "Click a cell: the map shows that octave only; a score: the whole noise.")
         self.crunch.picked.connect(self._crunch_pick)
         self.crunch.hovered.connect(self._crunch_info)
         lay.addWidget(self.crunch)
@@ -213,6 +246,10 @@ class LayersPanel(QWidget):
 
         world.changed.connect(self._refresh_availability)
         world.changed.connect(self._crunch_refresh)
+        self._era_palette = dict(self.ERA_PALETTE)
+        world.changed.connect(self._apply_era_palette)
+        self._apply_era_palette()
+        theme.signals.changed.connect(self._crunch_info)      # colour baked in its style
         self.map.overlayChanged.connect(self._crunch_current)
         self._refresh_availability()
         self._on_noise("Off")
@@ -237,8 +274,9 @@ class LayersPanel(QWidget):
             best = [(v["score"], n) for (cid, _a, n) in _CL
                     for v in [self.crunch.data.get(cid, {})] if v.get("score") is not None]
             if best:
-                s, n = max(best)
-                d = (f"Most crunchy: {n} ({s:.2f}) · hover a cell for details", QColor(theme.TEXT2))
+                s, n = min(best)
+                d = (f"Most crunchy: {n} ({s:.2f}; 0 = crunchy, 0.5 = bland) · hover a cell for details",
+                     QColor(theme.TEXT2))
             else:
                 d = ("—", QColor(theme.TEXT3))
         text, col = d
@@ -352,7 +390,26 @@ class LayersPanel(QWidget):
             if not key.startswith("__") and cb.isEnabled():
                 cb.setChecked(on)
 
+    # default biome colours by era (03/10): Cooler & Brighter before 1.18, True
+    # Colors from 1.18; a palette chosen by hand is kept for that era
+    ERA_PALETTE = {False: "Cooler & Brighter (Zennith)", True: "True Colors (ShowMe7)"}
+
+    def _era(self):
+        return self.world.mc >= cw.MC_VERSIONS["Java 1.18"]
+
+    def _apply_era_palette(self):
+        era = self._era()
+        if era == getattr(self, "_pal_era", None):
+            return
+        self._pal_era = era
+        want = self._era_palette.get(era)
+        if want in palette_names() and self.palette.currentText() != want:
+            self.palette.setCurrentText(want)
+
     def _on_palette(self, name):
+        if not hasattr(self, "_era_palette"):
+            self._era_palette = dict(self.ERA_PALETTE)
+        self._era_palette[self._era()] = name
         self.map.engine.set_palette(name)
         self.map.update()
 

@@ -9,15 +9,31 @@
 static const int PSX[14]={0,6,9,8,8,10,5,9,14,10,12,11,11,16};
 static const int PSY[14]={0,10,12,9,9,10,7,7,9,8,8,17,16,16};
 static const int PSZ[14]={0,6,9,9,9,7,7,9,9,9,10,16,16,16};
-typedef struct { Generator g; SurfaceNoise sn; int gen_mc; uint64_t surf_seed; int surf_ok; } Ctx;
+// `large` = setupGenerator flags (LARGE_BIOMES or 0) of this context. Set with
+// cb_set_large() right after cb_create(); every function below that sets up the
+// generator uses it (was hard-wired to 0 -> Large Biomes worlds were searched
+// as default worlds). Stored in the context so the existing exports keep their
+// signature (ABI-compatible with the Python bindings of an older build).
+typedef struct { Generator g; SurfaceNoise sn; int gen_mc; uint64_t surf_seed; int surf_ok; int large; } Ctx;
 EXPORT void* cb_create(){ Ctx*c=calloc(1,sizeof(Ctx)); if(c)c->gen_mc=-1; return c; }
 EXPORT void cb_free(void*p){ free(p); }
+// Select the world type of the context: large != 0 -> LARGE_BIOMES. Forces the
+// next call to re-run setupGenerator (the cached generator is version+flags).
+EXPORT void cb_set_large(void*p,int large){
+    Ctx*c=p; int f = large ? LARGE_BIOMES : 0;
+    if(c->large != f){ c->large=f; c->gen_mc=-1; }
+}
+// Cached generator setup (version + world type). Returns nothing; applySeed is
+// left to the caller.
+static void cb_gen_setup(Ctx*c,int mc){
+    if(c->gen_mc != mc){ setupGenerator(&c->g,mc,(uint32_t)c->large); c->gen_mc=mc; }
+}
 // FAST setup for the corrupted SCAN : setupGenerator is cached (version-only,
 // not seed) and we DON'T init the surface noise (only needed for the ruined Y,
 // which the search no longer uses — the perfect checker computes Y exactly).
 EXPORT void cb_setup(void*p,int mc,uint64_t seed){
     Ctx*c=p;
-    if(c->gen_mc != mc){ setupGenerator(&c->g,mc,0); c->gen_mc=mc; }
+    cb_gen_setup(c,mc);
     applySeed(&c->g,DIM_OVERWORLD,seed);
 }
 // 1er stronghold : anneau (sans biome) + snappé (avec biome)
@@ -34,7 +50,7 @@ EXPORT int cb_first_stronghold(void*p,int mc,uint64_t seed,int*ringx,int*ringz,i
 // 128-strongholds search mode (the corrupted/MaxY/eye finders then check each).
 EXPORT int cb_strongholds128(void*p,int mc,uint64_t seed,int*out_xz,int max_count){
     Ctx*c=p;
-    if(c->gen_mc != mc){ setupGenerator(&c->g,mc,0); c->gen_mc=mc; }
+    cb_gen_setup(c,mc);
     applySeed(&c->g,DIM_OVERWORLD,seed);
     StrongholdIter sh;
     initFirstStronghold(&sh,mc,seed);
@@ -52,7 +68,7 @@ EXPORT int cb_strongholds128(void*p,int mc,uint64_t seed,int*out_xz,int max_coun
 EXPORT int seedlist_first_stronghold(void*p,int mc,const int64_t*seeds,int n,
                                      int*out_x,int*out_z){
     Ctx*c=p;
-    if(c->gen_mc != mc){ setupGenerator(&c->g,mc,0); c->gen_mc=mc; }
+    cb_gen_setup(c,mc);
     for(int i=0;i<n;i++){
         uint64_t seed=(uint64_t)seeds[i];
         applySeed(&c->g,DIM_OVERWORLD,seed);
@@ -70,13 +86,35 @@ EXPORT int seedlist_first_stronghold(void*p,int mc,const int64_t*seeds,int n,
 EXPORT int cb_strongholds128_arr(void*p,int mc,const int64_t*seeds,int n,
                                  uint64_t*out_seed,int*out_x,int*out_z,int max_out){
     Ctx*c=p;
-    if(c->gen_mc != mc){ setupGenerator(&c->g,mc,0); c->gen_mc=mc; }
+    cb_gen_setup(c,mc);
     int k=0;
     for(int i=0;i<n;i++){
         uint64_t s=(uint64_t)seeds[i];
         applySeed(&c->g,DIM_OVERWORLD,s);
         StrongholdIter sh; initFirstStronghold(&sh,mc,s);
         for(int si=0;si<128;si++){
+            int rem=nextStronghold(&sh,&c->g);
+            if(k<max_out){ out_seed[k]=s; out_x[k]=sh.pos.x; out_z[k]=sh.pos.z; }
+            k++;
+            if(rem<=0) break;
+        }
+    }
+    return k;
+}
+// The FIRST per_seed strongholds of EACH seed (per_seed = 3: the first ring;
+// 128: all, same as cb_strongholds128_arr). Flattened (seed, x, z). 03/10.
+EXPORT int cb_strongholds_n_arr(void*p,int mc,const int64_t*seeds,int n,int per_seed,
+                                uint64_t*out_seed,int*out_x,int*out_z,int max_out){
+    Ctx*c=p;
+    cb_gen_setup(c,mc);
+    int k=0;
+    if(per_seed<1) per_seed=1;
+    if(per_seed>128) per_seed=128;
+    for(int i=0;i<n;i++){
+        uint64_t s=(uint64_t)seeds[i];
+        applySeed(&c->g,DIM_OVERWORLD,s);
+        StrongholdIter sh; initFirstStronghold(&sh,mc,s);
+        for(int si=0;si<per_seed;si++){
             int rem=nextStronghold(&sh,&c->g);
             if(k<max_out){ out_seed[k]=s; out_x[k]=sh.pos.x; out_z[k]=sh.pos.z; }
             k++;
@@ -187,7 +225,7 @@ EXPORT int cb_ruined_detail(void*p,int mc,uint64_t seed,int regX,int regZ,int*ou
 EXPORT int cb_corrupt_scan(void*p,int mc,uint64_t start,int n,int thr,int gate,
                            uint64_t*out,int max_out){
     Ctx*c=p;
-    if(c->gen_mc != mc){ setupGenerator(&c->g,mc,0); c->gen_mc=mc; }
+    cb_gen_setup(c,mc);
     int RS=640, k=0;
     for(int i=0;i<n;i++){
         uint64_t s=start+(uint64_t)i;
@@ -219,13 +257,40 @@ EXPORT int cb_corrupt_scan(void*p,int mc,uint64_t start,int n,int thr,int gate,
 EXPORT int cb_corrupt_scan128(void*p,int mc,uint64_t start,int n,int gate,
                               uint64_t*out_seed,int*out_x,int*out_z,int max_out){
     Ctx*c=p;
-    if(c->gen_mc != mc){ setupGenerator(&c->g,mc,0); c->gen_mc=mc; }
+    cb_gen_setup(c,mc);
     int RS=640, k=0;
     for(int i=0;i<n;i++){
         uint64_t s=start+(uint64_t)i;
         applySeed(&c->g,DIM_OVERWORLD,s);
         StrongholdIter sh; initFirstStronghold(&sh,mc,s);
         for(int si=0;si<128;si++){
+            int rem=nextStronghold(&sh,&c->g);
+            int sx=sh.pos.x, sz=sh.pos.z;
+            int sgx=(int)floorf((float)sx/RS), sgz=(int)floorf((float)sz/RS), hit=0;
+            for(int a=-1;a<=1&&!hit;a++)for(int b=-1;b<=1&&!hit;b++){
+                Pos pp; if(!getStructurePos(Ruined_Portal,mc,s,sgx+a,sgz+b,&pp))continue;
+                int ax=abs(pp.x-sx),az=abs(pp.z-sz),d=ax>az?ax:az; if(d<=gate)hit=1;
+            }
+            if(hit){ if(k<max_out){out_seed[k]=s;out_x[k]=sx;out_z[k]=sz;} k++; }
+            if(rem<=0) break;
+        }
+    }
+    return k;
+}
+// cb_corrupt_scan128 limited to the FIRST per_seed strongholds of each seed
+// (3 = the first ring). Same gate, same outputs. 03/10.
+EXPORT int cb_corrupt_scan_n(void*p,int mc,uint64_t start,int n,int gate,int per_seed,
+                             uint64_t*out_seed,int*out_x,int*out_z,int max_out){
+    Ctx*c=p;
+    cb_gen_setup(c,mc);
+    int RS=640, k=0;
+    if(per_seed<1) per_seed=1;
+    if(per_seed>128) per_seed=128;
+    for(int i=0;i<n;i++){
+        uint64_t s=start+(uint64_t)i;
+        applySeed(&c->g,DIM_OVERWORLD,s);
+        StrongholdIter sh; initFirstStronghold(&sh,mc,s);
+        for(int si=0;si<per_seed;si++){
             int rem=nextStronghold(&sh,&c->g);
             int sx=sh.pos.x, sz=sh.pos.z;
             int sgx=(int)floorf((float)sx/RS), sgz=(int)floorf((float)sz/RS), hit=0;

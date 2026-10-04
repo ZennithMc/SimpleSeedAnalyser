@@ -28,8 +28,8 @@ from . import icons, theme
 
 
 def lib_dir() -> str:
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, "SimpleSeedAnalyser", "library")
+    import ssa_paths
+    d = os.path.join(ssa_paths.data_dir(), "library")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -83,8 +83,10 @@ def _read_meta(path) -> dict:
     try:
         m["modified"] = datetime.datetime.fromtimestamp(os.path.getmtime(path)).isoformat(
             timespec="seconds")
+        from cubiomes_session import ssa_line
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for ln in f:
+                ln = ssa_line(ln)
                 if ln.startswith("#Cond:"):
                     m["n_cond"] += 1
                     try:
@@ -146,19 +148,21 @@ def update_meta(path, **kw):
     """Change name / description of an entry without touching the rest."""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         lines = f.read().split("\n")
+    from cubiomes_session import ssa_line
     st, idx = {}, None
     for i, ln in enumerate(lines):
-        if ln.startswith("#SSAState:"):
+        if ssa_line(ln).startswith("#SSAState:"):
             idx = i
             try:
-                st = json.loads(ln[len("#SSAState:"):])
+                st = json.loads(ssa_line(ln)[len("#SSAState:"):])
             except Exception:
                 st = {}
             break
     st.update(kw)
-    new = "#SSAState: " + json.dumps(st, ensure_ascii=False, separators=(",", ":"))
+    new = "#Desc: #SSAState: " + json.dumps(st, ensure_ascii=False, separators=(",", ":"))
     if idx is None:
-        at = next((i for i, ln in enumerate(lines) if ln.startswith("#Cond") or ln.startswith("#SSA:")),
+        at = next((i for i, ln in enumerate(lines) if ln.startswith("#Cond")
+                   or ssa_line(ln).startswith("#SSA:")),
                   len(lines))
         lines.insert(at, new)
     else:

@@ -102,7 +102,8 @@ class StrongholdDetailsDialog(QDialog):
 
 
 class _Loader(QObject):
-    done = Signal(list, dict)
+    done = Signal(object, object)       # (object: a dict through Qt would get str keys)
+    broken = Signal(int, object)          # (stronghold #, result | error text) — 03/10
 
 
 class _Num(QTableWidgetItem):
@@ -132,10 +133,11 @@ class StrongholdListDialog(QDialog):
         v.addLayout(top)
         v.addWidget(body("Click a column to sort. Double-click a row (or Go) to centre the map on it.",
                          muted=True, small=True))
-        cols = ["#", "Ring", "X", "Z", "Eyes", "", "Top Y", "Distance"]
-        self.corr = mc <= 21
-        if self.corr:
-            cols.append("Corruptible")
+        # « Broken »: is the end portal broken by a ruined portal? Checked by the real
+        # Minecraft 1.16 generation (mc_checker) for the strongholds a ruined portal
+        # can reach; the others are not broken (03/10, replaces « Distance »)
+        cols = ["#", "Ring", "X", "Z", "Eyes", "", "Top Y", "Broken"]
+        self.corr = mc in (19, 20)
         cols.append("")
         self.table = QTableWidget(0, len(cols))
         self.table.setHorizontalHeaderLabels(cols)
@@ -148,6 +150,9 @@ class StrongholdListDialog(QDialog):
         for i in range(len(cols)):
             hh.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        if not self.corr:                     # broken portals: checked in 1.16 only
+            self.table.setColumnHidden(7, True)
+            hh.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.table.cellDoubleClicked.connect(lambda r, _c: self._go(r))
         v.addWidget(self.table, 1)
         row = QHBoxLayout(); row.addStretch(1)
@@ -155,6 +160,7 @@ class StrongholdListDialog(QDialog):
         v.addLayout(row)
         self._loader = _Loader(self)
         self._loader.done.connect(self._fill)
+        self._loader.broken.connect(self._set_broken)
         threading.Thread(target=self._load, args=(strongholds,), daemon=True).start()
 
     def _load(self, strongholds):
@@ -202,26 +208,131 @@ class StrongholdListDialog(QDialog):
                     (f"{eyes}/12", eyes), ("█" * eyes + "░" * (12 - eyes), eyes),
                     (str(maxy) if maxy is not None else "—", maxy if maxy is not None else -9999),
                     (f"{dist:,}".replace(",", " "), dist)]
-            if self.corr:
-                c = corr.get(idx - 1)
-                n = int(c.get("corruptible", 0)) if c else 0
-                vals.append((f"● {n}" if n > 0 else "—", n))
+            vals.pop()                                     # (no Distance column any more)
+            if not self.corr:
+                vals.append(("1.16 only", -2))
+            elif corr.get(idx - 1) and int(corr[idx - 1].get("corruptible", 0)) > 0:
+                vals.append(("checking…", -1))              # checked by Minecraft below
+            else:
+                vals.append(("✗", 0))
             for cidx, (text, key) in enumerate(vals):
                 it = _Num(text); it.setData(Qt.ItemDataRole.UserRole, key)
                 it.setFont(mono)
                 if cidx in (4, 5):
                     it.setForeground(QColor(eye_color(eyes)))
-                if self.corr and cidx == len(vals) - 1 and key:
-                    it.setForeground(QColor("#5fd35f"))
+                if cidx == 7:
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    if not self.corr:
+                        it.setForeground(QColor(theme.TEXT3))
+                        it.setToolTip("Broken portals are checked in Java 1.16 / 1.16.1 only "
+                                      "(the checker is the real Minecraft 1.16 generation).")
+                    elif key == 0:
+                        it.setForeground(QColor(theme.DANGER))
+                        it.setToolTip("Not broken: no ruined portal reaches this end portal.")
+                    else:
+                        it.setForeground(QColor(theme.TEXT3))
+                        it.setToolTip("A ruined portal can reach the portal: checking it with "
+                                      "the real Minecraft generation…")
                 self.table.setItem(r, cidx, it)
             go = QPushButton("Go"); go.setProperty("kind", "ghost")
             go.clicked.connect(lambda _=False, xx=x, zz=z: self.goto.emit(xx, zz))
             self.table.setCellWidget(r, len(vals), go)
             self.table.item(r, 0).setData(Qt.ItemDataRole.UserRole + 1, (x, z))
         self.table.setSortingEnabled(True)
-        self.table.sortItems(4, Qt.SortOrder.DescendingOrder)
+        # the last sort chosen (column + order) is kept between seeds (03/10)
+        from PySide6.QtCore import QSettings
+        qs = QSettings("SSA", "SimpleSeedAnalyser")
+        try:
+            col = int(qs.value("stronghold/list_sort_col", 4))
+            desc = str(qs.value("stronghold/list_sort_desc", "true")).lower() in ("true", "1")
+        except (TypeError, ValueError):
+            col, desc = 4, True
+        if not (0 <= col < self.table.columnCount() - 1) or self.table.isColumnHidden(col):
+            col = 4
+        self.table.sortItems(col, Qt.SortOrder.DescendingOrder if desc else Qt.SortOrder.AscendingOrder)
+
+        def _remember(c, order):
+            qs.setValue("stronghold/list_sort_col", int(c))
+            qs.setValue("stronghold/list_sort_desc",
+                        "true" if order == Qt.SortOrder.DescendingOrder else "false")
+        self.table.horizontalHeader().sortIndicatorChanged.connect(_remember)
         n = len(rows)
         self.summary.setText(f"{n} strongholds · {total} eyes · avg {total / max(1, n):.1f}")
+        if self.corr:
+            self._check_broken([(idx, x, z) for (idx, x, z, _e, _m) in rows
+                                if corr.get(idx - 1) and int(corr[idx - 1].get("corruptible", 0)) > 0])
+
+    def _check_broken(self, todo):
+        """Sends the reachable strongholds to the Minecraft checker (background)."""
+        if not todo:
+            return
+        try:
+            import mc_checker
+            ok, why = mc_checker.status()
+        except Exception as e:
+            ok, why = False, str(e)
+        if not ok:
+            for idx, _x, _z in todo:
+                self._loader.broken.emit(idx, why)
+            return
+        seed, mc, sig = self.seed, self.mc, self._loader.broken
+
+        def run():
+            import ruined_portal as rp
+            try:
+                pool = mc_checker.pool()
+            except Exception as e:
+                for idx, _x, _z in todo:
+                    sig.emit(idx, str(e))
+                return
+            for idx, x, z in todo:
+                try:
+                    rq = rp.corrupt_request_for(int(seed), mc, sx=x, sz=z)
+                except Exception:
+                    rq = None
+                if rq is None:
+                    sig.emit(idx, dict(forced=0, natural=0))
+                    continue
+                frames, _ex, _ez, rox, roz = rq
+
+                def cb(res, err, idx=idx):
+                    sig.emit(idx, res if res is not None else (err or "checker error"))
+                pool.submit(int(seed), frames, rox, roz, cb, natural="auto",
+                            sh=getattr(rq, "sh", None))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _set_broken(self, idx, res):
+        """One checker answer → the « Broken » cell of stronghold #idx."""
+        for r in range(self.table.rowCount()):
+            it0 = self.table.item(r, 0)
+            if it0 is None or it0.data(Qt.ItemDataRole.UserRole) != idx:
+                continue
+            it = self.table.item(r, 7)
+            if it is None:
+                return
+            sorting = self.table.isSortingEnabled()
+            self.table.setSortingEnabled(False)
+            if isinstance(res, dict):
+                n = int(res.get("forced", 0))
+                if n > 0:
+                    nat = int(res.get("natural", -1))
+                    it.setText(f"✓ {n}" + ("" if nat > 0 else " /tp"))
+                    it.setForeground(QColor(theme.OK))
+                    it.setToolTip(f"Broken by a ruined portal: {n} frame(s) missing in Minecraft"
+                                  + ("" if nat > 0 else " — when the portal's chunks are "
+                                     "generated before the ruined portal's chunk (arrive "
+                                     "from the portal's side, see the Stronghold page)."))
+                    it.setData(Qt.ItemDataRole.UserRole, n)
+                else:
+                    it.setText("✗"); it.setForeground(QColor(theme.DANGER))
+                    it.setToolTip("Checked with Minecraft: not broken.")
+                    it.setData(Qt.ItemDataRole.UserRole, 0)
+            else:
+                it.setText("?"); it.setForeground(QColor(theme.WARN))
+                it.setToolTip("Not checked: " + str(res))
+                it.setData(Qt.ItemDataRole.UserRole, -1)
+            self.table.setSortingEnabled(sorting)
+            return
 
     def _go(self, r):
         it = self.table.item(r, 0)

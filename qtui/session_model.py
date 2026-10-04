@@ -66,6 +66,8 @@ def icon_type(c: dict) -> str:
     t = c.get("type", "")
     if t == "village" and (c.get("params") or {}).get("variant") == "abandoned":
         return "zombie_village"
+    if t == "igloo" and (c.get("params") or {}).get("variant") == "basement":
+        return "igloo_basement"
     return t
 
 
@@ -82,8 +84,18 @@ def area_text(c: dict) -> str:
         if t == "crunchiness":
             return f"score {'≤' if int(p.get('mode', 0)) == 0 else '≥'} {p.get('threshold', 0.1):g}"
         return ""
-    if t == "spiral":
-        base = f"step {p.get('step', 16)}"
+    if t == "climate_center":                     # flood fill: size and scale
+        sc = int(p.get("scale", 16) or 16)
+        mx = int(p.get("max_size", 0) or 0)
+        base = f"≥ {int(p.get('min_size', 1) or 1)}" + (f"…{mx}" if mx else "") + f" cells 1:{sc}"
+        x1, z1, x2, z2 = (int(c.get(k, 0)) for k in ("x1", "z1", "x2", "z2"))
+        if not int(c.get("rmax", 0) or 0) and x1 == x2 and z1 == z2:
+            return base + f" · within ±{128 * sc}"
+    elif t == "spiral":
+        _st = int(p.get('step', 16) or 512)
+        base = (f"step {_st // 16} chunk{'s' if _st != 16 else ''}"
+                if p.get("step_unit") == "chunks" and _st % 16 == 0
+                else f"step {_st} block{'s' if _st != 1 else ''}")
     else:
         base = ""
     rmax = int(c.get("rmax", 0) or 0)
@@ -94,9 +106,16 @@ def area_text(c: dict) -> str:
         if int(p.get("min_eyes", 0) or 0) > 0:
             bits.append(f"{'=' if p.get('exact_eyes') else '≥'}{p['min_eyes']} eyes")
         if p.get("maxy_enabled"):
-            bits.append(f"top Y ≥ {p.get('min_max_y', 60)}")
+            what = "room Y" if p.get("maxy_target") == "room" else "top Y"
+            bits.append(f"{what} ≥ {p.get('min_max_y', 60)}")
         if p.get("corrupt_enabled"):
-            bits.append("corruptible")
+            bits.append("broken portal")
+        if str(p.get("sh_scope", "")) == "All 128" or (not p.get("sh_scope") and p.get("scan_128")):
+            bits.append("any of 128")
+        elif str(p.get("sh_scope", "")) == "Ring 3":
+            bits.append("first ring")
+        if p.get("sh_anchor") == "portal":
+            bits.append("@ end portal")
         return " · ".join(bits) or "exists"
     if rmax:
         zone = f"r ≤ {rmax - 1}"
@@ -136,8 +155,9 @@ def new_condition(t: str) -> dict:
         c.update(area_mode=1, square_side=60_000_000, radial=0, rmax=0,
                  x1=-30_000_000, z1=-30_000_000, x2=30_000_000, z2=30_000_000)
     else:
-        r = 1024 if t != "spiral" else 2048
-        c.update(area_mode=0, radial=r, rmax=r + 1, x1=-r, z1=-r, x2=r, z2=r, square_side=0)
+        # area 0 by default (01/10): the user types the size he wants; before,
+        # every new condition started at 1 024 blocks (2 048 for a spiral)
+        c.update(area_mode=0, radial=0, rmax=0, x1=0, z1=0, x2=0, z2=0, square_side=0)
     if info.get("requires_at"):
         c["at_x"], c["at_z"] = 0, 0
     return c
@@ -416,11 +436,11 @@ class SessionModel(QObject):
             if c.get("type") in _SSA_TO_F and c.get("type") not in _SSA_ONLY:
                 try:
                     lines.append("#Cond: " + _encode_condition(full, i))
-                    lines.append("#SSAx: " + json.dumps(full, separators=(",", ":")))
+                    lines.append("#Desc: #SSAx: " + json.dumps(full, separators=(",", ":")))
                     continue
                 except Exception:
                     pass
-            lines.append("#SSA: " + json.dumps(full, separators=(",", ":")))
+            lines.append("#Desc: #SSA: " + json.dumps(full, separators=(",", ":")))
         return "\n".join(lines)
 
     def paste_text(self, text, parent=0):

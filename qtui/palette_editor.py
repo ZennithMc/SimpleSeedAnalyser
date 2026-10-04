@@ -733,7 +733,8 @@ class PaletteEditor(QDialog):
             name = f"{base} {k}"; k += 1
         return name
 
-    def _ask_name(self, title, default):
+    def _ask_name(self, title, default, allow=None):
+        """allow: a name accepted even if it exists (Rename: the current name)."""
         while True:
             name, ok = QInputDialog.getText(self, title, "Palette name:", text=default)
             if not ok:
@@ -741,7 +742,7 @@ class PaletteEditor(QDialog):
             name = name.strip()
             if not name or name.startswith("__"):
                 QMessageBox.warning(self, title, "Choose a name.")
-            elif name in npal.NOISE_PALETTE_NAMES:
+            elif name in npal.NOISE_PALETTE_NAMES and name != allow:
                 QMessageBox.warning(self, title, f"“{name}” already exists.")
             else:
                 return name
@@ -772,7 +773,9 @@ class PaletteEditor(QDialog):
         if self.palette in npal.BUILTIN_PALETTES:
             return
         old = self.palette
-        name = self._ask_name("Rename", old)
+        name = self._ask_name("Rename", old, allow=old)
+        if name == old:
+            return                               # same name: nothing to do (was "already exists")
         if name:
             data = copy.deepcopy(self.data)
             npal.remove_custom(old)

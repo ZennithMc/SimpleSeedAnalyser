@@ -190,7 +190,11 @@ SHORTCUTS = [
         ("Alt+W", "Weirdness"),
         ("Alt+Y", "Approx height"),
         ("Alt+Shift+Y", "Exact Y"),
+        ("Alt+1 … Alt+9", "Climate noise: only that octave (0A, 0B, 1A… in the list order)"),
+        ("Alt+Shift+1 … 9", "Climate noise: up to that octave"),
+        ("Alt+0", "Climate noise: all octaves"),
         ("Alt+G", "Octave arrows on / off (climate noises)"),
+        ("Alt+S", "Structure seed view: potential structure positions, biomes ignored"),
         ("Alt+Shift+G", "Octave arrows: Gradient ↔ Lattice"),
     ]),
     ("Sessions", [
@@ -309,14 +313,22 @@ class DecimalSpin(_QDSB):
         except ValueError:
             return self.value()
 
+    def fixup(self, text):
+        """Out of range when the field is left: clamp to the nearest bound
+        (01/10: typing 0.9 for a max of 0.5 was silently ignored)."""
+        try:
+            v = float(self._clean(text))
+        except ValueError:
+            return text
+        v = min(self.maximum(), max(self.minimum(), v))
+        return self.textFromValue(v)
+
     def textFromValue(self, v):
         s = f"{v:.{self.decimals()}f}"
         if "." in s:
             s = s.rstrip("0").rstrip(".")
         return s if s not in ("-0", "") else "0"
 
-    def fixup(self, text):
-        return self.textFromValue(self.valueFromText(text))
 
 
 # ── default folder of the file dialogs ─────────────────────────────────────
@@ -341,3 +353,54 @@ def remember_path(path):
     if path:
         QSettings("SSA", "SimpleSeedAnalyser").setValue("paths/last_dir",
                                                         _os.path.dirname(_os.path.abspath(path)))
+
+
+from PySide6.QtWidgets import QPushButton as _QPB
+
+
+class AdaptiveButton(_QPB):
+    """A push button that drops its text (icon only, text in the tooltip) when
+    the window is too narrow for it: its minimum width is the icon only, its
+    preferred width the full text. Used for the Start / Pause / Stop buttons,
+    whose run bars set the minimum window width (1276 px before, 29/09)."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._full = text
+        self._compact = False
+        from PySide6.QtWidgets import QSizePolicy
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+    def setText(self, text):
+        self._full = text
+        if not self._compact:
+            super().setText(text)
+        self.setToolTip(text.strip() if self._compact else self.toolTip())
+        self.updateGeometry()
+
+    def text(self):
+        return self._full
+
+    def _full_width(self):
+        fm = self.fontMetrics()
+        icon = self.iconSize().width() + 8 if not self.icon().isNull() else 0
+        return fm.horizontalAdvance(self._full) + icon + 34
+
+    def sizeHint(self):
+        s = super().sizeHint()
+        s.setWidth(max(s.width(), self._full_width()))
+        return s
+
+    def minimumSizeHint(self):
+        s = super().minimumSizeHint()
+        s.setWidth(self.iconSize().width() + 26 if not self.icon().isNull() else 40)
+        return s
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        compact = self.width() < self._full_width() - 2
+        if compact != self._compact:
+            self._compact = compact
+            _QPB.setText(self, "" if compact else self._full)
+            if compact:
+                self.setToolTip(self._full.strip())

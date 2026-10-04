@@ -274,6 +274,7 @@ def search_chunk(args):
     _S64 = (1 << 63)
 
     from stronghold_eyes import count_stronghold_eyes, get_stronghold_portal_full
+    from stronghold_eyes import _inflate_arg, topy_of
     from cubiomes_wrap import StrongholdIter as _SHIter
 
     lib = _get_cubiomes()
@@ -300,7 +301,7 @@ def search_chunk(args):
         _maxy = None
         if min_max_y is not None:
             _info = get_stronghold_portal_full(seed, bx, bz, mc_version)
-            _maxy = _info["highest_y"] if _info is not None else None
+            _maxy = topy_of(_info, min_max_y)
             if _maxy is None or _maxy < min_max_y:
                 return
         results.append((seed, eyes, bx, bz, _maxy))
@@ -335,7 +336,7 @@ def search_chunk(args):
                     chunk_seed_start, n_total, cxs, czs,
                     pre118=(mc_version <= 20), sea=63, margin=10,
                     minY=(-64 if mc_version >= 22 else 0),  # 1.18+ = deepslate world
-                    inflate=(12 if mc_version == 21 else 0), threshold=min_max_y)
+                    inflate=_inflate_arg(mc_version, min_max_y), threshold=int(min_max_y))
                 for seed in cseeds:
                     seed = int(seed)
                     i = seed - chunk_seed_start
@@ -345,7 +346,7 @@ def search_chunk(args):
                     bz = int(czs[i]) << 4
                     try:
                         info = get_stronghold_portal_full(seed, bx, bz, mc_version)
-                        if info is None or info["highest_y"] < min_max_y:
+                        if info is None or topy_of(info, min_max_y) < min_max_y:
                             continue
                         eyes = count_stronghold_eyes(seed, bx, bz, mc_version)
                         # BUG FIX : ce chemin (Max Y natif pré-118) oubliait le
@@ -353,7 +354,7 @@ def search_chunk(args):
                         if eyes < min_eyes:
                             continue
                         results.append((seed, eyes, info["center_x"],
-                                        info["center_z"], info["highest_y"]))
+                                        info["center_z"], topy_of(info, min_max_y)))
                     except Exception as _e:
                         _warn_once(_e)   # (was silently "no match")
                 return (i_start, i_end, results)

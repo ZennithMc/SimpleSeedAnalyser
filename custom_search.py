@@ -30,6 +30,7 @@ import ctypes
 import math
 import os
 import threading
+import time
 
 
 def _seed_arange(start, n):
@@ -407,14 +408,142 @@ class _RangeSeedList:
             s += 1
 
 
+def _inc_count(seed_count, search_mode):
+    """A seed-by-seed engine run for a "48-bit family" session: its Count is in
+    families → in seeds (as the C engine does when it adapts fam48 to inc)."""
+    if search_mode == "fam48" and seed_count and seed_count > 0:
+        return int(seed_count) * 65536
+    return seed_count
+
+
+# ── "End portal" position of the stronghold condition (03/10) ────────────────
+# sh_anchor = "portal": the condition's position (what linked conditions are
+# relative to, the result location / TP) is the centre of the end portal of the
+# matched stronghold instead of the stronghold's ring point.
+PORTAL_MARGIN = 256          # ring point → portal centre: ≤ ~245 blocks (snap 112 + pieces)
+
+
+def _portal_anchor(params: dict) -> bool:
+    return str((params or {}).get("sh_anchor", "")) == "portal"
+
+
+def _portal_xz(seed, mc, sx, sz):
+    """Centre (x, z) of the end portal of the stronghold starting at block (sx, sz)."""
+    try:
+        import ruined_portal as _rp
+        r = _rp._frames_xz_native(int(seed), int(sx) >> 4, int(sz) >> 4, int(mc) < 22)
+        if r is not None:
+            return (int(r[0]), int(r[1]))
+    except Exception:
+        pass
+    try:
+        import stronghold_eyes as _se
+        fr = _se.get_end_portal_frames(int(seed), int(sx), int(sz), int(mc))
+        if fr is not None:
+            return (int(fr[1]), int(fr[2]))
+    except Exception:
+        pass
+    return None
+
+
+def _loc_text(params, seed, mc, sx, sz):
+    """A result's "x,z": the stronghold start, or its end portal centre (End portal mode)."""
+    if _portal_anchor(params):
+        pp = _portal_xz(seed, mc, sx, sz)
+        if pp is not None:
+            return f"{pp[0]},{pp[1]}"
+    return f"{int(sx)},{int(sz)}"
+
+
+def _portal_link_children(conditions) -> bool:
+    """A stronghold condition in End portal mode has linked (child) conditions."""
+    for i, c in enumerate(conditions):
+        if (c.get("enabled", True) and c.get("type") == "first_stronghold"
+                and _portal_anchor(c.get("params")) and any(
+                    cc.get("enabled", True) and cc.get("relative", 0) == i + 1
+                    for cc in conditions)):
+            return True
+    return False
+
+
+def _portal_c_view(conditions):
+    """What the C engine / GPU pre-filters see for a session whose stronghold is
+    in End portal mode: they place the stronghold at its ring point, so each
+    linked condition is widened by PORTAL_MARGIN (a structure that is near the
+    portal is then always inside: a necessary test), or — when widening could
+    lose results (NOT, counts of 0, inverted tests, deeper links) — left to the
+    exact Python check of every candidate (_joint_seed_eval on the real session)."""
+    import copy as _copy
+    out = [_copy.deepcopy(c) for c in conditions]
+    drop = set()
+
+    def kids(i):
+        return [j for j, c in enumerate(out) if c.get("relative", 0) == i + 1]
+
+    def subtree(i):
+        st, res = [i], set()
+        while st:
+            k = st.pop()
+            res.add(k)
+            st.extend(kids(k))
+        return res
+    for i, c in enumerate(out):
+        if not (c.get("enabled", True) and c.get("type") == "first_stronghold"
+                and _portal_anchor(c.get("params"))):
+            continue
+        multi = _scan_128(c.get("params") or {})   # first ring / 128: no ring point in C
+        for j in kids(i):
+            ch = out[j]
+            p = ch.get("params") or {}
+            safe = (not multi and ch.get("type") in STRUCT_TYPES and ch.get("type") not in STRUCT_DIM
+                    and _cond_min_count(ch) > 0 and not p.get("invert") and not kids(j))
+            if not safe:
+                drop |= subtree(j)
+                continue
+            m = PORTAL_MARGIN
+            rb = ch.get("rmax", 0) or 0
+            if not rb and ch.get("area_mode") == 0 and int(ch.get("radial", 0) or 0) > 0:
+                rb = int(ch.get("radial", 0)) + 1
+            if rb and rb > 0:
+                ch["rmax"] = int(rb) + m
+            else:
+                for k, d in (("x1", -m), ("z1", -m), ("x2", m), ("z2", m)):
+                    ch[k] = int(ch.get(k, 0) or 0) + d
+    if not drop:
+        return out
+    keep = [i for i in range(len(out)) if i not in drop]
+    new_idx = {old + 1: n + 1 for n, old in enumerate(keep)}
+    res = []
+    for old in keep:
+        c = out[old]
+        r = c.get("relative", 0)
+        if r:
+            c["relative"] = new_idx.get(r, 0)
+        res.append(c)
+    return res
+
+
+def _sh_count(params: dict) -> int:
+    """How many strongholds the condition looks at (03/10): 1 (the first),
+    3 (the first ring: sh_scope "Ring 3") or 128 (sh_scope "All 128")."""
+    sc = params.get("sh_scope")
+    if sc is not None:
+        sc = str(sc)
+        return 128 if sc == "All 128" else 3 if sc == "Ring 3" else 1
+    return 128 if params.get("scan_128") else 1
+
+
+def _scan_val(params: dict):
+    """The `scan_128` argument of the engines: False, 3 or True (128)."""
+    n = _sh_count(params)
+    return True if n >= 128 else (3 if n == 3 else False)
+
+
 def _scan_128(params: dict) -> bool:
     """True si on scanne LES 128 strongholds (au lieu du premier). Nouveau param
     UI = choix `sh_scope` (« First ring » / « All 128 ») ; rétro-compat avec
     l'ancien bool `scan_128` des sessions sauvegardées."""
-    sc = params.get("sh_scope")
-    if sc is not None:
-        return str(sc) == "All 128"
-    return bool(params.get("scan_128"))
+    return _sh_count(params) > 1        # several strongholds (first ring or all 128)
 
 
 def _eye_filter_on(params: dict) -> bool:
@@ -447,7 +576,9 @@ def _stronghold_extra_ok(ctx: "EvalContext", params: dict, bx: int, bz: int) -> 
     if need_eye or need_maxy:
         try:
             from stronghold_eyes import get_stronghold_eyes_and_maxy
-            eyes, max_y = get_stronghold_eyes_and_maxy(seed, int(bx), int(bz), mc)
+            # « Top Y » of the stronghold or of its portal room (03/10)
+            eyes, max_y = get_stronghold_eyes_and_maxy(
+                seed, int(bx), int(bz), mc, what=1 if params.get("maxy_target") == "room" else 0)
         except Exception:
             return False
         if need_eye:
@@ -461,15 +592,27 @@ def _stronghold_extra_ok(ctx: "EvalContext", params: dict, bx: int, bz: int) -> 
             if max_y is None or int(max_y) < int(params.get("min_max_y", 60)):
                 return False
     if need_corrupt:
-        # Corruptible end portal (nécessaire) — 1.13-1.17 (corrupt_check_at
-        # renvoie None pour mc>21). Le compteur de frames exact n'est pas exposé
-        # par-seed ; on exige la condition nécessaire (corruptible).
-        try:
-            import ruined_portal as _RP
-            r = _RP.corrupt_check_at(seed, int(bx), int(bz), mc)
-        except Exception:
-            r = None
-        if not (r and r.get("corruptible")):
+        # Broken end portal (03/10): frames predicted broken by a ruined portal
+        # (footprint, 1.13-1.17) and / or a lake (1.16, experimental), ≥ min_frames
+        srcs = params.get("broken_sources") or ["ruined"]
+        need = max(1, int(params.get("min_frames", 1) or 1))
+        n = 0
+        if "ruined" in srcs and mc <= 21:
+            try:
+                import ruined_portal as _RP
+                r = _RP.corrupt_check_at(seed, int(bx), int(bz), mc)
+            except Exception:
+                r = None
+            if r:
+                n = max(n, int(r.get("corruptible", 0) or 0))
+        kinds = tuple(k for k in ("lava", "water") if k in srcs)
+        if kinds and n < need:
+            try:
+                import lake_portals as _LP
+                n = max(n, _LP.lake_frames_for(seed, int(bx), int(bz), mc, kinds))
+            except Exception:
+                pass
+        if n < need:
             return False
     return True
 
@@ -511,7 +654,7 @@ def _stronghold_match_detail(lib, mc_version: int, seed: int, sh_conds: list) ->
             continue
         try:
             if _scan_128(params):
-                shs = ctx.lib.find_strongholds(max_count=128)
+                shs = ctx.lib.find_strongholds(max_count=_sh_count(params))
             else:
                 shs = ctx.lib.find_strongholds(max_count=1, radius_blocks=None)
         except Exception:
@@ -665,7 +808,7 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
                 # strongholds satisfait le filtre yeux/maxY/corrupted (≈128x plus
                 # lourd/seed, mais par CANDIDAT donc rare). Positions réelles.
                 try:
-                    _shs = ctx.lib.find_strongholds(max_count=128)
+                    _shs = ctx.lib.find_strongholds(max_count=_sh_count(params))
                 except Exception:
                     _shs = []
                 if not _shs:
@@ -689,6 +832,22 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
                 ctx.match_pos = (int(_ex), int(_ez))
         else:
             ctx.match_pos = (int(pos.x), int(pos.z))
+        if _portal_anchor(params):
+            # End portal mode: the position is the portal centre of the matched
+            # stronghold (the first one, snapped, without a filter)
+            base = ctx.match_pos if _stronghold_extra_enabled(params) else None
+            if base is None:
+                try:
+                    _sh1 = ctx.lib.find_strongholds(max_count=1, radius_blocks=None)
+                    base = _sh1[0] if _sh1 else None
+                except Exception:
+                    base = None
+            pp = _portal_xz(ctx.seed, ctx.mc_version, *base) if base else None
+            if pp is None:
+                return False
+            ctx.match_pos = pp
+            ctx.push_position(cond_idx, pp)
+            return True
         ctx.push_position(cond_idx, (pos.x, pos.z))
         return True
 
@@ -886,8 +1045,25 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
         ctx.push_position(cond_idx, centers[0])
         return True
 
-    # ── Climate min/max + center — C-native F_CLIMATE_MINMAX ────────────
-    if t in ("climate_minmax", "climate_center"):
+    # ── Locate climate center — coarse flood fill, evaluated by the C engine
+    # (one implementation: the search and this path give the same region)
+    if t == "climate_center":
+        if ctx.mc_version < 22:
+            return False
+        one = copy.deepcopy(cond)
+        one.setdefault("params", {})["_need_center"] = True   # children may use it
+        r = _c_eval_single(ctx, one, cond_idx, all_conds, px, pz)
+        if r is None:
+            raise RuntimeError("Locate climate center needs the C engine (rebuild "
+                               "libcubiomes: py tools/build_native.py --cubiomes)")
+        ok, wx, wz = r
+        if not ok:
+            return False
+        ctx.push_position(cond_idx, (wx, wz))
+        return True
+
+    # ── Climate min/max — C-native F_CLIMATE_MINMAX ─────────────────────
+    if t in ("climate_minmax",):
         if ctx.mc_version < 22:
             return False
         para_map = {"Temperature": 0, "Humidity": 1,
@@ -977,6 +1153,8 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
             return False
         y_min   = float(params.get("y_min", float("-inf")))
         y_max   = float(params.get("y_max", float("+inf")))
+        if y_min <= -64: y_min = float("-inf")       # world limits = no bound
+        if y_max >= 320: y_max = float("+inf")
         invert  = bool(params.get("invert", False))
         # Read the ABSOLUTE "at: x z" + radius straight from the condition. (_get_box
         # collapses a radial box onto the parent position, losing "at".)
@@ -1270,9 +1448,9 @@ def _eval_node(ctx: EvalContext, conditions: List[dict],
             return False
 
         if t == "spiral":
-            step = params.get("step", 16)
+            step = int(params.get("step", 16) or 0)
             if step < 1:
-                step = 1
+                step = 512          # cubiomes-viewer: « c.step ? c.step : 512 » (= the C engine)
             rmax_b = cond.get("rmax", 0)
             if rmax_b and rmax_b > 0:
                 rb = rmax_b - 1
@@ -1296,7 +1474,7 @@ def _eval_node(ctx: EvalContext, conditions: List[dict],
 
         elif (t in ("first_stronghold", "stronghold")
               and _scan_128(params)
-              and _stronghold_extra_enabled(params)
+              and (_stronghold_extra_enabled(params) or _portal_anchor(params))
               and direct_children):
             # ── Linking JOINT scan_128 ────────────────────────────────────────
             # « check all 128 strongholds » AVEC des conditions reliées : on veut
@@ -1309,11 +1487,15 @@ def _eval_node(ctx: EvalContext, conditions: List[dict],
             # les rares strongholds qui ont déjà le village. Pass si UN stronghold
             # satisfait tout ; on mémorise sa position (TP + carte).
             try:
-                shs = ctx.lib.find_strongholds(max_count=128)
+                shs = ctx.lib.find_strongholds(max_count=_sh_count(params))
             except Exception:
                 shs = []
             for bx, bz in (shs or []):
                 sp = (int(bx), int(bz))
+                if _portal_anchor(params):           # linked to the end portal (03/10)
+                    sp = _portal_xz(ctx.seed, ctx.mc_version, bx, bz)
+                    if sp is None:
+                        continue
                 ctx.push_position(cond_1idx, sp)
                 if direct_children and not all(
                         _eval_node(ctx, conditions, ch, sp)
@@ -1473,6 +1655,10 @@ def check_seed(conditions, seed, mc_version, lib=None):
 def explain_seed(conditions: List[dict], seed: int, mc_version: int, lib: CubiomesLib = None):
     if lib is None:
         lib = CubiomesLib()
+    if any(c.get("type") == "first_stronghold" and _portal_anchor(c.get("params"))
+           for c in active_conditions(conditions)):
+        # End portal mode: the C engine only knows the ring point (03/10)
+        return _explain_seed_py(conditions, seed, mc_version, lib)
     try:
         r = _explain_seed_c(conditions, seed, mc_version, lib)
         if r is not None:
@@ -1553,7 +1739,7 @@ def find_match_position(conditions: List[dict], seed: int, mc_version: int,
             params = c.get("params", {})
             try:
                 if _scan_128(params):
-                    shs = ctx.lib.find_strongholds(max_count=128)
+                    shs = ctx.lib.find_strongholds(max_count=_sh_count(params))
                 else:
                     shs = ctx.lib.find_strongholds(max_count=1, radius_blocks=None)
                 for bx, bz in (shs or []):
@@ -1772,7 +1958,7 @@ def _get_ctype_map(lib) -> dict:
         "biome_sample":        "biome_sample",
         "biome_center":        "biome_center",
         "climate_minmax":      "climate_minmax",
-        "climate_center":      "climate_minmax",   # same C backend, different UX
+        "climate_center":      "climate_area",     # coarse flood fill (01/10)
         "climate_extreme":     "climate_minmax",   # legacy alias
         "climate_noise":       "climate_noise",
         "noise_sample":        "noise_sample",   # Monte-Carlo climat (coverage/confidence)
@@ -1888,7 +2074,7 @@ def cv_full_octave_conditions(enabled: List[dict]) -> set:
 
     out = set()
     for y, c in enumerate(enabled):
-        if t(y) not in ("climate_minmax", "climate_center", "noise_sample"):
+        if t(y) not in ("climate_minmax", "noise_sample"):   # (cubiomes-viewer quirk; climate_center is SSA-only)
             continue
         applied = False
         node, guard = y, 0
@@ -2031,7 +2217,7 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
         # évalue l'enfant PAR stronghold (village près d'UN des 128), à vitesse C.
         # Le filtre yeux reste vérifié par le post-filtre Python (rare candidats).
         if (t == "first_stronghold" and _scan_128(params)
-                and _stronghold_extra_enabled(params)):
+                and (_stronghold_extra_enabled(params) or _portal_anchor(params))):
             _my1 = i + 1
             if any(cc.get("relative", 0) == _my1
                    for j, cc in enumerate(enabled) if j != i):
@@ -2352,13 +2538,39 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
                 ymax = float(params.get("y_max", 0))
             except (TypeError, ValueError):
                 ymax = 0.0
-            s.height_ymin   = ymin if ymin != float("-inf") else -1e9
-            s.height_ymax   = ymax if ymax != float("+inf") else  1e9
+            # -64 / 320 = the world limits = no bound (an imported cubiomes-viewer
+            # condition without bound is stored as -64 / 320, 01/10)
+            s.height_ymin   = ymin if ymin > -64 else -1e9
+            s.height_ymax   = ymax if ymax < 320 else  1e9
             s.height_invert = 1 if params.get("invert", False) else 0
         else:
             s.height_ymin   = 0.0
             s.height_ymax   = 0.0
             s.height_invert = 0
+
+        # Locate climate center — coarse flood fill (01/10). Fields reused:
+        # biome_scale = cell size in blocks, biome_min_size / biome_tolerance =
+        # min / max region size in cells (0 = no max), min_count = 1 when the
+        # region's centre is needed (children, or the Python path asking for
+        # the position), climate_mode = range bounds only (no locate).
+        if t == "climate_center":
+            try:
+                s.biome_scale = max(4, min(1024, int(params.get("scale", 16) or 16)))
+            except (TypeError, ValueError):
+                s.biome_scale = 16
+            try:
+                s.biome_min_size = max(1, int(params.get("min_size", 1) or 1))
+            except (TypeError, ValueError):
+                s.biome_min_size = 1
+            try:
+                s.biome_tolerance = max(0, int(params.get("max_size", 0) or 0))
+            except (TypeError, ValueError):
+                s.biome_tolerance = 0
+            _me = int(s.cond_idx)
+            _kids = any(int(o.get("relative", 0) or 0) == _me for o in enabled)
+            s.min_count = 1 if (_kids or params.get("_need_center")) else 0
+            s.exclude = 0
+            s.climate_mode = (4 if s.climate_vmin > -1e29 else 0) | (8 if s.climate_vmax < 1e29 else 0)
 
     return arr, n
 
@@ -2422,7 +2634,7 @@ def _parallel_validate(raw, arr, n_conds, mc, large, seeds_i64,
         if m == 0:
             return _np.empty(0, _np.int64)
         out = _np.empty(m, _np.int64)
-        kept = raw.ssa_test_seeds_batch(
+        kept = _tsb(raw, 
             arr, ct.c_int(n_conds), ct.c_int(mc), ct.c_int(large),
             chunk.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(m),
             out.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(m))
@@ -2443,6 +2655,59 @@ def _parallel_validate(raw, arr, n_conds, mc, large, seeds_i64,
                 if stop_event.is_set():
                     break
                 on_match(int(s), "")
+
+
+
+# ── statistics of the GPU pipelines (01/10) ─────────────────────────────────
+# The GPU pre-filters validate their survivors with ssa_test_seeds_batch, which
+# kept no per-condition counters: those sessions had no stats at all. While a
+# search with on_profile runs, _GPU_PROF holds a counter buffer (the layout of
+# ssa_engine_profile2) that the validators fill through _tsb(), plus what the
+# GPU itself filtered out, credited to the pre-filtered condition.
+_GPU_PROF = {"buf": None, "n": 0, "pos": None, "scanned": 0, "kept": 0,
+             "lock": threading.Lock()}
+
+
+def _tsb(raw, arr, n, mc, large, pin, nin, pout, cap):
+    """ssa_test_seeds_batch, counted into the running search's statistics."""
+    buf = _GPU_PROF["buf"]
+    nn = int(getattr(n, "value", n))
+    f = getattr(raw, "ssa_test_seeds_batch_prof", None)
+    if buf is not None and f is not None and nn == _GPU_PROF["n"]:
+        f.restype = ctypes.c_int64
+        f.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int64),
+                      ctypes.c_int64, ctypes.POINTER(ctypes.c_int64), ctypes.c_int64, ctypes.POINTER(ctypes.c_int64)]
+        return f(arr, nn, mc, large, pin, nin, pout, cap, buf)
+    return raw.ssa_test_seeds_batch(arr, n, mc, large, pin, nin, pout, cap)
+
+
+def _gpu_prof_target(enabled, cond):
+    """The condition a GPU pipeline pre-filters (its position in the C array)."""
+    _GPU_PROF["pos"] = next((i for i, c in enumerate(enabled) if c is cond), None)
+
+
+def _gpu_prof_note(scanned, kept):
+    with _GPU_PROF["lock"]:
+        _GPU_PROF["scanned"] += int(scanned)
+        _GPU_PROF["kept"] += int(kept)
+
+
+def _gpu_prof_rows():
+    """(rows, total) like the engine's on_profile, or None (nothing counted)."""
+    buf, n = _GPU_PROF["buf"], _GPU_PROF["n"]
+    if buf is None or n <= 0:
+        return None
+    rows = [[int(buf[5 * i + j]) for j in range(5)] for i in range(n)]
+    pos = _GPU_PROF["pos"]
+    with _GPU_PROF["lock"]:
+        dropped = _GPU_PROF["scanned"] - _GPU_PROF["kept"]
+    if pos is not None and 0 <= pos < n and dropped > 0:
+        # the seeds the GPU rejected reached this condition and failed its test
+        rows[pos][0] += dropped
+        rows[pos][3] += dropped
+    if not any(r[0] for r in rows):
+        return None
+    return [tuple(r) for r in rows], int(buf[5 * n])
 
 
 def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
@@ -2514,11 +2779,19 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
                 except Exception:
                     import traceback; traceback.print_exc(); surv = None
                 if surv is None:                   # GPU failed/raised -> hand raw chunk to CPU
-                    _put(_seed_arange(c[0], c[1]))
-                    _bump(c[1])
-                    break                          # stop the GPU; CPU finishes the rest
+                    _put((_seed_arange(c[0], c[1]), [1, c[1]]))
+                    break
+                _gpu_prof_note(c[1], len(surv))                          # stop the GPU; CPU finishes the rest
                 _dt = _time.perf_counter() - _t0
-                if _dt < 0.25 and gsz["n"] < (1 << 23):
+                # a chunk also has to be VALIDATED quickly: it counts as searched
+                # only once its survivors are checked, and 8 M seeds with 1 000+
+                # costly survivors came as one lump every second or two → the
+                # rate swung between 0 and peaks (MIRRORS V6, 01/10). At most
+                # about one piece (~0.3 s) per validator per chunk.
+                _cap = max(1, nw) * max(8, int(vcost["piece"]))
+                if len(surv) > _cap:
+                    gsz["n"] = max(16, int(c[1] * _cap / len(surv)))
+                elif _dt < 0.25 and gsz["n"] < (1 << 23) and len(surv) * 2 <= _cap:
                     gsz["n"] *= 2
                 elif _dt > 1.0 and gsz["n"] > 16:
                     gsz["n"] = max(16, int(gsz["n"] * 0.5 / _dt))
@@ -2528,15 +2801,25 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
                     # went to ONE validator thread for minutes, and Stop waited
                     # for it (biome sample bench, 27/09)
                     step = max(8, int(vcost["piece"]))
+                    # the chunk counts as searched once its LAST piece is
+                    # validated: counted when queued, the rate showed the GPU
+                    # speed (500 M/s), then 0 while the queue drained, and a
+                    # Stop counted seeds never checked (REMIRRORS V6, 01/10)
+                    rec = [-(-len(surv) // step), c[1]]
                     for _o in range(0, len(surv), step):
-                        _put(surv[_o:_o + step])   # blocks if full (backpressure)
-                _bump(c[1])
+                        _put((surv[_o:_o + step], rec))   # blocks if full (backpressure)
+                else:
+                    _bump(c[1])
         finally:
             gpu_done.set()
 
     vcost = {"piece": 64}                          # survivors per validation piece (~0.3 s)
 
-    def _safe_test(seeds):                         # a bad chunk must not kill a validator
+    def _safe_test(item):                          # a bad chunk must not kill a validator
+        if isinstance(item, tuple):                # (survivors, [pieces left, chunk size])
+            seeds, rec = item
+        else:
+            seeds, rec = item, None
         _t = _time.perf_counter()
         try:                                       # (would shrink the pool & could stall
             cpu_test(seeds)                        # the GPU on a full queue in long runs)
@@ -2545,6 +2828,12 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
         _d = _time.perf_counter() - _t
         if len(seeds) >= 8 and _d > 0.01:          # measured validation cost per seed
             vcost["piece"] = max(8, min(1 << 16, int(0.3 * len(seeds) / _d)))
+        if rec is not None and not stop_event.is_set():
+            with prog_lock:
+                rec[0] -= 1
+                last = rec[0] == 0
+            if last:
+                _bump(rec[1])
 
     def _cpu_worker():
         csz = 64                                   # per worker, adapts to ~0.3 s
@@ -2740,6 +3029,7 @@ def _run_biome_gpu_search(enabled, bcond, seed_start, seed_count, mc_version,
     if res is None:
         return _gpu_decline("this session's tree is not supported by the C engine")
     arr, n_conds = res
+    _gpu_prof_target(enabled, bcond)
     try:
         raw.ssa_test_seeds_batch.argtypes = [
             ct.c_void_p, ct.c_int, ct.c_int, ct.c_int,
@@ -2793,7 +3083,7 @@ def _run_biome_gpu_search(enabled, bcond, seed_start, seed_count, mc_version,
         seeds_i64 = _np.ascontiguousarray(seeds_i64, _np.int64)
         nn = len(seeds_i64)
         out = _np.empty(nn, _np.int64)
-        kept = raw.ssa_test_seeds_batch(
+        kept = _tsb(raw, 
             arr, ct.c_int(n_conds), ct.c_int(mc_version), ct.c_int(large),
             seeds_i64.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn),
             out.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn))
@@ -2834,7 +3124,7 @@ def _climate_gpu_eligible(enabled):
     test value vs [vmin,vmax]); the overlap prefilter is recall-safe for either."""
     for c in enabled:
         p = c.get("params", {})
-        if (c.get("type") in ("climate_minmax", "climate_center")
+        if (c.get("type") == "climate_minmax"      # not climate_center: a flood fill
                 and (c.get("relative", 0) == 0 or p.get("gpu_box"))   # child: only with its
                                                       # zone englobante (gpu_planner)
                 and p.get("use_gpu")):   # limited octaves too (noise_gpu climatescan2)
@@ -2945,6 +3235,7 @@ def _run_climate_gpu_search(enabled, ccond, seed_start, seed_count, mc_version,
     if res is None:
         return _gpu_decline("this session's tree is not supported by the C engine")
     arr, n_conds = res
+    _gpu_prof_target(enabled, ccond)
     try:
         raw.ssa_test_seeds_batch.argtypes = [
             ct.c_void_p, ct.c_int, ct.c_int, ct.c_int,
@@ -3004,7 +3295,7 @@ def _run_climate_gpu_search(enabled, ccond, seed_start, seed_count, mc_version,
         seeds_i64 = _np.ascontiguousarray(seeds_i64, _np.int64)
         nn = len(seeds_i64)
         out = _np.empty(nn, _np.int64)
-        kept = raw.ssa_test_seeds_batch(
+        kept = _tsb(raw, 
             arr, ct.c_int(n_conds), ct.c_int(mc_version), ct.c_int(large),
             seeds_i64.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn),
             out.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn))
@@ -3112,6 +3403,7 @@ def _run_noise_gpu_search(enabled, ncond, seed_start, seed_count, mc_version,
     if res is None:
         return _gpu_decline("this session's tree is not supported by the C engine")
     arr, n_conds = res
+    _gpu_prof_target(enabled, ncond)
     try:
         raw.ssa_test_seeds_batch.argtypes = [
             ct.c_void_p, ct.c_int, ct.c_int, ct.c_int,
@@ -3176,7 +3468,7 @@ def _run_noise_gpu_search(enabled, ncond, seed_start, seed_count, mc_version,
         seeds_i64 = _np.ascontiguousarray(seeds_i64, _np.int64)
         nn = len(seeds_i64)
         out = _np.empty(nn, _np.int64)
-        kept = raw.ssa_test_seeds_batch(
+        kept = _tsb(raw, 
             arr, ct.c_int(n_conds), ct.c_int(mc_version), ct.c_int(large),
             seeds_i64.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn),
             out.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn))
@@ -3273,6 +3565,7 @@ def _run_biome_filter_gpu_search(enabled, fcond, seed_start, seed_count, mc_vers
     if res is None:
         return _gpu_decline("this session's tree is not supported by the C engine")
     arr, n_conds = res
+    _gpu_prof_target(enabled, fcond)
     try:
         raw.ssa_test_seeds_batch.argtypes = [
             ct.c_void_p, ct.c_int, ct.c_int, ct.c_int,
@@ -3319,7 +3612,7 @@ def _run_biome_filter_gpu_search(enabled, fcond, seed_start, seed_count, mc_vers
         seeds_i64 = _np.ascontiguousarray(seeds_i64, _np.int64)
         nn = len(seeds_i64)
         out = _np.empty(nn, _np.int64)
-        kept = raw.ssa_test_seeds_batch(
+        kept = _tsb(raw, 
             arr, ct.c_int(n_conds), ct.c_int(mc_version), ct.c_int(large),
             seeds_i64.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn),
             out.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn))
@@ -3411,6 +3704,7 @@ def _run_biome_center_gpu_search(enabled, ccond, seed_start, seed_count, mc_vers
     if res is None:
         return _gpu_decline("this session's tree is not supported by the C engine")
     arr, n_conds = res
+    _gpu_prof_target(enabled, ccond)
     try:
         raw.ssa_test_seeds_batch.argtypes = [
             ct.c_void_p, ct.c_int, ct.c_int, ct.c_int,
@@ -3448,7 +3742,7 @@ def _run_biome_center_gpu_search(enabled, ccond, seed_start, seed_count, mc_vers
         seeds_i64 = _np.ascontiguousarray(seeds_i64, _np.int64)
         nn = len(seeds_i64)
         out = _np.empty(nn, _np.int64)
-        kept = raw.ssa_test_seeds_batch(
+        kept = _tsb(raw, 
             arr, ct.c_int(n_conds), ct.c_int(mc_version), ct.c_int(large),
             seeds_i64.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn),
             out.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn))
@@ -4222,7 +4516,189 @@ def _run_precise_y_postfilter(precise_conds, other_conds, seed_start, seed_count
     return True
 
 
-def evaluate_session(
+def evaluate_session(conditions, seed_start, seed_count, mc_version, num_workers,
+                     stop_event, on_match, on_progress, search_mode="inc", on_mode=None,
+                     seed_list=None, on_resume=None, on_profile=None, max_found=0):
+    """The search (see _evaluate_session_impl). With on_profile, the GPU
+    pipelines report per-condition statistics too (01/10): their validators
+    count into _GPU_PROF, reported every 0.5 s and at the end. The C engine
+    keeps reporting its own; nothing is reported while the buffer is empty."""
+    args = (conditions, seed_start, seed_count, mc_version, num_workers, stop_event,
+            on_match, on_progress, search_mode, on_mode, seed_list, on_resume,
+            on_profile, max_found)
+    if on_profile is None or seed_list is not None:
+        return _evaluate_session_impl(*args)
+    n = len(active_conditions(conditions))
+    if n == 0 or n > 128:
+        return _evaluate_session_impl(*args)
+    try:                        # a libcubiomes older than p101 has no counters: no
+        if not hasattr(CubiomesLib()._lib, "ssa_test_seeds_batch_prof"):   # empty rows
+            return _evaluate_session_impl(*args)
+    except Exception:
+        return _evaluate_session_impl(*args)
+    buf = (ctypes.c_int64 * (5 * n + 1))()
+    _GPU_PROF.update(buf=buf, n=n, pos=None, scanned=0, kept=0)
+    done = threading.Event()
+
+    def _report():
+        r = _gpu_prof_rows()
+        if r is not None:
+            try:
+                on_profile(*r)
+            except Exception:
+                pass
+
+    def _loop():
+        while not done.wait(0.5):
+            _report()
+    th = threading.Thread(target=_loop, daemon=True)
+    th.start()
+    try:
+        return _evaluate_session_impl(*args)
+    finally:
+        done.set()
+        th.join(timeout=2)
+        _report()
+        _GPU_PROF.update(buf=None, n=0, pos=None)
+
+
+# ── Parallel post-filter (03/10) ──────────────────────────────────────────────
+# The exact Python check of the C engine's candidates (stronghold filters, End
+# portal links, all-128 joint links) ran in ONE thread inside the drain: with
+# common candidates the C engine filled its buffer and waited → 500 k/s then
+# 1 k/s, in waves. Now batches of candidates go to worker processes (every core).
+_PF_W = {}
+_PPF_TLS = threading.local()
+
+
+def _pf_worker_batch(args):
+    kind, payload, mc, items = args
+    lib = _PF_W.get("lib")
+    if lib is None:
+        lib = _PF_W["lib"] = CubiomesLib()
+    out = []
+    for s, det in items:
+        try:
+            if kind == "joint":
+                ok, mp = _joint_seed_eval(payload, int(s), mc, lib)
+            else:
+                ok, mp = _stronghold_session_ok(lib, mc, int(s), payload)
+        except Exception:
+            ok, mp = False, None
+        if ok:
+            out.append((int(s), f"{mp[0]},{mp[1]}" if mp else det))
+    return out
+
+
+class _ParallelPostFilter:
+    BATCH = 128
+    MAX_WAIT = 0.25                     # a lone candidate is checked within ~¼ s
+
+    def __init__(self, kind, payload, mc, nworkers, emit):
+        self.kind, self.payload, self.mc = kind, payload, int(mc)
+        self.nw = max(1, int(nworkers))
+        self.emit = emit
+        self.items, self.t_first = [], None
+        self.futs = []
+        self.lock = threading.Lock()
+        self.ex = None
+        self.failed = False
+        self.closed = threading.Event()
+        self.th = threading.Thread(target=self._loop, name="ssa-postfilter", daemon=True)
+        self.th.start()
+
+    def _sync(self, items):             # no worker processes: in this thread
+        for s, d in _pf_worker_batch((self.kind, self.payload, self.mc, items)):
+            self.emit(s, d)
+
+    def _submit_locked(self):
+        items, self.items, self.t_first = self.items, [], None
+        if not items:
+            return
+        if self.ex is None and not self.failed:
+            try:
+                import concurrent.futures as _cf
+                self.ex = _cf.ProcessPoolExecutor(max_workers=min(self.nw, 61))
+            except Exception:
+                self.failed = True
+        if self.failed:
+            self._sync(items)
+            return
+        try:
+            self.futs.append((self.ex.submit(_pf_worker_batch,
+                                             (self.kind, self.payload, self.mc, items)), items))
+        except Exception:
+            self.failed = True
+            self._sync(items)
+
+    def _collect(self, block=False):
+        with self.lock:
+            futs = list(self.futs)
+        for f, items in futs:
+            if not block and not f.done():
+                continue
+            try:
+                res = f.result()
+            except Exception:           # a worker died: check these here
+                res = _pf_worker_batch((self.kind, self.payload, self.mc, items))
+            with self.lock:
+                try:
+                    self.futs.remove((f, items))
+                except ValueError:
+                    continue
+            for s, d in res:
+                self.emit(s, d)
+            if block:
+                return
+
+    def add(self, seed, details):
+        with self.lock:
+            self.items.append((int(seed), details))
+            if self.t_first is None:
+                self.t_first = time.time()
+            if len(self.items) >= self.BATCH:
+                self._submit_locked()
+            backlog = len(self.futs)
+        if backlog > 4 * self.nw:       # the engine waits for the checks (honest speed)
+            self._collect(block=True)
+
+    def _loop(self):
+        while not self.closed.wait(0.05):
+            with self.lock:
+                if self.items and time.time() - self.t_first > self.MAX_WAIT:
+                    self._submit_locked()
+            self._collect()
+
+    def close(self):
+        """Everything handed in is checked and reported (pause: nothing lost)."""
+        self.closed.set()
+        self.th.join(timeout=5)
+        with self.lock:
+            self._submit_locked()
+        while True:
+            with self.lock:
+                left = len(self.futs)
+            if not left:
+                break
+            self._collect(block=True)
+        if self.ex is not None:
+            try:
+                self.ex.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+
+def _evaluate_session_impl(*args):
+    try:
+        return _evaluate_session_impl0(*args)
+    finally:
+        ppf = getattr(_PPF_TLS, "obj", None)
+        if ppf is not None:
+            _PPF_TLS.obj = None
+            ppf.close()
+
+
+def _evaluate_session_impl0(
         conditions: List[dict],
         seed_start: int,
         seed_count: int,
@@ -4236,8 +4712,11 @@ def evaluate_session(
         seed_list=None,
         on_resume: Callable[[int], None] = None,
         on_profile: Callable = None,
+        max_found: int = 0,
 ) -> None:
     """
+    max_found : > 0 → the C engine stops by itself after that many matches
+    (result limit / safety cap applied at the source, p96).
     Main search loop — tries the C-native multithreaded engine first,
     falls back to single-threaded Python if the engine is not compiled yet.
     seed_list : if given, test EXACTLY those seeds (Python per-seed path) and
@@ -4267,6 +4746,44 @@ def evaluate_session(
         if (_eye_on or _p.get("maxy_enabled")) and not _p.get("corrupt_enabled"):
             _min_eyes = int(_p.get("min_eyes", 0)) if _eye_on else 0
             _mmy = int(_p.get("min_max_y", 60)) if _p.get("maxy_enabled") else None
+            if _mmy is not None and _p.get("maxy_target") == "room":
+                from stronghold_eyes import RoomY
+                _mmy = RoomY(_mmy)                 # top of the portal room (03/10)
+            # ── Top Y 1.16 by 48-bit families (03/10): the Stronghold page's engine
+            # (topy_family, exact, CPU + GPU hybrid). Only in the session's 48-bit
+            # family mode (its Start / Count / resume are in families).
+            import topy_family as _tf
+            _thr_ok = (_mmy is not None and int(mc_version) in _tf.VERSIONS
+                       and int(_mmy) >= (_tf.MIN_FAST_Y_ROOM if _p.get("maxy_target") == "room"
+                                         else _tf.MIN_FAST_Y))
+            if (_thr_ok and search_mode == "fam48" and seed_list is None
+                    and not _scan_128(_p)):
+                _exact = bool(_p.get("exact_eyes"))
+
+                def _fcb(seed, eyes, bx, bz, *_a):
+                    if _min_eyes:
+                        if (int(eyes) != _min_eyes) if _exact else (int(eyes) < _min_eyes):
+                            return
+                    on_match(int(seed), _loc_text(_p, seed, mc_version, bx, bz))
+
+                def _fprog(done, total):
+                    if on_progress is not None:     # families (the runner's fam48 unit)
+                        on_progress(int(done) // _tf.FAMILY, int(total) // _tf.FAMILY)
+
+                def _fstatus(msg):
+                    if on_mode is not None:
+                        on_mode(("note", str(msg)))
+                if on_mode is not None:
+                    on_mode(1)
+                _tf.search_topy_families(
+                    int(seed_start) & _tf.M48, int(seed_count) * _tf.FAMILY if seed_count else 0,
+                    _mmy, _fcb, stop_event, _fprog, max(1, num_workers), int(mc_version),
+                    # "Hide sister seeds": one seed per tall stronghold, found sooner
+                    one_per_family=bool(_p.get("hide_sisters", True)),
+                    use_gpu=bool(_p.get("topy_gpu", True)),
+                    status_callback=_fstatus,
+                    resume_callback=(on_resume if on_resume is not None else None))
+                return
             from stronghold_eyes import search_end_portal_seeds
             # ── All 128 sur une PLAGE ────────────────────────────────────────
             # Le chemin range de search_end_portal_seeds ignore scan_128 : seul le
@@ -4281,27 +4798,104 @@ def evaluate_session(
                         and not _scan_128(_p))
             if on_mode is not None:
                 on_mode(0)
+            from broken_search import ResumeTracker
+            _etrk = (ResumeTracker(seed_start, ["e"])
+                     if (_sl is None and on_resume is not None) else None)
             search_end_portal_seeds(
-                seed_start, seed_count, _min_eyes,
+                seed_start, _inc_count(seed_count, search_mode), _min_eyes,
                 # callback(seed, eyes, bx, bz) → on garde bx,bz comme "x,z" dans
                 # details pour un TP instantané au clic sur le résultat.
                 callback=lambda s, *a, **k: on_match(
-                    int(s), (f"{a[1]},{a[2]}" if len(a) >= 3 else "")),
+                    int(s), (_loc_text(_p, s, mc_version, a[1], a[2]) if len(a) >= 3 else "")),
                 stop_event=stop_event, progress_callback=on_progress,
                 num_workers=max(1, num_workers), mc_version=mc_version,
                 # 1.18+: ±15-chunk prefilter (lossless); 1.13-1.17: the LCG
                 # prefilter lost about half the results (E21) → exact path
                 fast_mode=(int(mc_version) >= 22), use_gpu=_use_gpu, min_max_y=_mmy,
-                seed_list=_sl, scan_128=bool(_scan_128(_p)),
+                seed_list=_sl, scan_128=_scan_val(_p),
                 exact_eyes=bool(_p.get("exact_eyes")),
+                chunk_callback=_etrk.chunk_cb("e") if _etrk is not None else None,
             )
+            if _etrk is not None and _etrk.used:     # Pause / Resume (03/10)
+                on_resume(_etrk.point())
             return
+
+    # ── Fast path : first_stronghold « Broken portal » SEUL → moteur de l'onglet
+    # Stronghold (03/10). Avant : le moteur C émettait CHAQUE seed (toutes ont un
+    # stronghold) et le post-filtre Python les testait une par une dans un seul
+    # fil (< 1 000 sps, CPU presque au repos). Ici : la même recherche que la page
+    # Stronghold (porte native ruined portal + lacs, processus sur tous les cœurs),
+    # même règle (≥ min_frames prédits), donc les mêmes résultats.
+    if (len(enabled) == 1
+            and enabled[0].get("type") in ("first_stronghold", "stronghold")):
+        _p = enabled[0].get("params", {})
+        if _p.get("corrupt_enabled"):
+            import lake_portals as _LP
+            _mc = int(mc_version)
+            _srcs = [k for k in (_p.get("broken_sources") or ["ruined"])
+                     if (k == "ruined" and _mc <= 21)
+                     or (k in ("lava", "water") and _mc in _LP.LAKE_VERSIONS)]
+            if _srcs:
+                from broken_search import run_broken_sources
+                _need = max(1, int(_p.get("min_frames", 1) or 1))
+                if on_mode is not None:
+                    on_mode(0)
+
+                # eyes / Top Y with it (03/10): checked on the stronghold of each
+                # broken-portal hit (rare) instead of every seed in Python
+                _others = dict(_p, corrupt_enabled=False)
+                _extra = _eye_filter_on(_others) or bool(_others.get("maxy_enabled"))
+                _tls = threading.local()
+
+                def _sh_ok(seed, sx, sz):
+                    if not _extra:
+                        return True
+                    if sx is None or sz is None:          # the first stronghold
+                        lib = getattr(_tls, "lib", None)
+                        if lib is None:
+                            lib = _tls.lib = CubiomesLib()
+                        lib.setup_and_seed(mc=_mc, seed=int(seed))
+                        shs = lib.find_strongholds(max_count=1, radius_blocks=None)
+                        if not shs:
+                            return False
+                        sx, sz = shs[0]
+                    import types as _ty
+                    try:
+                        return _stronghold_extra_ok(_ty.SimpleNamespace(seed=int(seed), mc_version=_mc),
+                                                    _others, int(sx), int(sz))
+                    except Exception:
+                        return False
+
+                def _rcb(seed, ex, ey, ez, rx, ry, rz, under, *_a):
+                    if int(under) >= _need and _sh_ok(seed, *(_a[1:3] if len(_a) >= 3
+                                                             else (None, None))):
+                        on_match(int(seed), f"{int(ex)},{int(ez)}")
+
+                def _lcb(seed, ex, ey, ez, lx, ly, lz, npred, kind, sx, sz, *_a):
+                    if int(npred) >= _need and _sh_ok(seed, sx, sz):
+                        on_match(int(seed), f"{int(ex)},{int(ez)}")
+                _stop = stop_event if stop_event is not None else threading.Event()
+                from broken_search import ResumeTracker
+                _trk = (ResumeTracker(seed_start, ["ruined", "lakes"])
+                        if (seed_list is None and on_resume is not None) else None)
+                run_broken_sources(_srcs, seed_start, _inc_count(seed_count, search_mode),
+                                   max(1, num_workers), _stop,
+                                   on_progress or (lambda *_x: None), _mc,
+                                   _scan_val(_p), seed_list, _rcb, _lcb, tracker=_trk)
+                if _trk is not None:                 # Pause / Resume (03/10)
+                    on_resume(_trk.point())
+                return
 
     # ── Post-filtre stronghold eye/maxY/corrupted ────────────────────────────
     # Le moteur C/GPU ignore ces params (logique Python). On enveloppe on_match :
     # chaque candidat émis (déjà validé pour les autres conditions) est re-vérifié
     # côté Python sur les conditions stronghold uniquement. Coût par RÉSULTAT (rare).
     _joint_children = _session_joint_scan128_children(conditions)
+    # stronghold in End portal mode with linked conditions (03/10): the engines
+    # pre-filter with widened links, every candidate is checked exactly here
+    if _portal_link_children(conditions):
+        _joint_children = True
+        enabled = _portal_c_view(enabled)
     # candidates the C engine emitted but the Python post-filter did not check
     # because Stop / Pause came first: the resume point is moved back to them
     # (before, they were dropped and the resume point went past them → seeds
@@ -4320,10 +4914,16 @@ def evaluate_session(
         import threading as _th_j
         _j_tls = _th_j.local()
         _j_base = on_match
+        max_found = 0       # the engine's matches are candidates, not results (03/10)
+        _ppf_j = _ParallelPostFilter("joint", conditions, mc_version, num_workers, _j_base)
+        _PPF_TLS.obj = _ppf_j
+
         def _joint_postfilter_on_match(_seed, _details=""):
             if stop_event is not None and stop_event.is_set():
                 _pf_pending.append(int(_seed))
                 return
+            _ppf_j.add(_seed, _details)
+            return
             _lib = getattr(_j_tls, "lib", None)
             if _lib is None:
                 _lib = CubiomesLib()
@@ -4338,10 +4938,16 @@ def evaluate_session(
         # parallèle sur tous les workers. Respecte stop_event pour rester réactif.
         _pf_tls = _th_pf.local()
         _pf_base = on_match
+        max_found = 0       # the engine's matches are candidates, not results (03/10)
+        _ppf_s = _ParallelPostFilter("sh", _sh_pf, mc_version, num_workers, _pf_base)
+        _PPF_TLS.obj = _ppf_s
+
         def _sh_postfilter_on_match(_seed, _details=""):
             if stop_event is not None and stop_event.is_set():
                 _pf_pending.append(int(_seed))
                 return
+            _ppf_s.add(_seed, _details)
+            return
             _lib = getattr(_pf_tls, "lib", None)
             if _lib is None:
                 _lib = CubiomesLib()
@@ -4483,6 +5089,43 @@ def evaluate_session(
                     # They alternate each iteration so GPU never waits for CPU.
                     import concurrent.futures as _cf
 
+                    # p96: the GPU computes EXACTLY the CPU score (the octaves
+                    # and A/B weights of THIS condition, Large Biomes). Before,
+                    # it used fixed Commission weights on the wrong octaves:
+                    # not a superset of the CPU test → most results were missed
+                    # (« 400× faster but far fewer results »).
+                    if not _gc.has_exact_crunchiness():
+                        raise RuntimeError("the GPU library is older than the exact "
+                                           "crunchiness filter — rebuild it "
+                                           "(py tools/build_native.py)")
+                    _cc = None
+                    if _v_res is not None:
+                        # the crunchiness entry of the C array (ctype 19), so the GPU
+                        # uses the very parameters the CPU re-test uses
+                        _cc = next((_v_arr[i] for i in range(_v_nc)
+                                    if int(_v_arr[i].ctype) == 19), None)
+                    if _cc is not None and int(_cc.parent_idx) != 0:
+                        # under a NOT / OR / another condition, it is not a
+                        # pre-filter of the whole session
+                        raise RuntimeError("the crunchiness condition is not at the top "
+                                           "level of the session")
+                    if _cc is None or not hasattr(_raw_v, "ssa_crunch_gpu_params"):
+                        raise RuntimeError("libcubiomes is older than the exact crunchiness "
+                                           "filter — rebuild it (py tools/build_native.py --cubiomes)")
+                    _ch = (ct.c_uint64 * 2)(); _ol = (ct.c_uint64 * 6)(); _oh = (ct.c_uint64 * 6)()
+                    _wa = (ct.c_float * 6)(); _wb = (ct.c_float * 6)()
+                    _raw_v.ssa_crunch_gpu_params.restype = ct.c_int
+                    _raw_v.ssa_crunch_gpu_params.argtypes = [
+                        ct.c_int, ct.c_int, ct.c_uint32, ct.POINTER(ct.c_float),
+                        ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint64),
+                        ct.POINTER(ct.c_float), ct.POINTER(ct.c_float), ct.c_int]
+                    _kp = _raw_v.ssa_crunch_gpu_params(
+                        int(_cc.crunch_climate), int(_v_large), int(_cc.crunch_octave_mask),
+                        _cc.crunch_weights, _ch, _ol, _oh, _wa, _wb, 6)
+                    _gp = dict(clim_hash=(_ch[0], _ch[1]), oct_lo=list(_ol[:_kp]),
+                               oct_hi=list(_oh[:_kp]), w_a=list(_wa[:_kp]), w_b=list(_wb[:_kp]),
+                               threshold=float(_cc.crunch_threshold), mode_flag=int(_cc.crunch_mode))
+
                     def _gpu_batch(ss, n):
                         """Run one GPU batch, return (total_found, candidates).
                         Une erreur GPU n'est plus convertie en « 0 candidat »
@@ -4490,19 +5133,13 @@ def evaluate_session(
                         ci-dessous, qui repasse proprement sur le moteur CPU.
                         Si le buffer MAX_RES déborde, le lot est re-découpé au
                         lieu de perdre les candidats en trop."""
-                        _t, _c = _gc.crunchiness_filter_ex(
-                            seed_start=ss, n=n,
-                            climate_id=_climate,
-                            threshold=_thresh,
-                            mode_flag=_mode,
-                            max_results=MAX_RES,
-                        )
+                        _t, _c = _gc.crunchiness_filter_w(ss, n, max_results=MAX_RES, **_gp)
                         if _t <= MAX_RES:
                             return (_t, _c)
                         if _t > max(MAX_RES, n // 20):
                             raise RuntimeError(
-                                f"seuil crunchiness trop large pour le pré-filtre GPU "
-                                f"({_t:,} candidats sur {n:,} graines)")
+                                f"this crunchiness threshold keeps {_t / n:.0%} of the seeds: "
+                                f"the GPU pre-filter would not help")
                         _h = n // 2
                         _t1, _c1 = _gpu_batch(ss, _h)
                         _t2, _c2 = _gpu_batch(ss + _h, n - _h)
@@ -4513,6 +5150,8 @@ def evaluate_session(
                         _n0  = min(BATCH, _total_seeds)
                         _fut = _ex.submit(_gpu_batch, seed_start + _done, _n0)
                         _done += _n0
+                        _pend_n = _n0                      # seeds of the running batch (stats)
+                        _gpu_prof_target(enabled, _crunch_cond)
 
                         while True:
                             if stop_event.is_set():
@@ -4521,12 +5160,14 @@ def evaluate_session(
 
                             # Collect result of current GPU batch
                             _total_found, _candidates = _fut.result()
+                            _gpu_prof_note(_pend_n, len(_candidates) if _candidates is not None else 0)
 
                             # Immediately launch the next GPU batch (overlaps CPU validation)
                             if _done < _total_seeds and not stop_event.is_set():
                                 _nn  = min(BATCH, _total_seeds - _done)
                                 _fut = _ex.submit(_gpu_batch, seed_start + _done, _nn)
                                 _done += _nn
+                                _pend_n = _nn
                             else:
                                 _fut = None
 
@@ -4545,7 +5186,7 @@ def evaluate_session(
                                     _ci  = _np.ascontiguousarray(_candidates, _np.int64)
                                     _cn  = len(_ci)
                                     _co  = _np.empty(_cn, _np.int64)
-                                    _kept = _raw_v.ssa_test_seeds_batch(
+                                    _kept = _tsb(_raw_v, 
                                         _v_arr, ct.c_int(_v_nc), ct.c_int(mc_version),
                                         ct.c_int(_v_large),
                                         _ci.ctypes.data_as(ct.POINTER(ct.c_int64)),
@@ -4577,8 +5218,8 @@ def evaluate_session(
                 import traceback; traceback.print_exc()
                 if on_mode is not None:
                     try:
-                        on_mode(("gpu_status", f"Crunchiness GPU : {_gpu_ex} — "
-                                               f"recherche relancée sur le CPU."))
+                        on_mode(("gpu_status", f"Crunchiness GPU: {_gpu_ex} — "
+                                               f"searching on the CPU instead."))
                     except Exception:
                         pass
     # ────────────────────────────────────────────────────────────────────────
@@ -4793,6 +5434,13 @@ def evaluate_session(
         if eng is None:
             result = None
         else:
+            if max_found and max_found > 0 and hasattr(lib._lib, "ssa_engine_set_max_found"):
+                try:
+                    lib._lib.ssa_engine_set_max_found.argtypes = [ct.c_void_p, ct.c_int64]
+                    lib._lib.ssa_engine_set_max_found.restype = None
+                    lib._lib.ssa_engine_set_max_found(eng, ct.c_int64(int(max_found)))
+                except Exception:
+                    pass
             # Mode réellement choisi par l'auto-adaptation (0=INC,1=FAM48,2=BLOCKS)
             _eff_mode = 0
             if hasattr(lib._lib, "ssa_engine_effective_mode"):
@@ -4818,7 +5466,8 @@ def evaluate_session(
             _has_drain = hasattr(lib._lib, "ssa_engine_drain_matches")
             # per-condition profile (seeds reached / passed, own CPU time)
             _has_prof = on_profile is not None and hasattr(lib._lib, "ssa_engine_profile")
-            _prof_buf = (ct.c_int64 * (3 * n_conds + 1))()
+            _prof5 = hasattr(lib._lib, "ssa_engine_profile2")     # + per-check counts
+            _prof_buf = (ct.c_int64 * ((5 if _prof5 else 3) * n_conds + 1))()
             _last_prof = [0.0]
 
             def _profile(force=False):
@@ -4829,13 +5478,15 @@ def evaluate_session(
                     return
                 _last_prof[0] = now
                 try:
-                    lib._lib.ssa_engine_profile.restype = ct.c_int
-                    lib._lib.ssa_engine_profile.argtypes = [ct.c_void_p, ct.POINTER(ct.c_int64), ct.c_int]
-                    k = lib._lib.ssa_engine_profile(eng, _prof_buf, n_conds)
+                    fn = lib._lib.ssa_engine_profile2 if _prof5 else lib._lib.ssa_engine_profile
+                    fn.restype = ct.c_int
+                    fn.argtypes = [ct.c_void_p, ct.POINTER(ct.c_int64), ct.c_int]
+                    k = fn(eng, _prof_buf, n_conds)
+                    w = 5 if _prof5 else 3
                     if k > 0:
-                        on_profile([(int(_prof_buf[3 * i]), int(_prof_buf[3 * i + 1]),
-                                     int(_prof_buf[3 * i + 2])) for i in range(k)],
-                                   int(_prof_buf[3 * k]))
+                        # rows: [reached, branch passed, ticks(, checks, checks passed)]
+                        on_profile([tuple(int(_prof_buf[w * i + j]) for j in range(w))
+                                    for i in range(k)], int(_prof_buf[w * k]))
                 except Exception:
                     pass
 
@@ -4853,8 +5504,11 @@ def evaluate_session(
                                 eng, _drain_buf, DRAIN_CAP)
                             for k in range(n_drained):
                                 on_match(int(_drain_buf[k]), "")
-                            if n_drained < DRAIN_CAP:
+                            if n_drained < DRAIN_CAP or stop_event.is_set():
                                 break
+                    if stop_event.is_set():          # e.g. result limit hit while draining
+                        lib._lib.ssa_engine_stop(eng)
+                        break
 
                     still_running = lib._lib.ssa_engine_progress(
                         eng, ct.byref(done_c), ct.byref(found_c))
@@ -4872,7 +5526,7 @@ def evaluate_session(
                     if not still_running:
                         break
 
-                    time.sleep(0.05)
+                    stop_event.wait(0.05)            # wakes at once on Stop / Pause
 
                 # the workers are really finished before the final reads (a stop
                 # left them finishing their chunk: results pushed after the last

@@ -33,7 +33,10 @@ void nb_sampleClimateGrid(const BiomeNoise *bn, double *out,
         for (int xi = 0; xi < W; xi++) {
             double x = (gx + xi) * inv;
             double z = (gz + zi) * inv;
-            out[zi * W + xi] = sampleClimatePara(bn, NULL, x, z);
+            /* p95: table-gradient Perlin, same value, faster */
+            out[zi * W + xi] = (bn->nptype >= 0 && bn->nptype != NP_DEPTH)
+                ? sampleDoublePerlinScattered(bn->climate + bn->nptype, x, 0, z)
+                : sampleClimatePara(bn, NULL, x, z);
         }
     }
 }
@@ -62,7 +65,7 @@ static double nb_sampleOctaveN(const OctaveNoise *o, double x, double y, double 
         double ax = maintainPrecision(x * lf);
         double ay = maintainPrecision(y * lf);
         double az = maintainPrecision(z * lf);
-        v += p->amplitude * samplePerlin(p, ax, ay, az, 0, 0);
+        v += p->amplitude * samplePerlinScattered(p, ax, ay, az);   /* p95: same value */
     }
     return v;
 }

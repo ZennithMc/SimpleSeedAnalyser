@@ -1,4 +1,5 @@
 #include "biomenoise.h"
+#include <limits.h>
 
 #include "tables/btree18.h"
 #include "tables/btree192.h"
@@ -1192,6 +1193,66 @@ int sampleBiomeNoise(const BiomeNoise *bn, int64_t *np, int x, int y, int z,
     return id;
 }
 
+static int climateToBiomeHint(int mc, const uint64_t np[6], int *hint);
+/* SSA (p95): sampleBiomeNoise(bn, NULL, x, y, z, NULL, 0) with a leaf hint
+ * (see climateToBiomeHint): same result, for grids of neighbouring cells. */
+#define SDPH(dpn, x, y, z) (scat ? sampleDoublePerlinScattered(dpn, x, y, z) : sampleDoublePerlin(dpn, x, y, z))
+static int sampleBiomeNoiseHint(const BiomeNoise *bn, int x, int y, int z, int *hint,
+    uint64_t *dat, uint32_t sample_flags)
+{
+    int64_t *np = NULL;
+    const int scat = (sample_flags & SAMPLE_SSA_SCATTERED) != 0;
+    if (bn->nptype >= 0)
+    {   // initialized for a specific climate parameter
+        if (np)
+            memset(np, 0, NP_MAX*sizeof(*np));
+        int64_t id = (int64_t) (10000.0 * sampleClimatePara(bn, np, x, z));
+        return (int) id;
+    }
+
+    float t = 0, h = 0, c = 0, e = 0, d = 0, w = 0;
+    double px = x, pz = z;
+    if (!(sample_flags & SAMPLE_NO_SHIFT))
+    {
+        px += SDPH(&bn->climate[NP_SHIFT], x, 0, z) * 4.0;
+        pz += SDPH(&bn->climate[NP_SHIFT], z, x, 0) * 4.0;
+    }
+
+    c = SDPH(&bn->climate[NP_CONTINENTALNESS], px, 0, pz);
+    e = SDPH(&bn->climate[NP_EROSION], px, 0, pz);
+    w = SDPH(&bn->climate[NP_WEIRDNESS], px, 0, pz);
+
+    if (!(sample_flags & SAMPLE_NO_DEPTH))
+    {
+        float np_param[] = {
+            c, e, -3.0F * ( fabsf( fabsf(w) - 0.6666667F ) - 0.33333334F ), w,
+        };
+        double off = getSpline(bn->sp, np_param) + 0.015F;
+
+        //double py = y + SDPH(&bn->shift, y, z, x) * 4.0;
+        d = 1.0 - (y * 4) / 128.0 - 83.0/160.0 + off;
+    }
+
+    t = SDPH(&bn->climate[NP_TEMPERATURE], px, 0, pz);
+    h = SDPH(&bn->climate[NP_HUMIDITY], px, 0, pz);
+
+    int64_t l_np[6];
+    int64_t *p_np = np ? np : l_np;
+    p_np[0] = (int64_t)(10000.0F*t);
+    p_np[1] = (int64_t)(10000.0F*h);
+    p_np[2] = (int64_t)(10000.0F*c);
+    p_np[3] = (int64_t)(10000.0F*e);
+    p_np[4] = (int64_t)(10000.0F*d);
+    p_np[5] = (int64_t)(10000.0F*w);
+
+    int id = none;
+    if (!(sample_flags & SAMPLE_NO_BIOME))
+        id = dat ? climateToBiome(bn->mc, (const uint64_t*)p_np, dat)
+                 : climateToBiomeHint(bn->mc, (const uint64_t*)p_np, hint);
+    return id;
+}
+#undef SDPH
+
 // Note: Climate noise is sampled at a 1:1 scale.
 int sampleBiomeNoiseBeta(const BiomeNoiseBeta *bnb, int64_t *np, double *nv,
     int x, int z)
@@ -1432,6 +1493,514 @@ int get_resulting_node(const uint64_t np[6], const BiomeTree *bt, int idx,
     return leaf;
 }
 
+/* SSA (p92): exact per-leaf climate limits, see biomenoise.h */
+static const BiomeTree *ssa_btree(int mc);
+
+/* decoded leaf boxes of a tree, built once per table */
+typedef struct { int n; int32_t (*lo)[6], (*hi)[6]; uint8_t *id; int32_t *slo[6], *shi[6]; } LeafBoxes;
+static const LeafBoxes *g_leafbox[64];
+
+static const LeafBoxes *leaf_boxes(int mc, const BiomeTree *bt)
+{   // called with g_bli_lock held
+    if (g_leafbox[mc])
+        return g_leafbox[mc];
+    LeafBoxes *lb = (LeafBoxes*) calloc(1, sizeof(*lb));
+    lb->lo = (int32_t (*)[6]) malloc(bt->len * sizeof(*lb->lo));
+    lb->hi = (int32_t (*)[6]) malloc(bt->len * sizeof(*lb->hi));
+    lb->id = (uint8_t*) malloc(bt->len);
+    for (uint32_t i = 0; i < bt->len; i++)
+    {
+        uint64_t ni = bt->nodes[i];
+        if ((ni >> 56) != 0xFF)
+            continue;
+        for (int k = 0; k < 6; k++)
+        {
+            int idx = (ni >> 8*k) & 0xFF;
+            lb->lo[lb->n][k] = bt->param[2*idx + 0];
+            lb->hi[lb->n][k] = bt->param[2*idx + 1];
+        }
+        lb->id[lb->n++] = (ni >> 48) & 0xFF;
+    }
+    for (int k = 0; k < 6; k++)
+    {
+        lb->slo[k] = (int32_t*) malloc((lb->n + 8) * sizeof(int32_t));
+        lb->shi[k] = (int32_t*) malloc((lb->n + 8) * sizeof(int32_t));
+        for (int i = 0; i < lb->n; i++)
+        {
+            lb->slo[k][i] = lb->lo[i][k];
+            lb->shi[k][i] = lb->hi[i][k];
+        }
+    }
+    g_leafbox[mc] = lb;
+    return lb;
+}
+
+static int cmp_iv(const void *a, const void *b)
+{
+    int32_t x = ((const int32_t*)a)[0], y = ((const int32_t*)b)[0];
+    return (x > y) - (x < y);
+}
+
+/* does the union of the n intervals cover [A, B] ? (sorts tmp) */
+static int covers(const int32_t (*iv)[2], int n, int32_t A, int32_t B, int32_t (*tmp)[2])
+{
+    if (n <= 0)
+        return 0;
+    memcpy(tmp, iv, (size_t)n * sizeof(*tmp));
+    qsort(tmp, n, sizeof(*tmp), cmp_iv);
+    int64_t reach = (int64_t)A - 1;
+    for (int q = 0; q < n && reach < B; q++)
+    {
+        if (tmp[q][0] > reach + 1)
+            break;
+        if (tmp[q][1] > reach)
+            reach = tmp[q][1];
+    }
+    return reach >= B;
+}
+
+typedef struct { int64_t t; int j; } ThrEnt;
+static int cmp_thr_up(const void *a, const void *b)
+{
+    int64_t x = ((const ThrEnt*)a)->t, y = ((const ThrEnt*)b)->t;
+    return (x > y) - (x < y);
+}
+static int cmp_thr_dn(const void *a, const void *b)
+{
+    return cmp_thr_up(b, a);
+}
+
+/* Allowed interval of every parameter for each leaf of 'biome'.
+ * Leaf j "beats" leaf i at the value v of parameter k when it is strictly
+ * closer to v in k and at least as close as i in every other parameter, for
+ * any value of these. With j's interval containing i's in a parameter, j is
+ * at least as close there for any value; in ONE other parameter m this may be
+ * replaced by a family of leaves whose m-intervals together cover i's (for
+ * any value of m one of them is at least as close). i is then never the
+ * nearest leaf: v is outside i's allowed interval for k. */
+static int leaf_limits(const LeafBoxes *lb, int biome, int (*out)[12], int max)
+{
+    int n = 0;
+    int cap = 256;
+    int *cand = (int*) malloc(cap * sizeof(int));
+    uint8_t *cmiss = (uint8_t*) malloc(cap);
+    ThrEnt *te = (ThrEnt*) malloc(cap * sizeof(ThrEnt));
+    int32_t (*tmpiv)[2] = (int32_t (*)[2]) malloc(cap * sizeof(*tmpiv));
+    int32_t (*iv)[2] = (int32_t (*)[2]) malloc(cap * sizeof(*iv));
+    uint8_t *mbits = (uint8_t*) malloc(lb->n + 8);
+    for (int i = 0; i < lb->n; i++)
+    {
+        if (lb->id[i] != biome)
+            continue;
+        if (n >= max)
+        {
+            n = -1;
+            break;
+        }
+        const int32_t *lo = lb->lo[i], *hi = lb->hi[i];
+        // leaves that contain i in at least 4 of the 6 parameters
+        // (miss bit q: j's interval does not contain i's in parameter q)
+        for (int j = 0; j < lb->n; j++)
+            mbits[j] = 0;
+        for (int q = 0; q < 6; q++)
+        {
+            const int32_t *sl = lb->slo[q], *sh = lb->shi[q];
+            int32_t a = lo[q], b = hi[q];
+            uint8_t bit = 1 << q;
+            for (int j = 0; j < lb->n; j++)     // vectorizes
+                mbits[j] |= (sl[j] > a || sh[j] < b) ? bit : 0;
+        }
+        int nc = 0;
+        for (int j = 0; j < lb->n; j++)
+        {
+            int miss = mbits[j];
+            if (j == i || __builtin_popcount(miss) > 2)
+                continue;
+            if (nc == cap)
+            {
+                cap *= 2;
+                cand = (int*) realloc(cand, cap * sizeof(int));
+                cmiss = (uint8_t*) realloc(cmiss, cap);
+                te = (ThrEnt*) realloc(te, cap * sizeof(ThrEnt));
+                tmpiv = (int32_t (*)[2]) realloc(tmpiv, cap * sizeof(*tmpiv));
+                iv = (int32_t (*)[2]) realloc(iv, cap * sizeof(*iv));
+            }
+            cand[nc] = j;
+            cmiss[nc] = miss;
+            nc++;
+        }
+        for (int k = 0; k < 6; k++)
+        {
+            int64_t L = INT32_MIN, H = INT32_MAX;
+            for (int m = 0; m < 6; m++)
+            {
+                if (m == k)
+                    continue;
+                int allow = (1 << k) | (1 << m);
+                for (int side = 0; side < 2; side++)
+                {
+                    // members of the family and the value from which each
+                    // one is strictly closer in k (above: v >= t, below: v <= t)
+                    int nf = 0;
+                    for (int c = 0; c < nc; c++)
+                    {
+                        if (cmiss[c] & ~allow)
+                            continue;
+                        int j = cand[c];
+                        int32_t jlo = lb->lo[j][k], jhi = lb->hi[j][k];
+                        int64_t t;
+                        if (side == 0)
+                        {
+                            if (jhi <= hi[k]) continue;
+                            t = jlo <= hi[k] ? (int64_t)hi[k] + 1
+                              : (((int64_t)jlo + hi[k]) >> 1) + 1;
+                            if (t > H) continue;        // cannot improve
+                        }
+                        else
+                        {
+                            if (jlo >= lo[k]) continue;
+                            int64_t sum = (int64_t)jhi + lo[k];
+                            t = jhi >= lo[k] ? (int64_t)lo[k] - 1
+                              : ((sum >> 1) + (sum & 1)) - 1;
+                            if (t < L) continue;
+                        }
+                        te[nf].t = t;
+                        te[nf].j = j;
+                        nf++;
+                    }
+                    if (nf == 0)
+                        continue;
+                    qsort(te, nf, sizeof(*te), side == 0 ? cmp_thr_up : cmp_thr_dn);
+                    for (int x = 0; x < nf; x++)
+                    {
+                        iv[x][0] = lb->lo[te[x].j][m];
+                        iv[x][1] = lb->hi[te[x].j][m];
+                    }
+                    if (!covers((const int32_t (*)[2]) iv, nf, lo[m], hi[m], tmpiv))
+                        continue;
+                    // smallest prefix (nearest thresholds) that covers
+                    int lo_n = 1, hi_n = nf;
+                    while (lo_n < hi_n)
+                    {
+                        int mid = (lo_n + hi_n) / 2;
+                        if (covers((const int32_t (*)[2]) iv, mid, lo[m], hi[m], tmpiv))
+                            hi_n = mid;
+                        else
+                            lo_n = mid + 1;
+                    }
+                    int64_t t = te[lo_n - 1].t;
+                    if (side == 0) { if (t - 1 < H) H = t - 1; }
+                    else           { if (t + 1 > L) L = t + 1; }
+                }
+            }
+            out[n][2*k+0] = (int) L;
+            out[n][2*k+1] = (int) H;
+        }
+        n++;
+    }
+    free(cand); free(cmiss); free(te); free(tmpiv); free(iv); free(mbits);
+    return n;
+}
+
+static volatile int g_bli_lock;
+
+int getBiomeLeafLimits(int mc, int biome, int (*out)[12], int max)
+{
+    const BiomeTree *bt = ssa_btree(mc);
+    if (!bt || mc < 0 || mc >= 64)
+        return -1;
+    while (__atomic_exchange_n(&g_bli_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    const LeafBoxes *lb = leaf_boxes(mc, bt);
+    __atomic_store_n(&g_bli_lock, 0, __ATOMIC_RELEASE);
+    return leaf_limits(lb, biome, out, max);
+}
+
+/* per-biome reduced leaf data, computed once and shared by all threads */
+static const BiomeLeafInfo *g_bli[64][256];
+
+static int rows_sub(const int *a, const int *b, int n)
+{   // interval row a contained in row b
+    for (int k = 0; k < n; k += 2)
+        if (a[k] < b[k] || a[k+1] > b[k+1])
+            return 0;
+    return 1;
+}
+
+static int reduce_rows(int *rows, int n, int w)
+{   // drop rows contained in another row (keep one of equal rows)
+    int m = 0;
+    for (int i = 0; i < n; i++)
+    {
+        int *ri = rows + i*w, drop = 0;
+        for (int j = 0; j < n && !drop; j++)
+        {
+            if (j == i) continue;
+            int *rj = rows + j*w;
+            if (rows_sub(ri, rj, w) && (!rows_sub(rj, ri, w) || j < i))
+                drop = 1;
+        }
+        if (!drop)
+            memmove(rows + m*w, ri, w*sizeof(int)), m++;
+    }
+    return m;
+}
+
+/* The pruning relies on the tree search returning a nearest leaf, which holds
+ * when every node box (below the root) contains the boxes of its children.
+ * True for the 1.18 - 26.3 tables except 26.2, checked here once per table. */
+static int tree_bounded(const BiomeTree *bt, int idx, int depth)
+{
+    if (bt->steps[depth] == 0)
+        return 1;
+    uint32_t step;
+    do
+    {
+        step = bt->steps[depth];
+        depth++;
+    }
+    while (idx+step >= bt->len);
+    uint64_t node = bt->nodes[idx];
+    uint16_t inner = node >> 48;
+    for (uint32_t i = 0; i < bt->order; i++)
+    {
+        uint64_t c = bt->nodes[inner];
+        if (idx != 0)
+        {
+            for (int k = 0; k < 6; k++)
+            {
+                int pi = (node >> 8*k) & 0xFF, ci = (c >> 8*k) & 0xFF;
+                if (bt->param[2*ci] < bt->param[2*pi] ||
+                    bt->param[2*ci+1] > bt->param[2*pi+1])
+                    return 0;
+            }
+        }
+        if ((c >> 56) != 0xFF && !tree_bounded(bt, inner, depth))
+            return 0;
+        inner += step;
+        if (inner >= bt->len)
+            break;
+    }
+    return 1;
+}
+
+const BiomeLeafInfo *getBiomeLeafInfo(int mc, int biome)
+{
+    if (mc < MC_1_18 || mc >= 64 || biome < 0 || biome >= 256)
+        return NULL;
+    const BiomeLeafInfo *p = __atomic_load_n(&g_bli[mc][biome], __ATOMIC_ACQUIRE);
+    if (p)
+        return p;
+    while (__atomic_exchange_n(&g_bli_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    p = g_bli[mc][biome];
+    static signed char exact[64];   // 0 unknown, 1 exact, -1 not
+    if (!exact[mc])
+        exact[mc] = (ssa_btree(mc) && tree_bounded(ssa_btree(mc), 0, 0)) ? 1 : -1;
+    if (!p && exact[mc] > 0)
+    {
+        int max = 4096;
+        int (*lf)[12] = (int (*)[12]) malloc(max * sizeof(*lf));
+        int n = leaf_limits(leaf_boxes(mc, ssa_btree(mc)), biome, lf, max);
+        if (n >= 0)
+        {
+            BiomeLeafInfo *bi = (BiomeLeafInfo*) calloc(1, sizeof(*bi));
+            int (*th)[4] = (int (*)[4]) malloc((n ? n : 1) * sizeof(*th));
+            for (int k = 0; k < 6; k++)
+            {
+                bi->hull[2*k] = INT_MAX; bi->hull[2*k+1] = INT_MIN;
+            }
+            for (int i = 0; i < n; i++)
+            {
+                for (int k = 0; k < 6; k++)
+                {
+                    if (lf[i][2*k]   < bi->hull[2*k])   bi->hull[2*k]   = lf[i][2*k];
+                    if (lf[i][2*k+1] > bi->hull[2*k+1]) bi->hull[2*k+1] = lf[i][2*k+1];
+                }
+                th[i][0] = lf[i][0]; th[i][1] = lf[i][1];
+                th[i][2] = lf[i][2]; th[i][3] = lf[i][3];
+            }
+            bi->nth = reduce_rows(&th[0][0], n, 4);
+            bi->nlf = reduce_rows(&lf[0][0], n, 12);
+            lf = (int (*)[12]) realloc(lf, (bi->nlf ? bi->nlf : 1) * sizeof(*lf));
+            bi->th = (const int (*)[4]) th;
+            bi->lf = (const int (*)[12]) lf;
+            lf = NULL;
+            p = bi;
+            __atomic_store_n(&g_bli[mc][biome], p, __ATOMIC_RELEASE);
+        }
+        free(lf);
+    }
+    __atomic_store_n(&g_bli_lock, 0, __ATOMIC_RELEASE);
+    return p;
+}
+
+int setupBiomePrune(BiomePrune *bp, int mc, const int *ids, int n)
+{
+    memset(bp, 0, sizeof(*bp));
+    if (n <= 0 || n > BPRUNE_MAX)
+        return 0;
+    for (int i = 0; i < n; i++)
+    {
+        const BiomeLeafInfo *bi = getBiomeLeafInfo(mc, ids[i]);
+        if (!bi)
+            return 0;
+        bp->b[i] = bi;
+    }
+    bp->n = n;
+    // sampling order: most pruning per octave first. Pruning ~ share of the
+    // [-1, 1] range outside the union of the candidates' hulls.
+    static const int para[5] = { 0, 1, 5, 3, 2 };     // T, H, W, E, C
+    static const double cost[5] = { 2, 2, 3, 4, 6 };  // octaves
+    double score[5];
+    for (int q = 0; q < 5; q++)
+    {
+        int k = para[q];
+        // union length of the hull intervals clipped to [-10000, 10000]
+        int lo[BPRUNE_MAX], hi[BPRUNE_MAX], m = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int a = bp->b[i]->hull[2*k], b = bp->b[i]->hull[2*k+1];
+            if (a < -10000) a = -10000;
+            if (b > 10000) b = 10000;
+            if (a <= b) { lo[m] = a; hi[m] = b; m++; }
+        }
+        for (int i = 1; i < m; i++)         // sort by lo
+            for (int j = i; j > 0 && lo[j] < lo[j-1]; j--)
+            {
+                int t = lo[j]; lo[j] = lo[j-1]; lo[j-1] = t;
+                t = hi[j]; hi[j] = hi[j-1]; hi[j-1] = t;
+            }
+        double cov = 0; int end = -10001;
+        for (int i = 0; i < m; i++)
+        {
+            int a = lo[i] > end ? lo[i] : end;
+            if (hi[i] > a) cov += hi[i] - a;
+            if (hi[i] > end) end = hi[i];
+        }
+        score[q] = (1.0 - cov / 20000.0) / cost[q];
+        bp->order[q] = k;
+    }
+    for (int i = 1; i < 5; i++)             // stable sort, best score first
+        for (int j = i; j > 0 && score[j] > score[j-1] + 1e-9; j--)
+        {
+            double t = score[j]; score[j] = score[j-1]; score[j-1] = t;
+            int o = bp->order[j]; bp->order[j] = bp->order[j-1]; bp->order[j-1] = o;
+        }
+    return 1;
+}
+
+static inline uint32_t hull_keep(const BiomePrune *bp, uint32_t alive, int k, int64_t v)
+{
+    uint32_t a = alive;
+    while (a)
+    {
+        int i = __builtin_ctz(a);
+        a &= a - 1;
+        const int *h = bp->b[i]->hull;
+        if (v < h[2*k] || v > h[2*k+1])
+            alive &= ~(1U << i);
+    }
+    return alive;
+}
+
+/* SSA (p92): see biomenoise.h. Same arithmetic as sampleBiomeNoise(), with the
+ * climate parameters computed cheapest first and checked after each one. */
+#define SDP(dpn, x, y, z) (scat ? sampleDoublePerlinScattered(dpn, x, y, z) : sampleDoublePerlin(dpn, x, y, z))
+int sampleBiomeNoisePruned(const BiomeNoise *bn, int x, int y, int z,
+    uint64_t *dat, uint32_t sample_flags, const BiomePrune *bp, uint32_t alive)
+{
+    float t = 0, h = 0, c = 0, e = 0, d = 0, w = 0;
+    int64_t p_np[6];
+    double px = x, pz = z;
+    uint32_t a;
+    const int scat = (sample_flags & SAMPLE_SSA_SCATTERED) != 0;
+    int i, j, th = 0;
+    if (!(sample_flags & SAMPLE_NO_SHIFT))
+    {
+        px += SDP(&bn->climate[NP_SHIFT], x, 0, z) * 4.0;
+        pz += SDP(&bn->climate[NP_SHIFT], z, x, 0) * 4.0;
+    }
+    // parameters in the prepared order (most selective per octave first)
+    for (int q = 0; q < 5; q++)
+    {
+        int k = bp->order[q];
+        switch (k)
+        {
+        case 0:
+            t = SDP(&bn->climate[NP_TEMPERATURE], px, 0, pz);
+            p_np[0] = (int64_t)(10000.0F*t);
+            break;
+        case 1:
+            h = SDP(&bn->climate[NP_HUMIDITY], px, 0, pz);
+            p_np[1] = (int64_t)(10000.0F*h);
+            break;
+        case 2:
+            c = SDP(&bn->climate[NP_CONTINENTALNESS], px, 0, pz);
+            p_np[2] = (int64_t)(10000.0F*c);
+            break;
+        case 3:
+            e = SDP(&bn->climate[NP_EROSION], px, 0, pz);
+            p_np[3] = (int64_t)(10000.0F*e);
+            break;
+        default:
+            w = SDP(&bn->climate[NP_WEIRDNESS], px, 0, pz);
+            p_np[5] = (int64_t)(10000.0F*w);
+            break;
+        }
+        if (!(alive = hull_keep(bp, alive, k, p_np[k]))) return -2;
+        th |= (k == 0) + 2*(k == 1);
+        if (th == 3)
+        {   // T and H known: some T×H rectangle of a candidate must hold them
+            th = 4;
+            for (a = alive; a; a &= a - 1)
+            {
+                i = __builtin_ctz(a);
+                const BiomeLeafInfo *bi = bp->b[i];
+                for (j = 0; j < bi->nth; j++)
+                {
+                    const int *r = bi->th[j];
+                    if (p_np[0] >= r[0] && p_np[0] <= r[1] && p_np[1] >= r[2] && p_np[1] <= r[3])
+                        break;
+                }
+                if (j == bi->nth)
+                    alive &= ~(1U << i);
+            }
+            if (!alive) return -2;
+        }
+    }
+
+    if (!(sample_flags & SAMPLE_NO_DEPTH))
+    {
+        float np_param[] = {
+            c, e, -3.0F * ( fabsf( fabsf(w) - 0.6666667F ) - 0.33333334F ), w,
+        };
+        double off = getSpline(bn->sp, np_param) + 0.015F;
+        d = 1.0 - (y * 4) / 128.0 - 83.0/160.0 + off;
+    }
+    p_np[4] = (int64_t)(10000.0F*d);
+    if (!(alive = hull_keep(bp, alive, 4, p_np[4]))) return -2;
+    for (a = alive; a; a &= a - 1)
+    {   // some leaf of the candidate must contain all six parameters
+        i = __builtin_ctz(a);
+        const BiomeLeafInfo *bi = bp->b[i];
+        for (j = 0; j < bi->nlf; j++)
+        {
+            const int *r = bi->lf[j];
+            if (p_np[0] >= r[0] && p_np[0] <= r[1] && p_np[1] >= r[2] && p_np[1] <= r[3] &&
+                p_np[2] >= r[4] && p_np[2] <= r[5] && p_np[3] >= r[6] && p_np[3] <= r[7] &&
+                p_np[4] >= r[8] && p_np[4] <= r[9] && p_np[5] >= r[10] && p_np[5] <= r[11])
+                break;
+        }
+        if (j < bi->nlf)
+            break;
+    }
+    if (!a) return -2;
+
+    return climateToBiome(bn->mc, (const uint64_t*)p_np, dat);
+}
+#undef SDP
+
 ATTR(hot, flatten)
 int climateToBiome(int mc, const uint64_t np[6], uint64_t *dat)
 {
@@ -1497,6 +2066,229 @@ int climateToBiome(int mc, const uint64_t np[6], uint64_t *dat)
     return (bt->nodes[idx] >> 48) & 0xFF;
 }
 
+/* SSA (p95): the tree search of get_resulting_node, started with a distance
+ * bound and no candidate. It returns the first leaf, in traversal order, among
+ * the nearest ones -- as the unbounded search does -- provided the bound is
+ * above the nearest distance (else -1). Same traversal and same strict
+ * comparisons as get_resulting_node; only branches whose box is at least the
+ * bound away are skipped earlier. (Passing the hint as 'alt' with dist+1, as a
+ * first version did, was NOT exact: a branch with no better leaf returns the
+ * hint, which then lowers the bound to its own distance and hides an earlier
+ * leaf at the same distance.) */
+static int grn_bound(const uint64_t np[6], const BiomeTree *bt, int idx,
+    uint64_t *pds, int depth)
+{
+    if (bt->steps[depth] == 0)
+        return idx;
+    uint32_t step;
+    do
+    {
+        step = bt->steps[depth];
+        depth++;
+    }
+    while (idx+step >= bt->len);
+
+    uint64_t node = bt->nodes[idx];
+    uint16_t inner = node >> 48;
+    int leaf = -1;
+    uint32_t i, n;
+
+    for (i = 0, n = bt->order; i < n; i++)
+    {
+        uint64_t ds_inner = get_np_dist(np, bt, inner);
+        if (ds_inner < *pds)
+        {
+            uint64_t ds_sub = *pds;
+            int leaf2 = grn_bound(np, bt, inner, &ds_sub, depth);
+            if (leaf2 >= 0)
+            {
+                uint64_t ds_leaf2 = (inner == leaf2) ? ds_inner : get_np_dist(np, bt, leaf2);
+                if (ds_leaf2 < *pds)
+                {
+                    *pds = ds_leaf2;
+                    leaf = leaf2;
+                }
+            }
+        }
+        inner += step;
+        if (inner >= bt->len)
+            break;
+    }
+    return leaf;
+}
+
+/* climateToBiome(mc, np, NULL) using the leaf of a neighbouring cell to get a
+ * tight starting bound: same result, most branches cut at once.
+ * *hint: leaf index in/out, < 0 = none. */
+static int climateToBiomeHint(int mc, const uint64_t np[6], int *hint)
+{
+    const BiomeTree *bt = ssa_btree(mc);
+    int idx = -1;
+    if (*hint >= 0 && (uint32_t)*hint < bt->len)
+    {
+        uint64_t ds = get_np_dist(np, bt, *hint) + 1;
+        idx = grn_bound(np, bt, 0, &ds, 0);
+    }
+    if (idx < 0)
+        idx = get_resulting_node(np, bt, 0, 0, -1, 0);
+    *hint = idx;
+    return (bt->nodes[idx] >> 48) & 0xFF;
+}
+
+
+static const BiomeTree *ssa_btree(int mc)
+{
+    if (mc < MC_1_18)
+        return NULL;
+    static const BiomeTree btree18 = {
+        btree18_steps, &btree18_param[0][0], btree18_nodes, btree18_order,
+        sizeof(btree18_nodes) / sizeof(uint64_t)
+    };
+    static const BiomeTree btree192 = {
+        btree192_steps, &btree192_param[0][0], btree192_nodes, btree192_order,
+        sizeof(btree192_nodes) / sizeof(uint64_t)
+    };
+    static const BiomeTree btree19 = {
+        btree19_steps, &btree19_param[0][0], btree19_nodes, btree19_order,
+        sizeof(btree19_nodes) / sizeof(uint64_t)
+    };
+    static const BiomeTree btree20 = {
+        btree20_steps, &btree20_param[0][0], btree20_nodes, btree20_order,
+        sizeof(btree20_nodes) / sizeof(uint64_t)
+    };
+    static const BiomeTree btree21wd = {
+        btree21wd_steps, &btree21wd_param[0][0], btree21wd_nodes, btree21wd_order,
+        sizeof(btree21wd_nodes) / sizeof(uint64_t)
+    };
+    static const BiomeTree btree262 = {
+        btree262_steps, &btree262_param[0][0], btree262_nodes, btree262_order,
+        sizeof(btree262_nodes) / sizeof(uint64_t)
+    };
+    static const BiomeTree btree263 = {
+        btree263_steps, &btree263_param[0][0], btree263_nodes, btree263_order,
+        sizeof(btree263_nodes) / sizeof(uint64_t)
+    };
+
+    const BiomeTree *bt;
+
+    if (mc >= MC_26_3)
+        bt = &btree263;
+    else if (mc >= MC_26_2)
+        bt = &btree262;
+    else if (mc >= MC_1_21_WD)
+        bt = &btree21wd;
+    else if (mc >= MC_1_20_6)
+        bt = &btree20;
+    else if (mc >= MC_1_19_4)
+        bt = &btree19;
+    else if (mc >= MC_1_19_2)
+        bt = &btree192;
+    else
+        bt = &btree18;
+
+    return bt;
+}
+
+/* ── SSA (p93): climate noises with shared, on-demand octaves ─────────────
+ * Same constants as init_climate_seed() (checked equal sample by sample
+ * against setClimateParaSeed in tests/perlin_check.c). */
+static int climate_para_def(int nptype, int large, const double **amp,
+    int *omin, int *len, uint64_t *xl, uint64_t *xh)
+{
+    static const double a_temp[]  = {1.5, 0, 1, 0, 0, 0};
+    static const double a_humi[]  = {1, 1, 0, 0, 0, 0};
+    static const double a_cont[]  = {1, 1, 2, 2, 2, 1, 1, 1, 1};
+    static const double a_eros[]  = {1, 1, 0, 1, 1};
+    static const double a_weird[] = {1, 2, 1, 0, 0, 0};
+    switch (nptype)
+    {
+    // NP_SHIFT == NP_DEPTH: setClimateParaSeed treats it as depth (C, E, W),
+    // not supported here (the caller keeps setClimateParaSeed)
+    case NP_TEMPERATURE:
+        *amp = a_temp; *omin = large ? -12 : -10; *len = 6;
+        *xl = large ? 0x944b0073edf549db : 0x5c7e6b29735f0d7f;
+        *xh = large ? 0x4ff44347e9d22b96 : 0xf7d86f1bbc734988; return 1;
+    case NP_HUMIDITY:
+        *amp = a_humi; *omin = large ? -10 : -8; *len = 6;
+        *xl = large ? 0x71b8ab943dbd5301 : 0x81bb4d22e8dc168e;
+        *xh = large ? 0xbb63ddcf39ff7a2b : 0xf1c8b4bea16303cd; return 1;
+    case NP_CONTINENTALNESS:
+        *amp = a_cont; *omin = large ? -11 : -9; *len = 9;
+        *xl = large ? 0x9a3f51a113fce8dc : 0x83886c9d0ae3a662;
+        *xh = large ? 0xee2dbd157e5dcdad : 0xafa638a61b42e8ad; return 1;
+    case NP_EROSION:
+        *amp = a_eros; *omin = large ? -11 : -9; *len = 5;
+        *xl = large ? 0x8c984b1f8702a951 : 0xd02491e6058f6fd8;
+        *xh = large ? 0xead7b1f92bae535f : 0x4792512c94c17a80; return 1;
+    case NP_WEIRDNESS:
+        *amp = a_weird; *omin = -7; *len = 6;
+        *xl = 0xefc8ef4d36102b34; *xh = 0x1beeeb324a0f24ea; return 1;
+    }
+    return 0;
+}
+
+int climLazyGet(ClimLazy *cl, DoublePerlinNoise *view, uint64_t seed,
+    int large, int nptype, int nmax)
+{
+    if (!cl->valid || cl->seed != seed || cl->large != large || cl->nptype != nptype)
+    {
+        const double *amp;
+        int omin, len, i, n;
+        uint64_t xl, xh;
+        if (!climate_para_def(nptype, large, &amp, &omin, &len, &xl, &xh))
+            return 0;
+        Xoroshiro pxr;
+        xSetSeed(&pxr, seed);
+        uint64_t xlo = xNextLong(&pxr);
+        uint64_t xhi = xNextLong(&pxr);
+        pxr.lo = xlo ^ xl;
+        pxr.hi = xhi ^ xh;
+        // xDoublePerlinInit: octA then octB, each xOctaveInit draws 2 longs
+        cl->xloA = xNextLong(&pxr); cl->xhiA = xNextLong(&pxr);
+        cl->xloB = xNextLong(&pxr); cl->xhiB = xNextLong(&pxr);
+        cl->amp = amp; cl->omin = omin; cl->len = len;
+        for (i = n = 0; i < len; i++)
+            if (amp[i] != 0)
+                cl->idx[n++] = i;
+        cl->tot = n;
+        cl->haveA = cl->haveB = 0;
+        // xDoublePerlinInit's amplitude: len without leading/trailing zeros
+        int tl = len;
+        for (i = len-1; i >= 0 && amp[i] == 0.0; i--) tl--;
+        for (i = 0; amp[i] == 0.0; i++) tl--;
+        static const double amp_ini[] = {
+            0, 5./6, 10./9, 15./12, 20./15, 25./18, 30./21, 35./24, 40./27, 45./30,
+        };
+        cl->amplitude = amp_ini[tl];
+        cl->seed = seed; cl->large = large; cl->nptype = nptype; cl->valid = 1;
+    }
+    int na = cl->tot, nb = cl->tot;
+    if (nmax > 0)
+    {
+        na = (nmax + 1) >> 1;
+        nb = nmax - na;
+        if (na > cl->tot) na = cl->tot;
+        if (nb > cl->tot) nb = cl->tot;
+    }
+    while (cl->haveA < na)
+    {
+        xOctaveInitOne(&cl->octA[cl->haveA], cl->xloA, cl->xhiA, cl->amp,
+            cl->omin, cl->len, cl->idx[cl->haveA]);
+        cl->haveA++;
+    }
+    while (cl->haveB < nb)
+    {
+        xOctaveInitOne(&cl->octB[cl->haveB], cl->xloB, cl->xhiB, cl->amp,
+            cl->omin, cl->len, cl->idx[cl->haveB]);
+        cl->haveB++;
+    }
+    view->amplitude = cl->amplitude;
+    view->octA.octaves = cl->octA;
+    view->octA.octcnt = na;
+    view->octB.octaves = cl->octB;
+    view->octB.octcnt = nb;
+    return 1;
+}
 
 void setClimateParaSeed(BiomeNoise *bn, uint64_t seed, int large, int nptype, int nmax)
 {
@@ -1579,6 +2371,7 @@ static void genBiomeNoise3D(const BiomeNoise *bn, int *out, Range r, int opt)
     uint64_t dat = 0;
     uint64_t *p_dat = opt ? &dat : NULL;
     uint32_t flags = opt ? SAMPLE_NO_SHIFT : 0;
+    int hint = -1;
     int i, j, k;
     int *p = out;
     int scale = r.scale > 4 ? r.scale / 4 : 1;
@@ -1592,7 +2385,11 @@ static void genBiomeNoise3D(const BiomeNoise *bn, int *out, Range r, int opt)
             for (i = 0; i < r.sx; i++)
             {
                 int xi = (r.x+i)*scale + mid;
-                *p = sampleBiomeNoise(bn, NULL, xi, yk, zj, p_dat, flags);
+                // SSA (p95): same results as sampleBiomeNoise(bn, NULL, xi,
+                // yk, zj, p_dat, flags); faster tree search at 1:4 (hint),
+                // table-gradient Perlin (faster at every scale, measured)
+                *p = sampleBiomeNoiseHint(bn, xi, yk, zj, &hint, p_dat,
+                        flags | SAMPLE_SSA_SCATTERED);
                 p++;
             }
         }

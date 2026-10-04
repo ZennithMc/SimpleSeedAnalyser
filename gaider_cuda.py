@@ -509,6 +509,40 @@ def crunchiness_filter(
     return (total, out[:actual].tolist())
 
 
+def has_exact_crunchiness() -> bool:
+    """True when the GPU library has the exact crunchiness kernel (p96)."""
+    return is_available() and getattr(_CUDA_LIB, "gaider_cuda_crunchiness_filter_w", None) is not None
+
+
+def crunchiness_filter_w(seed_start: int, n: int, clim_hash, oct_lo, oct_hi, w_a, w_b,
+                         threshold: float, mode_flag: int, max_results: int,
+                         eps: float = 1e-5) -> "tuple[int, list[int]]":
+    """EXACT GPU crunchiness pre-filter (p96): same score as the CPU engine
+    (octave hashes and A/B weights from libcubiomes ssa_crunch_gpu_params),
+    kept within eps of passing → a superset of the CPU result, which re-tests
+    every candidate. Returns (total, candidates); when total > max_results only
+    the first max_results are returned (the caller splits the batch)."""
+    if not is_available():
+        _unavailable()
+    fn = _CUDA_LIB.gaider_cuda_crunchiness_filter_w
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_int64, ctypes.c_int32, ctypes.c_uint64, ctypes.c_uint64,
+                   ctypes.c_int32, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+                   ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+                   ctypes.c_float, ctypes.c_float, ctypes.c_int32,
+                   ctypes.POINTER(ctypes.c_int64), ctypes.c_int32]
+    k = len(oct_lo)
+    a_lo = (ctypes.c_uint64 * 6)(*oct_lo); a_hi = (ctypes.c_uint64 * 6)(*oct_hi)
+    a_wa = (ctypes.c_float * 6)(*w_a); a_wb = (ctypes.c_float * 6)(*w_b)
+    import numpy as np
+    out = np.zeros(max(1, max_results), dtype=np.int64)
+    total = fn(seed_start, n, clim_hash[0], clim_hash[1], k, a_lo, a_hi, a_wa, a_wb,
+               float(threshold), float(eps), int(mode_flag),
+               out.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)), int(max_results))
+    _check(total)
+    return (int(total), out[:min(total, max_results)].tolist())
+
+
 def crunchiness_filter_ex(
         seed_start: int,
         n: int,

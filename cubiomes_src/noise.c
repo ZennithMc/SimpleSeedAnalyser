@@ -46,6 +46,22 @@ static inline double indexedLerp(uint8_t idx, double a, double b, double c)
 }
 #endif
 
+/* SSA (p93): same gradient by table lookup. The switch above is an indirect
+ * jump on the permutation value: perfect when neighbouring samples fall in
+ * the same lattice cell (grid scans, gradient descents), ~100 ns per Perlin
+ * sample when the samples are scattered (Monte Carlo), because every jump is
+ * mispredicted. The table form costs ~23 ns either way and gives the same
+ * value (components are +-1 or 0: g.(a,b,c) is exactly the switch's sum, a
+ * zero component only adding +-0.0) -- checked bit-identical on 30 M samples. */
+static const double g_grad_x[16] = { 1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0, 1, 0,-1, 0 };
+static const double g_grad_y[16] = { 1, 1,-1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1 };
+static const double g_grad_z[16] = { 0, 0, 0, 0, 1, 1,-1,-1, 1, 1,-1,-1, 0, 1, 0,-1 };
+static inline double indexedLerpT(uint8_t idx, double a, double b, double c)
+{
+    idx &= 0xf;
+    return g_grad_x[idx] * a + g_grad_y[idx] * b + g_grad_z[idx] * c;
+}
+
 void perlinInit(PerlinNoise *noise, uint64_t *seed)
 {
     int i = 0;
@@ -194,6 +210,108 @@ double samplePerlin(const PerlinNoise *noise, double d1, double d2, double d3,
     double l6 = indexedLerp(idx[b2+1], d1-1, d2,   d3-1);
     double l7 = indexedLerp(idx[a3+1], d1,   d2-1, d3-1);
     double l8 = indexedLerp(idx[b3+1], d1-1, d2-1, d3-1);
+#endif
+
+    l1 = lerp(t1, l1, l2);
+    l3 = lerp(t1, l3, l4);
+    l5 = lerp(t1, l5, l6);
+    l7 = lerp(t1, l7, l8);
+
+    l1 = lerp(t2, l1, l3);
+    l5 = lerp(t2, l5, l7);
+
+    return lerp(t3, l1, l5);
+}
+
+/* copy of samplePerlin() with the table gradient (scattered samples) */
+double samplePerlinScattered(const PerlinNoise *noise, double d1, double d2, double d3)
+{
+    const double yamp = 0, ymin = 0;
+    uint8_t h1, h2, h3;
+    double t1, t2, t3;
+
+    if (d2 == 0.0)
+    {
+        d2 = noise->d2;
+        h2 = noise->h2;
+        t2 = noise->t2;
+    }
+    else
+    {
+        d2 += noise->b;
+        double i2 = floor(d2);
+        d2 -= i2;
+        h2 = (int) i2;
+        t2 = d2*d2*d2 * (d2 * (d2*6.0-15.0) + 10.0);
+    }
+
+    d1 += noise->a;
+    d3 += noise->c;
+
+    double i1 = floor(d1);
+    double i3 = floor(d3);
+    d1 -= i1;
+    d3 -= i3;
+
+    h1 = (int) i1;
+    h3 = (int) i3;
+
+    t1 = d1*d1*d1 * (d1 * (d1*6.0-15.0) + 10.0);
+    t3 = d3*d3*d3 * (d3 * (d3*6.0-15.0) + 10.0);
+
+    if (yamp)
+    {
+        double yclamp = ymin < d2 ? ymin : d2;
+        d2 -= floor(yclamp / yamp) * yamp;
+    }
+
+    const uint8_t *idx = noise->d;
+
+#if 1
+    // try to promote optimizations that can utilize the {xh, xl} registers
+    typedef struct vec2 { uint8_t a, b; } vec2;
+
+    vec2 v1 = { idx[h1], idx[h1+1] };
+    v1.a += h2;
+    v1.b += h2;
+
+    vec2 v2 = { idx[v1.a], idx[v1.a+1] };
+    vec2 v3 = { idx[v1.b], idx[v1.b+1] };
+    v2.a += h3;
+    v2.b += h3;
+    v3.a += h3;
+    v3.b += h3;
+
+    vec2 v4 = { idx[v2.a], idx[v2.a+1] };
+    vec2 v5 = { idx[v2.b], idx[v2.b+1] };
+    vec2 v6 = { idx[v3.a], idx[v3.a+1] };
+    vec2 v7 = { idx[v3.b], idx[v3.b+1] };
+
+    double l1 = indexedLerpT(v4.a, d1,   d2,   d3);
+    double l5 = indexedLerpT(v4.b, d1,   d2,   d3-1);
+    double l2 = indexedLerpT(v6.a, d1-1, d2,   d3);
+    double l6 = indexedLerpT(v6.b, d1-1, d2,   d3-1);
+    double l3 = indexedLerpT(v5.a, d1,   d2-1, d3);
+    double l7 = indexedLerpT(v5.b, d1,   d2-1, d3-1);
+    double l4 = indexedLerpT(v7.a, d1-1, d2-1, d3);
+    double l8 = indexedLerpT(v7.b, d1-1, d2-1, d3-1);
+#else
+    uint8_t a1 = idx[h1]   + h2;
+    uint8_t b1 = idx[h1+1] + h2;
+
+    uint8_t a2 = idx[a1]   + h3;
+    uint8_t b2 = idx[b1]   + h3;
+    uint8_t a3 = idx[a1+1] + h3;
+    uint8_t b3 = idx[b1+1] + h3;
+
+    double l1 = indexedLerpT(idx[a2],   d1,   d2,   d3);
+    double l2 = indexedLerpT(idx[b2],   d1-1, d2,   d3);
+    double l3 = indexedLerpT(idx[a3],   d1,   d2-1, d3);
+    double l4 = indexedLerpT(idx[b3],   d1-1, d2-1, d3);
+    double l5 = indexedLerpT(idx[a2+1], d1,   d2,   d3-1);
+    double l6 = indexedLerpT(idx[b2+1], d1-1, d2,   d3-1);
+    double l7 = indexedLerpT(idx[a3+1], d1,   d2-1, d3-1);
+    double l8 = indexedLerpT(idx[b3+1], d1-1, d2-1, d3-1);
 #endif
 
     l1 = lerp(t1, l1, l2);
@@ -446,6 +564,46 @@ int xOctaveInit(OctaveNoise *noise, Xoroshiro *xr, PerlinNoise *octaves,
 }
 
 
+/* SSA (p93): initialise only octave number i (index in 'amplitudes', which
+ * must be non-zero) of an octave noise, exactly as xOctaveInit() would, given
+ * the two longs xOctaveInit draws first (xlo, xhi). Lets several octave
+ * counts (nmax) of the same climate noise share their octaves, initialised
+ * on demand. persist / lacunarity: xOctaveInit multiplies by 0.5 / 2.0 per
+ * step, which is exact, so ldexp gives the same values. */
+void xOctaveInitOne(PerlinNoise *octave, uint64_t xlo, uint64_t xhi,
+        const double *amplitudes, int omin, int len, int i)
+{
+    static const uint64_t md5_octave_n[][2] = {
+        {0xb198de63a8012672, 0x7b84cad43ef7b5a8}, // md5 "octave_-12"
+        {0x0fd787bfbc403ec3, 0x74a4a31ca21b48b8}, // md5 "octave_-11"
+        {0x36d326eed40efeb2, 0x5be9ce18223c636a}, // md5 "octave_-10"
+        {0x082fe255f8be6631, 0x4e96119e22dedc81}, // md5 "octave_-9"
+        {0x0ef68ec68504005e, 0x48b6bf93a2789640}, // md5 "octave_-8"
+        {0xf11268128982754f, 0x257a1d670430b0aa}, // md5 "octave_-7"
+        {0xe51c98ce7d1de664, 0x5f9478a733040c45}, // md5 "octave_-6"
+        {0x6d7b49e7e429850a, 0x2e3063c622a24777}, // md5 "octave_-5"
+        {0xbd90d5377ba1b762, 0xc07317d419a7548d}, // md5 "octave_-4"
+        {0x53d39c6752dac858, 0xbcd1c5a80ab65b3e}, // md5 "octave_-3"
+        {0xb4a24d7a84e7677b, 0x023ff9668e89b5c4}, // md5 "octave_-2"
+        {0xdffa22b534c5f608, 0xb9b67517d3665ca9}, // md5 "octave_-1"
+        {0xd50708086cef4d7c, 0x6e1651ecc7f43309}, // md5 "octave_0"
+    };
+    static const double lacuna_ini[] = { // -omin = 3..12
+        1, .5, .25, 1./8, 1./16, 1./32, 1./64, 1./128, 1./256, 1./512, 1./1024,
+        1./2048, 1./4096,
+    };
+    static const double persist_ini[] = { // len = 4..9
+        0, 1, 2./3, 4./7, 8./15, 16./31, 32./63, 64./127, 128./255, 256./511,
+    };
+    Xoroshiro pxr;
+    pxr.lo = xlo ^ md5_octave_n[12 + omin + i][0];
+    pxr.hi = xhi ^ md5_octave_n[12 + omin + i][1];
+    xPerlinInit(octave, &pxr);
+    octave->amplitude = amplitudes[i] * ldexp(persist_ini[len], -i);
+    octave->lacunarity = ldexp(lacuna_ini[-omin], i);
+}
+
+
 double sampleOctaveAmp(const OctaveNoise *noise, double x, double y, double z,
         double yamp, double ymin, int ydefault)
 {
@@ -567,6 +725,37 @@ double sampleDoublePerlin(const DoublePerlinNoise *noise,
 
     v += sampleOctave(&noise->octA, x, y, z);
     v += sampleOctave(&noise->octB, x*f, y*f, z*f);
+
+    return v * noise->amplitude;
+}
+
+/* SSA (p93): sampleDoublePerlin() for scattered samples (Monte Carlo): same
+ * value, gradient by table (see samplePerlinScattered). */
+static double sampleOctaveScattered(const OctaveNoise *noise, double x, double y, double z)
+{
+    double v = 0;
+    int i;
+    for (i = 0; i < noise->octcnt; i++)
+    {
+        PerlinNoise *p = noise->octaves + i;
+        double lf = p->lacunarity;
+        double ax = maintainPrecision(x * lf);
+        double ay = maintainPrecision(y * lf);
+        double az = maintainPrecision(z * lf);
+        double pv = samplePerlinScattered(p, ax, ay, az);
+        v += p->amplitude * pv;
+    }
+    return v;
+}
+
+double sampleDoublePerlinScattered(const DoublePerlinNoise *noise,
+        double x, double y, double z)
+{
+    const double f = 337.0 / 331.0;
+    double v = 0;
+
+    v += sampleOctaveScattered(&noise->octA, x, y, z);
+    v += sampleOctaveScattered(&noise->octB, x*f, y*f, z*f);
 
     return v * noise->amplitude;
 }

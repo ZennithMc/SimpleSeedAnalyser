@@ -17,8 +17,12 @@ if sys.stdout is None or sys.stderr is None:
     _stream = None
     if "--multiprocessing-fork" not in sys.argv:
         try:
-            _base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") \
-                or os.path.expanduser("~")
+            if sys.platform == "win32":       # same places as ssa_paths.log_dir()
+                _base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") \
+                    or os.path.expanduser("~")
+            else:
+                _base = os.environ.get("XDG_STATE_HOME") or \
+                    os.path.join(os.path.expanduser("~"), ".local", "state")
             _dir = os.path.join(_base, "SimpleSeedAnalyser")
             os.makedirs(_dir, exist_ok=True)
             _path = os.path.join(_dir, "console.log")

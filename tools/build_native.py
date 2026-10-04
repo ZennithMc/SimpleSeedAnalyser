@@ -3,10 +3,12 @@
 tools/build_native.py — build UNIQUE des DLL CUDA de SSA (poste de développement).
 
     py tools/build_native.py              reconstruit toutes les unités CUDA (+ terrain)
-    py tools/build_native.py --unit X     une seule (gaider_cuda, structure_cuda, noise_gpu)
+    py tools/build_native.py --unit X     une seule (gaider_cuda, structure_cuda, noise_gpu, topy_gpu)
     py tools/build_native.py --check      indique seulement ce qui est à jour / à refaire
     py tools/build_native.py --cubiomes   reconstruit libcubiomes.dll (moteur C, gcc)
+                                          + gaider_layouts.dll (strongholds, g++)
                                           — SSA doit être fermé
+    py tools/build_native.py --layouts    reconstruit seulement gaider_layouts.dll
 
 Chaque DLL est compilée UNE fois pour toutes les cartes supportées (fatbin) :
   sm_75 (RTX 20 / GTX 16), sm_80 (A100), sm_86 (RTX 30), sm_89 (RTX 40),
@@ -45,6 +47,7 @@ MAIN_SRC = {  # fichier compilé par nvcc (les autres sources sont des #include)
     "gaider_cuda": "cubiomes_src/gaider_cuda.cu",
     "structure_cuda": "cubiomes_src/structure_cuda.cu",
     "noise_gpu": "cubiomes_src/noise_gpu.cu",
+    "topy_gpu": "cubiomes_src/topy_gpu.cu",
 }
 
 
@@ -140,10 +143,53 @@ def build_cubiomes() -> int:
     return 0
 
 
+def build_layouts() -> int:
+    """Rebuild gaider_layouts (C++ stronghold generator: eyes, layouts, Top Y,
+    portal frames). The old library is kept as .old and restored on failure."""
+    import gaider_layouts as gl
+    out = os.path.join(APP, gl._lib_name())
+    old = out + ".old"
+    if os.path.exists(out):
+        try:
+            if os.path.exists(old):
+                os.remove(old)
+            os.replace(out, old)
+        except OSError as e:
+            print(f"[FAIL] {os.path.basename(out)} verrouillée (SSA encore ouvert ?) : {e}")
+            return 1
+    t0 = time.time()
+    p = gl._compile()
+    ok = p is not None and os.path.exists(out)
+    if ok:
+        try:
+            import ctypes
+            ctypes.CDLL(out).max_y_batch_arr      # loads and has the Top Y entry point
+        except Exception as e:
+            print(f"[FAIL] gaider_layouts : {e}")
+            ok = False
+    if not ok:
+        if os.path.exists(out):
+            try:
+                os.replace(out, out + ".bad")
+            except OSError:
+                pass
+        if os.path.exists(old):
+            os.replace(old, out)
+        print(f"[FAIL] gaider_layouts : {gl._LIB_LOAD_ERROR or 'build failed'} — "
+              "ancienne bibliothèque restaurée")
+        return 1
+    print(f"[ OK ] {os.path.basename(out)} reconstruite en {time.time() - t0:.0f} s "
+          f"(ancienne : {os.path.basename(old)})")
+    return 0
+
+
 def main():
     args = sys.argv[1:]
+    if "--layouts" in args:
+        return build_layouts()
     if "--cubiomes" in args:
-        return build_cubiomes()
+        r = build_cubiomes()
+        return build_layouts() or r
     units = list(MAIN_SRC)
     if "--unit" in args:
         u = args[args.index("--unit") + 1]

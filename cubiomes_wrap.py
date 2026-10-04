@@ -455,7 +455,12 @@ def _compile_cubiomes() -> str:
         # et additions flottantes sans NaN/inf significatifs). Vérifié bit-exact
         # vs build standard. -ffast-math y donne un gros gain car le bruit est
         # dominé par des fmadd que le compilateur peut réordonner/vectoriser.
-        NOISE_FILES = {"noise.c", "biomenoise.c"}
+        # p93: NO LONGER USED. -ffast-math was NOT bit-exact (measured: 86 % of
+        # Perlin samples differ in the last bits from the standard build, and
+        # the result changed with the compiler / the code around). The noise
+        # is now fast without it (gradient table in noise.c, ~4x), so every
+        # file is compiled with strict IEEE maths = cubiomes / cubiomes-viewer.
+        NOISE_FILES = set()
         base = ["-O3", "-fPIC", "-fwrapv"]
         if use_native:
             base += ["-mavx2", "-funroll-loops"]  # mavx2: évite down-clock AVX-512, +15%

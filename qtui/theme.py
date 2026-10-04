@@ -335,6 +335,11 @@ def set_theme(name: str, tokens: dict | None = None) -> None:
     LINE, LINE2 = t["line"], t["line2"]
     TEXT, TEXT2, TEXT3 = t["text"], t["text2"], t["text3"]
     ACCENT, OK, WARN, DANGER = t["accent"], t["ok"], t["warn"], t["danger"]
+    # readable everywhere (01/10): the secondary / muted texts are nudged towards
+    # the main text until they reach a minimum contrast on the panels — on the
+    # translucent panels of the textured themes they were too faint
+    TEXT2 = readable(TEXT2, TEXT, [BG1, BG2, BG3], 5.0)
+    TEXT3 = readable(TEXT3, TEXT, [BG1, BG2, BG3], 3.6)
     IS_LIGHT = QColor(BG1).lightness() > 128
     ACCENT_H = _shade(ACCENT, 1.15)
     ACCENT_P = _shade(ACCENT, 0.87)
@@ -347,6 +352,35 @@ def set_theme(name: str, tokens: dict | None = None) -> None:
     ACCENT2 = ex.get("accent2") or ACCENT_H
     PANEL = _rgba(BG1, ex["panel"]) if ex.get("panel") and not tokens_overridden(tokens) else BG1
     BACKDROP = ex.get("backdrop")
+
+
+def _lum(hex_: str) -> float:
+    c = QColor(hex_)
+
+    def ch(v):
+        v /= 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    return 0.2126 * ch(c.red()) + 0.7152 * ch(c.green()) + 0.0722 * ch(c.blue())
+
+
+def contrast(a: str, b: str) -> float:
+    """WCAG contrast ratio of two colours (1 … 21)."""
+    la, lb = _lum(a), _lum(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+def readable(col: str, towards: str, backs, target: float) -> str:
+    """`col`, mixed a little towards `towards` (the main text colour) until its
+    contrast on every colour of `backs` reaches `target` (unchanged if it does)."""
+    a, b = QColor(col), QColor(towards)
+    for k in range(0, 21):
+        f = k / 20.0
+        c = QColor(round(a.red() + (b.red() - a.red()) * f),
+                   round(a.green() + (b.green() - a.green()) * f),
+                   round(a.blue() + (b.blue() - a.blue()) * f)).name()
+        if all(contrast(c, x) >= target for x in backs):
+            return c
+    return towards
 
 
 def tokens_overridden(tokens) -> bool:
@@ -424,6 +458,11 @@ def stylesheet() -> str:
     acc_grad = (f"qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {ACCENT}, stop:1 {ACCENT2})"
                 if EXTRAS.get(THEME, {}).get("accent2") else ACCENT)
     on_acc = "#1a1408" if QColor(ACCENT).lightness() > 150 else "white"
+    # the nav rail / status bar sat right on the textured backdrop (strata,
+    # marble…): their muted text vanished on it (Mesa « Theme », 01/10). A
+    # translucent panel tint under them keeps the backdrop visible but readable.
+    chrome_bg = _rgba(BG1, 0.72) if BACKDROP else "transparent"
+    nav_text = TEXT2 if BACKDROP else TEXT3
     return f"""
 * {{ outline: 0; }}
 QWidget {{ color: {TEXT}; background: transparent; selection-background-color: {ACCENT}; selection-color: white; }}
@@ -432,8 +471,8 @@ QDialog {{ background: {BG1}; }}
 QToolTip {{ background: {BG2}; color: {TEXT}; border: 1px solid {LINE2}; padding: 5px 8px; border-radius: 4px; }}
 
 /* ---------- regions ---------- */
-#TopBar, #NavRail, #StatusBar {{ background: transparent; border: 0; }}
-#StatusBar QLabel {{ color: {TEXT3}; }}
+#TopBar, #NavRail, #StatusBar {{ background: {chrome_bg}; border: 0; }}
+#StatusBar QLabel {{ color: {TEXT2}; }}
 #SidePanel {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 10px; }}
 #Surface {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 10px; }}
 #Page {{ background: transparent; }}
@@ -450,7 +489,7 @@ QLabel#MapReadout {{ background: {OVERLAY}; border: 1px solid {LINE2}; border-ra
 
 /* ---------- nav rail ---------- */
 QToolButton#NavButton {{
-    color: {TEXT3}; border: 0; border-radius: {RADIUS}px; padding: 6px 0 5px 0;
+    color: {nav_text}; border: 0; border-radius: {RADIUS}px; padding: 6px 0 5px 0;
     font-size: 7.5pt; font-weight: 600;
 }}
 QToolButton#NavButton:hover {{ color: {TEXT2}; background: {BG3}; }}

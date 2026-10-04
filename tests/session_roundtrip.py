@@ -30,6 +30,26 @@ def strip(cs):
     return [{k: v for k, v in c.items() if k != "save"} for c in cs]
 
 
+
+CV_KEYS = ("#Time:", "#Title:", "#Desc:", "#Cond:", "#MC:", "#Large:", "#Search:", "#Progress:",
+           "#Threads:", "#ResStop:", "#SMin:", "#SMax:", "#Mode48:", "#List48:", "#HutQual:",
+           "#MonArea:", "#Salt:", "#Gen48")
+
+
+def cv_rejects(path):
+    """Lines cubiomes-viewer 4.1.2 (Session::load) would refuse: anything that is
+    not a known header, #Time / #Title / #Desc, #Cond or a seed."""
+    bad = []
+    for i, ln in enumerate(open(path, encoding="utf-8").read().splitlines()):
+        if i == 0 or not ln or ln.startswith(CV_KEYS):
+            continue
+        try:
+            int(ln.split()[0])
+        except ValueError:
+            bad.append(ln[:60])
+    return bad
+
+
 def main():
     bad = 0
     fd, path = tempfile.mkstemp(suffix=".session"); os.close(fd)
@@ -42,7 +62,7 @@ def main():
     print("full round-trip       ", "OK" if ok else "DIFF", "" if ok else [(x, y) for x, y in zip(a, b) if x != y][:2], r["unsupported"])
     # hex only (cubiomes-viewer view): drop #SSAx/#SSA lines
     txt = open(path).read().splitlines()
-    hex_only = [ln for ln in txt if not ln.startswith("#SSA")]
+    hex_only = [ln for ln in txt if not ln.startswith("#SSA") and not ln.startswith("#Desc: #SSA")]
     open(path, "w").write("\n".join(hex_only) + "\n")
     r2 = parse_session_file(path)
     # the viewer-representable subset: everything except the SSA-only crunchiness (2)
@@ -67,6 +87,14 @@ def main():
         ok = e1 == e2
         bad += not ok
         print(f"hex-only {name:16s}", "OK" if ok else "DIFF", len(e1), len(e2))
+    # the whole file must open in cubiomes-viewer (01/10: #SSAState refused)
+    os.remove(path)
+    fd, path = tempfile.mkstemp(suffix=".session"); os.close(fd)
+    write_session_file(path, CONDS, mc_str="Java 1.19", seed_min=123, progress=456,
+                       results=[5, -7], state={"mode": "inc", "name": "x"})
+    rej = cv_rejects(path)
+    bad += bool(rej)
+    print("cubiomes-viewer reads ", "OK" if not rej else "REFUSED", rej[:2])
     print("FAILURES:", bad)
     os.remove(path)
     return bad

@@ -114,6 +114,13 @@ def _bind(lib):
             ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int),
             ctypes.POINTER(ctypes.c_int), ctypes.c_int]
         lib.cb_corrupt_scan128.restype = ctypes.c_int
+    # same gate, first N strongholds per seed (3 = first ring, 03/10)
+    if hasattr(lib, "cb_corrupt_scan_n"):
+        lib.cb_corrupt_scan_n.argtypes = [ctypes.c_void_p, ctypes.c_int,
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        lib.cb_corrupt_scan_n.restype = ctypes.c_int
 
 
 def has_corrupted() -> bool:
@@ -167,9 +174,8 @@ def _winit(mc):
     try:
         if os.environ.get("SSA_DEBUG", "") in ("", "0"):   # developer trace only
             raise OSError
-        _d = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
-                          "SimpleSeedAnalyser")
-        os.makedirs(_d, exist_ok=True)
+        import ssa_paths
+        _d = ssa_paths.log_dir()
         dbg = os.path.join(_d, "corrupt_debug.txt")   # (was written next to the code)
         with open(dbg, "w") as f:
             f.write("cb_corrupt_scan=%s  cb_ruined_y=%s  native_frames=%s\n"
@@ -360,6 +366,15 @@ def _validate_118(seed):
     return (ex, ey, ez), best
 
 
+class _Req(tuple):
+    """(frames, epx, epz, rox, roz) + .sh = the stronghold's start chunk, which the
+    Minecraft checker pins (its 1.16.1 stronghold search can differ, 03/10)."""
+    def __new__(cls, t, sh):
+        o = tuple.__new__(cls, t)
+        o.sh = sh
+        return o
+
+
 def corrupt_request_for(seed, mc=20, sx=None, sz=None, _ctxlib=None):
     """For the checker VERIFY: returns (frames, epx, epz, rox, roz) where `frames`
     is the list of the 12 exact (x, y, z) end-portal frame positions, (epx,epz) is
@@ -403,7 +418,7 @@ def corrupt_request_for(seed, mc=20, sx=None, sz=None, _ctxlib=None):
                 best = (d, out[5] >> 4, out[6] >> 4)
     if best is None:
         return None
-    return (frames, ex, ez, best[1], best[2])
+    return _Req((frames, ex, ez, best[1], best[2]), (sx >> 4, sz >> 4))
 
 
 def corrupt_request_auto(seed, mc=20):
@@ -573,6 +588,8 @@ def _chunk(args):
     la liste des hits (seed, ex,ey,ez, rx,ry,rz, under, template). `under` = nb de
     frames de l'end portal couvertes par l'empreinte X,Z du portail en ruine."""
     seed0, n, max_dist, thr, scan_128, sublist = args
+    from stronghold_eyes import sh_count
+    nsh = sh_count(scan_128)               # 1, 3 (first ring) or 128 (03/10)
     lib = _W["lib"]
     mc = _W["mc"]
     ctx = _W["ctx"]
@@ -592,13 +609,14 @@ def _chunk(args):
         pos = _W.get("s128_pos")
         for seed in sublist:
             if use_128:
-                k = lib.cb_strongholds128(ctx, mc, seed & _U64, pos, 128)
+                k = lib.cb_strongholds128(ctx, mc, seed & _U64, pos, nsh)
                 for j in range(k):
                     r = _validate_at(seed, pos[2 * j], pos[2 * j + 1])
                     if r is None:
                         continue
                     (ex, ey, ez), (under, rc, mfb, ti) = r
-                    hits.append((seed, ex, ey, ez, rc[0], rc[1], rc[2], under, ti))
+                    hits.append((seed, ex, ey, ez, rc[0], rc[1], rc[2], under, ti,
+                                 int(pos[2 * j]), int(pos[2 * j + 1])))
             else:
                 r = _val(seed)
                 if r is None:
@@ -606,6 +624,11 @@ def _chunk(args):
                 (ex, ey, ez), (under, rc, mfb, ti) = r
                 hits.append((seed, ex, ey, ez, rc[0], rc[1], rc[2], under, ti))
         return (seed0, len(sublist), hits)
+    if (scan_128 and nsh < 128 and not is_118 and "s128_seed" in _W
+            and not hasattr(lib, "cb_corrupt_scan_n") and "s128_pos" in _W):
+        # first ring with an older library: the per-seed path (slower, exact)
+        sub = [((x + (1 << 63)) % (1 << 64)) - (1 << 63) for x in range(seed0, seed0 + n)]
+        return (seed0, n, _chunk((seed0, n, max_dist, thr, scan_128, sub))[2])
     if (scan_128 and not is_118 and "s128_seed" in _W
             and hasattr(lib, "cb_corrupt_scan128")):
         # 128-STRONGHOLDS mode: the native gate screens EVERY stronghold of each
@@ -616,8 +639,12 @@ def _chunk(args):
         off = 0
         while off < n:
             m = min(_S128_CHUNK, n - off)
-            k = lib.cb_corrupt_scan128(ctx, mc, (seed0 + off) & _U64, m,
-                                       _SCAN_GATE, sb, xb, zb, cap)
+            if nsh < 128:
+                k = lib.cb_corrupt_scan_n(ctx, mc, (seed0 + off) & _U64, m,
+                                          _SCAN_GATE, nsh, sb, xb, zb, cap)
+            else:
+                k = lib.cb_corrupt_scan128(ctx, mc, (seed0 + off) & _U64, m,
+                                           _SCAN_GATE, sb, xb, zb, cap)
             for j in range(min(k, cap)):
                 su = int(sb[j])
                 seed = su if su < (1 << 63) else su - (1 << 64)
@@ -625,7 +652,8 @@ def _chunk(args):
                 if r is None:
                     continue
                 (ex, ey, ez), (under, rc, mfb, ti) = r
-                hits.append((seed, ex, ey, ez, rc[0], rc[1], rc[2], under, ti))
+                hits.append((seed, ex, ey, ez, rc[0], rc[1], rc[2], under, ti,
+                             int(xb[j]), int(zb[j])))
             off += m
         return (seed0, n, hits)
     if "scan_buf" in _W and hasattr(lib, "cb_corrupt_scan"):
@@ -660,9 +688,11 @@ def search_corrupted_portals(seed_start, seed_count, callback,
                              stop_event=None, progress_callback=None,
                              num_workers=1, mc_version=21,
                              max_dist=25, prefilter_thr=180,
-                             chunk_size=20000, scan_128=True, seed_list=None):
+                             chunk_size=20000, scan_128=True, seed_list=None,
+                             chunk_callback=None):
     """Cherche les seeds ou un portail en ruine corrompt le end portal d'un
-    stronghold. callback(seed, ex, ey, ez, rx, ry, rz, dist, underground) par hit.
+    stronghold. callback(seed, ex, ey, ez, rx, ry, rz, under, template[, sx, sz]) par hit
+    (sx, sz = début du stronghold pour les hits « 128 strongholds » ; absent = le 1er).
     seed_count <= 0 => illimite (jusqu'a stop_event).
     scan_128=True (default) : check ALL 128 strongholds of each seed (more hits
     per seed); False : only the 1st stronghold (the original fast mode).
@@ -690,9 +720,10 @@ def search_corrupted_portals(seed_start, seed_count, callback,
     nwork = max(1, int(num_workers))
     # 128-strongholds mode is much heavier per seed -> smaller chunks for a
     # responsive progress bar (the gate is batched in C inside cb_corrupt_scan128).
-    use_128 = bool(scan_128)
+    from stronghold_eyes import sh_count
+    use_128 = sh_count(scan_128) if scan_128 else False     # the count goes to the workers
     if use_128:
-        chunk_size = min(chunk_size, _S128_CHUNK)
+        chunk_size = min(chunk_size, _S128_CHUNK if use_128 >= 128 else 4 * _S128_CHUNK)
     # 1.18+ : the biome-accurate stronghold snap (locateBiome on the noise biome
     # system) is ~8 ms/seed (vs µs in 1.16), so a 20k chunk takes ~50 s. Small
     # chunks -> live SPS + responsive Stop.
@@ -704,6 +735,8 @@ def search_corrupted_portals(seed_start, seed_count, callback,
         seed0, n, hits = res
         for h in hits:
             callback(*h)
+        if chunk_callback is not None:     # this block is fully checked (resume, 03/10)
+            chunk_callback(seed0, n)
         done[0] += n
         if progress_callback:
             progress_callback(done[0], seed_count)
@@ -712,7 +745,7 @@ def search_corrupted_portals(seed_start, seed_count, callback,
     def _chunks():
         if seed_list is not None:
             from itertools import islice
-            cs = _S128_CHUNK if use_128 else chunk_size
+            cs = min(chunk_size, _S128_CHUNK) if use_128 else chunk_size
             src = iter(seed_list)        # SeedListSource/list/generator -> stream
             idx = 0
             while True:

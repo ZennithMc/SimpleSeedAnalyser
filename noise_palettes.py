@@ -599,8 +599,16 @@ def custom_lut(name: str, map_noise: str):
 
 def custom_file() -> str:
     import os
-    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "SimpleSeedAnalyser", "noise_palettes.json")
+    import ssa_paths
+    new = os.path.join(ssa_paths.data_dir(), "noise_palettes.json")
+    if not os.environ.get("APPDATA"):         # Linux before 29/09: ~/.config/SimpleSeedAnalyser
+        old = os.path.join(os.path.expanduser("~"), ".config", "SimpleSeedAnalyser", "noise_palettes.json")
+        if not os.path.exists(new) and os.path.exists(old):
+            try:
+                os.replace(old, new)
+            except OSError:
+                return old
+    return new
 
 
 def save_custom():

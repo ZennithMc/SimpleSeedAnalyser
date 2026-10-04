@@ -33,10 +33,14 @@ namespace stronghold_generator {
             if ((bound & m) == 0)  // i.e., bound is a power of 2
                 r = (int)((bound * (long long)r) >> 31);
             else { // reject over-represented candidates
-                for (int u = r;
-                        u - (r = u % bound) + m < 0;
-                        u = this->next(31))
-                    ;
+                // Java's loop: the sum overflows on purpose (int), and then the
+                // draw is rejected. Written with unsigned arithmetic: the signed
+                // version is undefined behaviour, which g++ -O3 folded to "never
+                // reject" (seen 03/10: ~1 stronghold in 10^5–10^6 differed).
+                for (int u = r;; u = this->next(31)) {
+                    r = u % bound;
+                    if ((int)((unsigned)u - (unsigned)r + (unsigned)m) >= 0) break;
+                }
             }
             return r;
         }

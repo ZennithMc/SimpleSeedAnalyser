@@ -51,6 +51,10 @@ CUDA_UNITS = {
         "file": "noise_gpu.dll" if IS_WIN else "libnoise_gpu.so",
         "sources": ["cubiomes_src/noise_gpu.cu", "cubiomes_src/noise_gpu_kernel.cuh",
                     "cubiomes_src/ssa_cuda_common.cuh"],
+    },    "topy_gpu": {                     # 1.13-1.17 stronghold Top Y (03/10)
+        "file": "topy_gpu.dll" if IS_WIN else "libtopy_gpu.so",
+        "sources": ["cubiomes_src/topy_gpu.cu", "cubiomes_src/topy_gpu_gen.cuh",
+                    "cubiomes_src/ssa_cuda_common.cuh"],
     },
 }
 

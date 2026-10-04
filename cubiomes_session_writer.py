@@ -6,8 +6,9 @@ Format hybride :
   • Les conditions reconnues par cubiomes-viewer → lignes `#Cond: <hex>`
     (320 octets little-endian identiques à ce que cubiomes écrirait).
   • Les conditions SSA-only (crunchiness, mountain_ring, cherry_ring,
-    mushroom_island, climate_center) → lignes `#SSA: <json>`.
-    Cubiomes les ignore (il ne lit que les #Cond:).
+    mushroom_island, climate_center) → lignes `#Desc: #SSA: <json>`.
+    Les lignes propres à SSA sont derrière « #Desc: », que cubiomes-viewer
+    ignore (un #SSAState nu lui faisait refuser le fichier, 01/10).
     SSA les relit via parse_session_file() étendu.
 
 Toutes les conditions sont sauvegardées ; rien n'est perdu.
@@ -107,7 +108,8 @@ _SSA_TO_F: Dict[str, int] = {
 }
 
 # Conditions SSA-only : sauvegardées en #SSA: <json>, ignorées par cubiomes
-_SSA_ONLY = {"crunchiness", "mountain_ring", "mushroom_island", "cherry_ring"}
+_SSA_ONLY = {"crunchiness", "mountain_ring", "mushroom_island", "cherry_ring",
+             "climate_center"}   # coarse flood fill: no cubiomes-viewer equivalent (01/10)
 
 _SCALE_TO_F_CLEAN = {1: F_BIOME, 4: F_BIOME_4, 16: F_BIOME_16,
                      64: F_BIOME_64, 256: F_BIOME_256}
@@ -183,7 +185,7 @@ def write_session_file(
     if state:
         # SSA search state (mode, stop rule, paused search…) — ignored by
         # cubiomes-viewer, restored by SSA
-        lines.append("#SSAState: " + json.dumps(state, ensure_ascii=False, separators=(",", ":")))
+        lines.append("#Desc: #SSAState: " + json.dumps(state, ensure_ascii=False, separators=(",", ":")))
 
     n_hex = 0
     n_ssa = 0
@@ -197,12 +199,12 @@ def write_session_file(
         if t in _SSA_TO_F and t not in _SSA_ONLY:
             try:
                 lines.append(f"#Cond: {_encode_condition(c, pos)}")
-                lines.append(f"#SSAx: {full}")
+                lines.append(f"#Desc: #SSAx: {full}")
                 n_hex += 1
                 continue
             except Exception:
                 pass
-        lines.append(f"#SSA: {full}")
+        lines.append(f"#Desc: #SSA: {full}")
         n_ssa += 1
 
     if results:
@@ -243,7 +245,7 @@ def encode_conditions_to_text(conditions: List[dict], orig_save_idx=None) -> str
         except Exception:
             import json as _json
             try:
-                lines.append("#SSA:" + _json.dumps(c, separators=(",", ":")))
+                lines.append("#Desc: #SSA:" + _json.dumps(c, separators=(",", ":")))
             except Exception:
                 pass
     return "\n".join(lines)

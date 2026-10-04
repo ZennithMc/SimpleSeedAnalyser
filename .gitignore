@@ -34,3 +34,4 @@ drawing_presets.json
 # test binaries / backups
 *.exe
 *.bak*
+.cuda13/

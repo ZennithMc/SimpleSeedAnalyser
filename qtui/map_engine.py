@@ -189,9 +189,11 @@ def _pixmap_from_rgb(rgb: np.ndarray) -> QImage:
 
 class _Bus(QObject):
     tile = Signal(object, object)        # (key, QImage)
+    preview = Signal(object, object)     # (key, QImage) quick 1/16 version
     noise = Signal(object, object)       # (key, uint8 array)
     structures = Signal(object, object)
     landmarks = Signal(object, object)
+    pieces = Signal(object, object)      # (key, stronghold pieces)
     skipped = Signal(object)
     failed = Signal(object)
 
@@ -263,14 +265,19 @@ class MapEngine(QObject):
         self.exact_pool.setMaxThreadCount(max(2, min(10, (os.cpu_count() or 4) // 2)))
         self.bus = _Bus()
         self.bus.tile.connect(self._on_tile)
+        self.bus.preview.connect(self._on_preview)
         self.bus.noise.connect(self._on_noise)
         self.bus.structures.connect(self._on_structures)
         self.bus.landmarks.connect(self._on_landmarks)
+        self.bus.pieces.connect(self._on_pieces)
+        self.sh_pieces: dict = {}
+        self.pieces_pending: set = set()
         self.bus.skipped.connect(self._on_skipped)
         self.bus.failed.connect(self._on_failed)
         self.failed: set = set()                 # keys whose job raised (not retried this epoch)
         self.palette = "True Colors (ShowMe7)"
         self.tiles: "OrderedDict[tuple, QPixmap]" = OrderedDict()
+        self.previews: "OrderedDict[tuple, QPixmap]" = OrderedDict()   # quick versions
         self.pending: set = set()
         self.noise_raw: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
         self.noise_pix: "OrderedDict[tuple, QPixmap]" = OrderedDict()
@@ -300,9 +307,11 @@ class MapEngine(QObject):
     # ── world / palette changes ─────────────────────────────────────────────
     def reset(self):
         self.epoch += 1
-        self.tiles.clear(); self.pending.clear()
+        self.tiles.clear(); self.pending.clear(); self.previews.clear()
         self.noise_raw.clear(); self.noise_pix.clear()
         self.structs.clear(); self.struct_pending.clear(); self.zombies = {}
+        self.basements = {}
+        self.sh_pieces = {}; self.pieces_pending = set()
         self.landmarks = {}
         self._request_landmarks()
 
@@ -310,6 +319,7 @@ class MapEngine(QObject):
         if name != self.palette:
             self.palette = name
             self.tiles.clear()
+            self.previews.clear()
 
     def min_scale(self) -> int:
         return 1 if self.world.mc >= cw.MC_VERSIONS["Java 1.18"] else 4
@@ -350,7 +360,34 @@ class MapEngine(QObject):
                 lut = biome_lut(pal)
                 self.bus.tile.emit(key, _pixmap_from_rgb(lut[np.clip(ids, 0, len(lut) - 1)]))
             self.pool.start(_Job(job, lambda k=key: self.bus.failed.emit(k)), priority)
+            # Fluidity: a quick version first (the same area at a 4x coarser
+            # scale, 16x fewer cells) so an empty screen fills at once; the
+            # exact tile replaces it when ready.
+            ps = scale * 4
+            if ps in SCALES and key not in self.previews:
+                def pjob(key=key, wk=wk, pal=pal, ps=ps):
+                    if key in self.tiles or not self._still_wanted(key):
+                        return
+                    lib = _thread_lib(wk)
+                    n = TILE // 4
+                    ids = np.frombuffer(lib.gen_biomes_region(tx * n, tz * n, n, n, ps),
+                                        dtype=np.int32).reshape(n, n)
+                    lut = biome_lut(pal)
+                    self.bus.preview.emit(key, _pixmap_from_rgb(lut[np.clip(ids, 0, len(lut) - 1)]))
+                self.pool.start(_Job(pjob), priority + 3)
         return None
+
+    def preview(self, scale, tx, tz):
+        """Quick coarse version of a biome tile still generating (or None)."""
+        return self.previews.get((self.epoch, "b", self.palette, scale, tx, tz))
+
+    def _on_preview(self, key, img):
+        if key[0] != self.epoch or key[2] != self.palette or key in self.tiles:
+            return
+        self.previews[key] = QPixmap.fromImage(img)
+        while len(self.previews) > self.MAX_TILES:
+            self.previews.popitem(last=False)
+        self.tileReady.emit()
 
     def cached_tile(self, scale, tx, tz):
         return self.tiles.get((self.epoch, "b", self.palette, scale, tx, tz))
@@ -360,6 +397,7 @@ class MapEngine(QObject):
         if key[0] != self.epoch or key[2] != self.palette:
             return
         self.tiles[key] = QPixmap.fromImage(img)
+        self.previews.pop(key, None)
         while len(self.tiles) > self.MAX_TILES:
             self.tiles.popitem(last=False)
         self.tileReady.emit()
@@ -470,8 +508,18 @@ class MapEngine(QObject):
     # ── structures ─────────────────────────────────────────────────────────
     STRUCT_BLOCK = 4096
 
+    # structure-seed view (Alt+S, like cubiomes-viewer, 03/10): every POTENTIAL
+    # position of each structure (its region's attempt), biomes ignored — what
+    # the 48 low bits alone give, the same for the 65 536 seeds of the family
+    seed_view = False
+
+    def set_seed_view(self, on):
+        self.seed_view = bool(on)
+        self.structuresReady.emit()
+
     def structures(self, skey: str, bx: int, bz: int, fetch=True):
-        key = (self.epoch, skey, bx, bz)
+        sv = self.seed_view
+        key = (self.epoch, skey, bx, bz) + (("seed",) if sv else ())
         v = self.structs.get(key)
         if v is not None or not fetch:
             return v
@@ -484,8 +532,14 @@ class MapEngine(QObject):
             def job(key=key, wk=wk):
                 lib = _thread_lib(wk)
                 pts = lib.find_structures_in_box(stype, bx * B, bz * B, bx * B + B - 1, bz * B + B - 1,
-                                                 verify_biome=True, max_count=100000)
-                if skey == "village" and pts:
+                                                 verify_biome=not sv, max_count=100000)
+                if skey == "igloo" and pts:          # igloos with a basement: own icon
+                    try:
+                        self.basements[key] = frozenset(
+                            q for q in pts if lib.get_variant_basement(stype, q[0], q[1]))
+                    except Exception:
+                        pass
+                if skey == "village" and pts and not sv:
                     try:                     # abandoned (zombie) villages: their own icon
                         flags = lib.village_abandoned_flags(pts)
                         self.zombies[key] = frozenset(p for p, f in zip(pts, flags) if f)
@@ -495,8 +549,16 @@ class MapEngine(QObject):
             self.pool.start(_Job(job), 2)
         return None
 
+    def with_basement(self, bx: int, bz: int):
+        """Igloos with a basement of a structure block (empty until computed);
+        it depends on the seed only, so the structure-seed view has it too."""
+        key = (self.epoch, "igloo", bx, bz) + (("seed",) if self.seed_view else ())
+        return self.basements.get(key, frozenset())
+
     def abandoned(self, bx: int, bz: int):
         """Abandoned villages of a structure block (empty until computed)."""
+        if self.seed_view:                   # depends on the biome: not in seed view
+            return frozenset()
         return self.zombies.get((self.epoch, "village", bx, bz), frozenset())
 
     def _on_structures(self, key, pts):
@@ -504,6 +566,34 @@ class MapEngine(QObject):
         if key[0] != self.epoch:
             return
         self.structs[key] = pts
+        self.structuresReady.emit()
+
+    # ── stronghold pieces (zoomed-in map, 03/10) ────────────────────────────
+    def stronghold_pieces(self, x, z, fetch=True):
+        """Every piece of the stronghold at (x, z), final Y (helper process)."""
+        key = (self.epoch, int(x), int(z))
+        v = self.sh_pieces.get(key)
+        if v is not None or not fetch or key in self.pieces_pending:
+            return v
+        self.pieces_pending.add(key)
+        wk = self.world.key
+
+        def job():
+            import stronghold_eyes as se
+            try:
+                res = _eye_pool().submit(se.stronghold_pieces_batch, wk[0], wk[1],
+                                         [(key[1], key[2])]).result()
+            except Exception:                    # pool closing / failure: nothing drawn
+                res = {}
+            self.bus.pieces.emit(key, res.get((key[1], key[2]), []))
+        self.pool.start(_Job(job), 3)
+        return None
+
+    def _on_pieces(self, key, pieces):
+        self.pieces_pending.discard(key)
+        if key[0] != self.epoch:
+            return
+        self.sh_pieces[key] = pieces
         self.structuresReady.emit()
 
     # ── spawn + strongholds ─────────────────────────────────────────────────

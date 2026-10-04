@@ -30,10 +30,9 @@ def _console_fallback():
     f = None
     if not child:
         try:
-            base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
-            d = os.path.join(base, "SimpleSeedAnalyser")
-            os.makedirs(d, exist_ok=True)
-            f = open(os.path.join(d, "console.log"), "w", encoding="utf-8", buffering=1)
+            import ssa_paths
+            ssa_paths.migrate_legacy()
+            f = open(os.path.join(ssa_paths.log_dir(), "console.log"), "w", encoding="utf-8", buffering=1)
         except Exception:
             f = None
     if f is None:
@@ -86,10 +85,10 @@ def _crash_log():
     import threading
     import time
     import traceback
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, "SimpleSeedAnalyser")
+    import ssa_paths
     try:
-        os.makedirs(d, exist_ok=True)
+        ssa_paths.migrate_legacy()
+        d = ssa_paths.log_dir()
         path = os.path.join(d, "crash.log")
         mark = path + ".seen"
         try:

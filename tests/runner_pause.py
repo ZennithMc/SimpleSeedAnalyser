@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from PySide6.QtWidgets import QApplication
 
 app = QApplication.instance() or QApplication([])
+import qtui.search_runner as _sr                     # noqa: E402
+_sr.SAFETY_FIRST = _sr.SAFETY_MAX                    # exactness test: no safety pause
 from qtui.search_runner import SearchRunner          # noqa: E402
 from engine_vs_batch import batch, signed            # noqa: E402
 from diff_engine import S                            # noqa: E402

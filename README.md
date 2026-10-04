@@ -34,20 +34,20 @@ Keep the whole folder together: the `.exe` needs its `_internal` folder next to 
 2. Run `./SimpleSeedAnalyser/SimpleSeedAnalyser`
 - Needs glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, Fedora 35+, Linux Mint 21+, Arch…).
 - If it says *“could not load the Qt platform plugin xcb”*, install the missing Qt helper: `sudo apt install libxcb-cursor0` (Debian / Ubuntu / Mint) or `sudo dnf install xcb-util-cursor` (Fedora).
-- The Linux build currently runs on the **CPU only** (GPU support for Linux is being tested).
+- GPU: same as Windows (NVIDIA RTX 20+, driver 580+, proprietary NVIDIA driver); otherwise the CPU is used.
 
 ### Requirements
 - **CPU:** 64-bit with **AVX2** (Intel 2013+ / AMD 2015+). SSA uses every core.
-- **GPU (optional, Windows):** NVIDIA **RTX 20 series or newer** with an up-to-date driver (**580 or newer**). Without it SSA runs on the CPU; the top bar shows *GPU* or *CPU only*.
+- **GPU (optional, Windows and Linux):** NVIDIA **RTX 20 series or newer** with an up-to-date driver (**580 or newer**). Without it SSA runs on the CPU; the top bar shows *GPU* or *CPU only*.
 - **RAM:** 4 GB is enough; big seed lists and 1.18+ stronghold scans like more.
 
 ### Where SSA keeps your things
 Sessions, library, drawings, palettes and settings are stored in your user folder, not in the program folder:
-`%APPDATA%\SimpleSeedAnalyser` on Windows, `~/SimpleSeedAnalyser` (and `~/.config`) on Linux. Updating SSA = replacing the program folder; your data stays.
+`%APPDATA%\SimpleSeedAnalyser` on Windows, `~/.local/share/SimpleSeedAnalyser` on Linux. Updating SSA = replacing the program folder; your data stays.
 
 ### Something wrong?
 - **Self-test:** open a terminal in the SSA folder and run `SimpleSeedAnalyser.exe --selftest` (Linux: `./SimpleSeedAnalyser --selftest`). It checks the engines with known answers and the GPU, then shows a report (also saved as `selftest.txt`).
-- **Logs:** `%LOCALAPPDATA%\SimpleSeedAnalyser\console.log` and `crash.log` (Linux: `~/SimpleSeedAnalyser/`). Send them with your report.
+- **Logs:** `%LOCALAPPDATA%\SimpleSeedAnalyser\console.log` and `crash.log` (Linux: `~/.local/state/SimpleSeedAnalyser/`). Send them with your report.
 
 ---
 

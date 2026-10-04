@@ -16,6 +16,7 @@
 // On RTX 5080 (~10000 SMs), expect ~5+ billion seeds/s for the GPU phase
 // (excluding the CPU-side initFirstStronghold which can be parallelized too).
 
+#include <string.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #define SSA_UNIT "gaider_cuda"
@@ -1038,6 +1039,100 @@ __global__ void k_crunchiness_filter(
     int32_t pos = atomicAdd(out_count, 1);
     if (pos < max_results)
         out_seeds[pos] = (int64_t)seed;
+}
+
+// ── p96: EXACT crunchiness pre-filter ────────────────────────────────────────
+// Same score as compute_crunchiness_score() in session_engine.c: the octave
+// hashes and the A / B weights of the condition come from the host
+// (ssa_crunch_gpu_params), in the CPU order. A seed is kept when its score is
+// within `eps` of passing, so float differences between GPU and CPU can only
+// add candidates (the CPU re-tests every candidate exactly), never lose one.
+struct CrunchW {
+    uint64_t c_lo, c_hi;        // climate hash (normal or large biomes)
+    int32_t  n;                 // active octave pairs (<= 6)
+    uint64_t oct_lo[6], oct_hi[6];
+    float    wa[6], wb[6];      // 0 = pair / stream not selected
+};
+
+__global__ void k_crunchiness_w(
+        int64_t seed_start, int32_t n, CrunchW P,
+        float threshold, float eps, int32_t mode_flag,
+        int64_t *out_seeds, int32_t *out_count, int32_t max_results) {
+    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    uint64_t seed = (uint64_t)((int64_t)seed_start + idx);
+
+    uint64_t pxr_lo, pxr_hi;
+    cr_set_seed(&pxr_lo, &pxr_hi, seed);
+    uint64_t xlo = cr_next_long(&pxr_lo, &pxr_hi);
+    uint64_t xhi = cr_next_long(&pxr_lo, &pxr_hi);
+    uint64_t nr_lo = xlo ^ P.c_lo;
+    uint64_t nr_hi = xhi ^ P.c_hi;
+    uint64_t a_lo = cr_next_long(&nr_lo, &nr_hi);
+    uint64_t a_hi = cr_next_long(&nr_lo, &nr_hi);
+    uint64_t b_lo = cr_next_long(&nr_lo, &nr_hi);
+    uint64_t b_hi = cr_next_long(&nr_lo, &nr_hi);
+
+    float score = 0.0f;
+    for (int i = 0; i < P.n; i++) {
+        if (P.wa[i] != 0.0f) {
+            float y = cr_octave_yfrac(a_lo, a_hi, P.oct_lo[i], P.oct_hi[i]);
+            score += P.wa[i] * fabsf(y - 0.5f);
+        }
+        if (P.wb[i] != 0.0f) {
+            float y = cr_octave_yfrac(b_lo, b_hi, P.oct_lo[i], P.oct_hi[i]);
+            score += P.wb[i] * fabsf(y - 0.5f);
+        }
+    }
+    // CPU: crunchy = score <= threshold, bland = score >= threshold
+    bool keep = (mode_flag == 0) ? (score <= threshold + eps)
+                                 : (score >= threshold - eps);
+    if (!keep) return;
+    int32_t pos = atomicAdd(out_count, 1);
+    if (pos < max_results)
+        out_seeds[pos] = (int64_t)seed;
+}
+
+extern "C" EXPORT int gaider_cuda_crunchiness_filter_w(
+        int64_t seed_start, int32_t n,
+        uint64_t c_lo, uint64_t c_hi, int32_t n_oct,
+        const uint64_t *oct_lo, const uint64_t *oct_hi,
+        const float *wa, const float *wb,
+        float threshold, float eps, int32_t mode_flag,
+        int64_t *out_seeds, int32_t max_results) {
+    if (n <= 0) return 0;
+    if (max_results < 1) max_results = 1;
+    CrunchW P;
+    memset(&P, 0, sizeof(P));
+    P.c_lo = c_lo; P.c_hi = c_hi;
+    P.n = n_oct < 0 ? 0 : (n_oct > 6 ? 6 : n_oct);
+    for (int i = 0; i < P.n; i++) {
+        P.oct_lo[i] = oct_lo[i]; P.oct_hi[i] = oct_hi[i];
+        P.wa[i] = wa[i]; P.wb[i] = wb[i];
+    }
+    SsaDevBuf d_seeds, d_count;
+    SSA_CK(d_seeds.alloc((size_t)max_results * sizeof(int64_t)));
+    SSA_CK(d_count.alloc(sizeof(int32_t)));
+    SSA_CK(cudaMemset(d_count.p, 0, sizeof(int32_t)));
+    static SsaChunker ck(1 << 22, 1 << 14, 1 << 27);
+    const int bs = 512;
+    for (int32_t off = 0; off < n; ) {
+        int32_t cur = (int32_t)((int64_t)(n - off) < ck.chunk ? (n - off) : ck.chunk);
+        ck.begin();
+        k_crunchiness_w<<<(cur + bs - 1) / bs, bs>>>(
+            seed_start + off, cur, P, threshold, eps, mode_flag,
+            d_seeds.as<int64_t>(), d_count.as<int32_t>(), max_results);
+        SSA_CK_LAUNCH();
+        ck.end();
+        off += cur;
+    }
+    int32_t h_count = 0;
+    SSA_CK(cudaMemcpy(&h_count, d_count.p, sizeof(int32_t), cudaMemcpyDeviceToHost));
+    int32_t actual = h_count < max_results ? h_count : max_results;
+    if (actual > 0) {
+        SSA_CK(cudaMemcpy(out_seeds, d_seeds.p, (size_t)actual * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    }
+    return h_count;
 }
 
 // ── C-callable exports ────────────────────────────────────────────────────────

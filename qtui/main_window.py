@@ -275,7 +275,15 @@ class MainWindow(QMainWindow):
         for name, key in NOISE_KEYS.items():
             QShortcut(QKeySequence(key), self, activated=lambda n=name: self._noise_key(n))
         QShortcut(QKeySequence("Alt+G"), self, activated=self._arrows_key)
+        # octave of the climate noise shown: Alt+1…9 = only that octave (list
+        # order 0A, 0B, 1A…), Alt+Shift+1…9 = up to it, Alt+0 = all (28/09)
+        for k in range(10):
+            QShortcut(QKeySequence(f"Alt+{k}"), self, activated=lambda k=k: self._octave_key(k, False))
+            if k:
+                QShortcut(QKeySequence(f"Alt+Shift+{k}"), self,
+                          activated=lambda k=k: self._octave_key(k, True))
         QShortcut(QKeySequence("Alt+Shift+G"), self, activated=self._arrow_mode_key)
+        QShortcut(QKeySequence("Alt+S"), self, activated=self._seed_view_key)
         QShortcut(QKeySequence("F1"), self, activated=self.show_shortcuts)
         QShortcut(QKeySequence("F11"), self, activated=self.toggle_fullscreen)
         QShortcut(QKeySequence("Ctrl+Shift+V"), self, activated=self.paste_seed_coords)
@@ -292,8 +300,20 @@ class MainWindow(QMainWindow):
         # last session back as it was (autosave.session), then a light periodic
         # autosave (only when something changed) in case of a crash
         from PySide6.QtCore import QTimer
+        from . import ui_state
+        _ui = ui_state.restore(self)         # window, world, map, layers, Stronghold page (03/10)
         QTimer.singleShot(0, self.sessions.restore_autosave)
         QTimer.singleShot(0, self.drawing.restore_autosave)
+        # the Draw page centres the shared map on its drawing: the saved view wins
+        QTimer.singleShot(0, lambda: ui_state.restore_map(self, _ui))
+        # saved soon after every change too (not only at close: SSA closed from its
+        # console, killed or crashed, never runs closeEvent)
+        self._ui_timer = QTimer(self, singleShot=True, interval=2000,
+                                timeout=lambda: ui_state.save(self, heavy=False))
+        for sig in (self.world.changed, self.layers.changed):
+            sig.connect(self._ui_timer.start)
+        self.link.viewMoved.connect(self._ui_timer.start)
+        self._ui_sh_sig = None
         self._autosave_timer = QTimer(self, interval=90_000, timeout=self._periodic_autosave)
         self._autosave_timer.start()
         self._autosave_sig = None
@@ -313,9 +333,48 @@ class MainWindow(QMainWindow):
         if item is not None and not item.isEnabled():
             self._flash("Noise layers exist from Java 1.18 (noise-based generation).")
             return
+        if self.link.engine.seed_view:      # Alt+B (or a noise) leaves the structure-seed view
+            self.link.engine.set_seed_view(False)
+            self.link.repaint_all()
         cb.setCurrentText(name)
         self._flash(("Noise: " + name if name != "Off" else "Biomes (no noise)")
                     + f"   ·   {NOISE_KEYS[name]}")
+
+    def _octave_key(self, k, upto):
+        if not self._page_has_map():
+            return
+        from .map_engine import CLIMATE
+        lp = self.layers
+        if self.map.ov.get("noise") not in CLIMATE:
+            self._flash("Octaves: choose a climate noise first (Alt+T / H / C / E / W).")
+            return
+        if k == 0:
+            lp.oct_mode.set_value("All")
+            lp._apply_octave()
+            self._flash(f"{self.map.ov['noise']}: all octaves   ·   Alt+1…9 one octave, "
+                        "Alt+Shift+1…9 up to it")
+            return
+        if k > lp.oct_list.count():
+            self._flash(f"{self.map.ov['noise']} has {lp.oct_list.count()} octave streams "
+                        f"(Alt+1 … Alt+{min(9, lp.oct_list.count())}).")
+            return
+        lp.oct_mode.set_value("Up to" if upto else "Only")
+        lp.oct_list.setCurrentRow(k - 1)
+        lp._apply_octave()
+        name = lp.oct_list.item(k - 1).text().split()[0]
+        self._flash(f"{self.map.ov['noise']}: {'up to' if upto else 'only'} octave {name}"
+                    "   ·   Alt+0: all octaves")
+
+    def _seed_view_key(self):
+        """Structure-seed view (Alt+S, like cubiomes-viewer): every potential
+        structure position of the enabled types, biomes ignored."""
+        if not self._page_has_map():
+            return
+        eng = self.link.engine
+        eng.set_seed_view(not eng.seed_view)
+        self.link.repaint_all()
+        self._flash("Structure seed view: potential positions, biomes ignored   ·   Alt+S"
+                    if eng.seed_view else "Normal map (biomes)   ·   Alt+S")
 
     def _arrows_key(self):
         if not self._page_has_map():
@@ -343,6 +402,15 @@ class MainWindow(QMainWindow):
     def _periodic_autosave(self):
         try:
             self.drawing.autosave_if_changed()
+        except Exception:
+            pass
+        try:                                 # SSA as it is (+ the Stronghold results if changed)
+            from . import ui_state
+            r = self.strongholds.results
+            sig = (len(r.all_rows), r.mode, str(getattr(self.strongholds, "_paused", None)),
+                   self.strongholds.runner.state)
+            ui_state.save(self, heavy=sig != self._ui_sh_sig)
+            self._ui_sh_sig = sig
         except Exception:
             pass
         s = self.sessions
@@ -458,6 +526,8 @@ class MainWindow(QMainWindow):
         self.status_left.setText(text)
 
     def closeEvent(self, e):
+        from . import ui_state
+        ui_state.save(self)                  # everything comes back at the next launch (03/10)
         if self.strongholds.runner.state in ("running", "pausing", "stopping"):
             self.strongholds.runner.stop()
         s = self.sessions

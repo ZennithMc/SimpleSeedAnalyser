@@ -11,10 +11,12 @@ Per-page overlays (session zones, result markers, pick mode) stay per view.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, Signal
 
 
 class MapLink(QObject):
+    viewMoved = Signal()             # centre / zoom changed (saved for the next launch)
+
     def __init__(self, world, parent=None):
         super().__init__(parent)
         from .map_engine import MapEngine
@@ -40,6 +42,7 @@ class MapLink(QObject):
         """src changed centre / zoom → the other views follow (no echo)."""
         if self._syncing:
             return
+        self.viewMoved.emit()
         self._syncing = True
         try:
             for v in self.views:

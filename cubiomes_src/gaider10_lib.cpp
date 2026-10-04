@@ -139,3 +139,6 @@ extern "C" EXPORT uint32_t max_y_batch_arr(const int64_t *seeds, int32_t n,
 }
 
 extern "C" EXPORT int gaider_maxy_inflate() { return 1; }  // marqueur: max_y_batch a le param inflate
+
+// marker: topY understands inflate | 256 = top of the portal room (03/10)
+extern "C" EXPORT int gaider_topy_room() { return 1; }

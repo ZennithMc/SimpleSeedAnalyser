@@ -240,6 +240,7 @@ enum {
     SAMPLE_NO_SHIFT = 0x1,  // skip local distortions
     SAMPLE_NO_DEPTH = 0x2,  // skip depth sampling for vertical biomes
     SAMPLE_NO_BIOME = 0x4,  // do not apply climate noise to biome mapping
+    SAMPLE_SSA_SCATTERED = 0x100, // SSA: sampleBiomeNoisePruned only, scattered Perlin (same values)
 };
 void initBiomeNoise(BiomeNoise *bn, int mc);
 void setBiomeSeed(BiomeNoise *bn, uint64_t seed, int large);
@@ -248,6 +249,58 @@ int sampleBiomeNoise(const BiomeNoise *bn, int64_t *np, int x, int y, int z,
     uint64_t *dat, uint32_t sample_flags);
 int sampleBiomeNoiseBeta(const BiomeNoiseBeta *bnb, int64_t *np, double *nv,
     int x, int z);
+/* SSA (p93): one climate noise (T, H, C, E, W or shift) whose octaves are
+ * initialised on demand and shared by every octave count: climLazyGet fills
+ * 'view' with the noise setClimateParaSeed(bn, seed, large, nptype, nmax)
+ * would put in bn->climate[nptype] (same octaves, same sums), initialising
+ * only the octaves not yet built for this seed. Zero-initialise before use. */
+typedef struct {
+    uint64_t seed;
+    int large, nptype, valid;
+    uint64_t xloA, xhiA, xloB, xhiB;
+    const double *amp;
+    int omin, len, tot, haveA, haveB;
+    int idx[9];
+    double amplitude;
+    PerlinNoise octA[9], octB[9];
+} ClimLazy;
+int climLazyGet(ClimLazy *cl, DoublePerlinNoise *view, uint64_t seed,
+    int large, int nptype, int nmax);
+
+/* ── SSA (p92): exact climate pruning for the 1.18+ overworld ────────────────
+ * getBiomeLeafLimits: the leaves of the climate tree that give 'biome', with,
+ * for each of them and each parameter (T,H,C,E,D,W), an interval outside of
+ * which the leaf can never be the nearest one: some other leaf, at least as
+ * close in every other parameter, is then strictly closer. Writes at most
+ * 'max' leaves; returns their number, or -1 (unsupported / too many).
+ *
+ * getBiomeLeafInfo: the same, reduced (hull, unique T×H rectangles, unique
+ * rows), computed once per (mc, biome) and shared by all threads.
+ *
+ * sampleBiomeNoisePruned: sampleBiomeNoise(bn, NULL, x, y, z, dat, flags)
+ * computing the climate parameters cheapest first; returns -2 as soon as they
+ * prove that none of the 'alive' candidates of 'bp' can be the result, else
+ * exactly the biome sampleBiomeNoise would return. */
+int getBiomeLeafLimits(int mc, int biome, int (*out)[12], int max);
+
+typedef struct {
+    int hull[12];
+    int nth, nlf;
+    const int (*th)[4];     /* T lo,hi, H lo,hi */
+    const int (*lf)[12];
+} BiomeLeafInfo;
+const BiomeLeafInfo *getBiomeLeafInfo(int mc, int biome);
+
+#define BPRUNE_MAX 16
+typedef struct {
+    int n;
+    const BiomeLeafInfo *b[BPRUNE_MAX];
+    int order[5];           /* T,H,W,E,C sampling order, most selective first */
+} BiomePrune;
+/* fills bp for the listed biomes; returns 0 when pruning is not possible */
+int setupBiomePrune(BiomePrune *bp, int mc, const int *ids, int n);
+int sampleBiomeNoisePruned(const BiomeNoise *bn, int x, int y, int z,
+    uint64_t *dat, uint32_t sample_flags, const BiomePrune *bp, uint32_t alive);
 double approxSurfaceBeta(const BiomeNoiseBeta *bnb, const SurfaceNoiseBeta *snb,
     int x, int z); // doesn't really work yet
 

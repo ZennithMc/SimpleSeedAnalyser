@@ -199,7 +199,7 @@ void stronghold_generator::StrongholdGenerator::generate(long long worldSeed, in
         Direction direction = HORIZONTAL[random.nextInt(4)];
         BoundingBox boundingBox = Piece::makeBoundingBox(x, 64, z, direction, 5, 11, 5);
         Piece startPiece = Piece(PieceType::STAIRS_DOWN, 0, boundingBox, direction, 1);
-        this->pieces[this->piecesSize++] = startPiece;
+        this->pushPiece(startPiece);
         this->addChildren(startPiece, random);
         while (this->pendingPiecesSize != 0 && !this->generationStopped) {
             int i = random.nextInt(this->pendingPiecesSize);
@@ -214,6 +214,10 @@ void stronghold_generator::StrongholdGenerator::generate(long long worldSeed, in
 }
 
 int stronghold_generator::StrongholdGenerator::topY(long long worldSeed, int chunkX, int chunkZ, int sea, int margin, int minY, int inflate) {
+    // inflate | TOPY_ROOM (256): the top of the PORTAL ROOM instead of the
+    // whole stronghold (same generation, same move below sea level, 03/10)
+    const bool room = (inflate & 256) != 0;
+    inflate &= 255;
     int attempt = 0;
     Random random(0);
     do {
@@ -226,7 +230,7 @@ int stronghold_generator::StrongholdGenerator::topY(long long worldSeed, int chu
         Direction direction = HORIZONTAL[random.nextInt(4)];
         BoundingBox boundingBox = Piece::makeBoundingBox(x, 64, z, direction, 5, 11, 5);
         Piece startPiece = Piece(PieceType::STAIRS_DOWN, 0, boundingBox, direction, 1);
-        this->pieces[this->piecesSize++] = startPiece;
+        this->pushPiece(startPiece);
         this->addChildren(startPiece, random);
         while (this->pendingPiecesSize != 0) {
             int i = random.nextInt(this->pendingPiecesSize);
@@ -237,7 +241,8 @@ int stronghold_generator::StrongholdGenerator::topY(long long worldSeed, int chu
             }
             this->addChildren(piece, random);
         }
-    } while (this->portalRoomPiece == nullptr);
+    } while (this->portalRoomPiece == nullptr && !this->overflowed);
+    if (this->overflowed) return TOPY_OVERFLOW;   // too big to know (never seen)
     // moveBelowSeaLevel : sommet final = n5
     int gMin = this->pieces[0].boundingBox.minY;
     int gMax = this->pieces[0].boundingBox.maxY;
@@ -253,6 +258,7 @@ int stronghold_generator::StrongholdGenerator::topY(long long worldSeed, int chu
     int n3 = sea - margin;
     int n5 = yspan + minY + 1;
     if (n5 < n3) n5 += random.nextInt(n3 - n5);
+    if (room) return this->portalRoomPiece->boundingBox.maxY + (n5 - gMax);
     return realMax + (n5 - gMax);
 }
 
@@ -272,6 +278,42 @@ void stronghold_generator::StrongholdGenerator::resetPieces() {
     this->pendingPiecesSize = 0;
     this->portalRoomPiece = nullptr;
     this->generationStopped = false;
+    this->overflowed = false;
+    this->gridReset();
+}
+
+void stronghold_generator::StrongholdGenerator::gridReset() {
+    this->gridOn = false;                       // origin set by the first piece
+}
+
+void stronghold_generator::StrongholdGenerator::pushPiece(const Piece &piece) {
+    if (this->piecesSize >= MAX_PIECES) {      // never writes past pieces[]
+        this->overflowed = true;
+        this->generationStopped = true;
+        return;
+    }
+    this->pieces[this->piecesSize++] = piece;
+    this->gridInsert(this->piecesSize - 1);
+}
+
+void stronghold_generator::StrongholdGenerator::gridInsert(int index) {
+    if (index == 0) {                           // the start piece: grid around it
+        this->gridOX = this->startX - (GRID_N / 2) * 16;
+        this->gridOZ = this->startZ - (GRID_N / 2) * 16;
+        for (int i = 0; i < GRID_N * GRID_N; i++) this->gridCount[i] = 0;
+        this->gridOn = true;
+    }
+    if (!this->gridOn) return;
+    BoundingBox &b = this->pieces[index].boundingBox;
+    int x0 = (b.minX - this->gridOX) >> 4, x1 = (b.maxX - this->gridOX) >> 4;
+    int z0 = (b.minZ - this->gridOZ) >> 4, z1 = (b.maxZ - this->gridOZ) >> 4;
+    if (x0 < 0 || z0 < 0 || x1 >= GRID_N || z1 >= GRID_N) { this->gridOn = false; return; }
+    for (int gx = x0; gx <= x1; gx++)
+        for (int gz = z0; gz <= z1; gz++) {
+            int c = gx * GRID_N + gz;
+            if (this->gridCount[c] >= GRID_CAP) { this->gridOn = false; return; }
+            this->gridItems[c][this->gridCount[c]++] = (short)index;
+        }
 }
 
 void stronghold_generator::StrongholdGenerator::updatePieceWeight() {
@@ -399,8 +441,13 @@ stronghold_generator::Piece stronghold_generator::StrongholdGenerator::createPie
 
 void stronghold_generator::StrongholdGenerator::addPiece(Piece piece) {
     // printf("Adding piece at %i %i with rotation %i and depth %i\n", piece.boundingBox.minX, piece.boundingBox.minZ, piece.orientation, piece.depth);
+    if (this->piecesSize >= MAX_PIECES || this->pendingPiecesSize >= MAX_PIECES) {
+        this->overflowed = true;
+        this->generationStopped = true;
+        return;
+    }
     this->pendingPieces[this->pendingPiecesSize++] = this->piecesSize;
-    this->pieces[this->piecesSize++] = piece;
+    this->pushPiece(piece);
 }
 
 bool stronghold_generator::StrongholdGenerator::findAndCreatePieceFactory(PieceType pieceType, Random &random, int x, int y, int z, Direction direction, int depth) {
@@ -645,6 +692,26 @@ uint64_t total_find_collision_intersects;
 uint64_t total_find_collision_null;
 
 stronghold_generator::Piece* stronghold_generator::StrongholdGenerator::findCollisionPiece(BoundingBox &boundingBox) {
+    if (this->gridOn) {
+        int x0 = (boundingBox.minX - this->gridOX) >> 4, x1 = (boundingBox.maxX - this->gridOX) >> 4;
+        int z0 = (boundingBox.minZ - this->gridOZ) >> 4, z1 = (boundingBox.maxZ - this->gridOZ) >> 4;
+        if (x0 >= 0 && z0 >= 0 && x1 < GRID_N && z1 < GRID_N) {
+            int best = 1 << 30;
+            for (int gx = x0; gx <= x1; gx++)
+                for (int gz = z0; gz <= z1; gz++) {
+                    int c = gx * GRID_N + gz;
+                    int n = this->gridCount[c];
+                    for (int k = 0; k < n; k++) {
+                        int idx = this->gridItems[c][k];
+                        if (idx >= best) break;         // items are in increasing order
+                        if (this->pieces[idx].boundingBox.intersects(boundingBox)) { best = idx; break; }
+                    }
+                }
+            return best < (1 << 30) ? &this->pieces[best] : nullptr;
+        }
+        // a query box outside the grid: pieces inside the grid cannot reach it
+        // only if they are all inside — fall back to the exact linear scan
+    }
     // total_find_collision_count += 1;
     for (int i = 0; i < this->piecesSize; i++) {
         // total_find_collision_intersects += 1;

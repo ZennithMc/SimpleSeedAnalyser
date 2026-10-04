@@ -18,8 +18,8 @@ import os
 import threading
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QRect, QRectF, Qt, QTime, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
-from .widgets import user_path, remember_path
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from .widgets import AdaptiveButton, user_path, remember_path
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QTimeEdit, QFrame, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar,
                                QPushButton, QSpinBox, QSplitter, QStackedWidget, QTableView,
@@ -112,7 +112,7 @@ def _short(n):
 
 class _ProfileDelegate(QStyledItemDelegate):
     """Profiler cell: a bar = share of the search time ('x %' on it), then
-    the number of seeds that passed the condition's branch and its rate."""
+    how many checks of the condition's own test passed and the rate."""
     def paint(self, p, opt, idx):
         v = idx.data(Qt.ItemDataRole.UserRole)
         if not v:
@@ -181,8 +181,14 @@ class ConditionTree(QTreeWidget):
         self.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         self.header().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.header().resizeSection(3, 142)
         self.setHeaderLabels(["#", "Condition", "Area", "Time · passed · rate"])
+        # the fixed 142 px cut the title even in a wide window (01/10): fit it
+        hi = self.headerItem()
+        hi.setToolTip(3, "Per condition: share of the search time · how many of its checks "
+                         "passed · pass rate per check")
+        from PySide6.QtGui import QFontMetrics
+        _fm = QFontMetrics(theme.ui_font(8, QFont.Weight.DemiBold))   # = the QSS header font
+        self.header().resizeSection(3, max(142, _fm.horizontalAdvance(hi.text(3)) + 16 + 14))
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.header().setMinimumSectionSize(8)
@@ -324,15 +330,26 @@ class ConditionTree(QTreeWidget):
                 it.setData(3, Qt.ItemDataRole.UserRole, None)
                 it.setToolTip(3, "")
                 continue
-            reached, passed, ticks = r
+            reached, passed, ticks = r[0], r[1], r[2]
+            checks, ok = (r[3], r[4]) if len(r) >= 5 else (None, None)
             share = ticks / own if own else 0.0
-            rate = passed / reached if reached else None
-            it.setData(3, Qt.ItemDataRole.UserRole, (share, rate, reached, passed,
+            b_rate = passed / reached if reached else None
+            # shown: the condition's OWN test, per check (29/09 — testers: the
+            # branch rate was 0 % everywhere when nothing was found). Spiral /
+            # OR / NOT have no own test: their branch rate is shown.
+            if checks:
+                rate, shown = ok / checks, ok
+            else:
+                rate, shown = b_rate, passed
+            it.setData(3, Qt.ItemDataRole.UserRole, (share, rate, reached, shown,
                                                      ticks / top if top else 0.0))
             it.setToolTip(3, (
                 f"#{n} {it.text(1)}\n"
-                f"Reached by {fmt_int(reached)} seeds · its branch passed for {fmt_int(passed)}"
-                + (f" ({rate * 100:.2f} %)" if rate is not None else "") + "\n"
+                + (f"Own test: {fmt_int(ok)} of {fmt_int(checks)} checks passed ({ok / checks * 100:.2f} %)\n"
+                   if checks else "")
+                + f"Reached by {fmt_int(reached)} seeds · the whole branch (with the conditions "
+                f"under it) passed for {fmt_int(passed)}"
+                + (f" ({b_rate * 100:.2f} %)" if b_rate is not None else "") + "\n"
                 + (f"{share * 100:.2f} % of the search time (its own test; the conditions under it "
                    f"are counted on their own rows)" if ticks else
                    "Time: — (reached too rarely to be measured: the time is sampled on 1 seed in 32)")))
@@ -358,8 +375,13 @@ class ConditionTree(QTreeWidget):
     def _item_changed(self, it, col):
         if self._filling or col != 1:
             return
-        self.toggled.emit(it.data(0, Qt.ItemDataRole.UserRole),
-                          it.checkState(1) == Qt.CheckState.Checked)
+        # NOT right away: the toggle refills the tree (clear() deletes this very
+        # item) while Qt is still inside the click on its check box → use after
+        # free → « Segmentation fault » when re-enabling a condition (Linux,
+        # CoffeeAddicted 30/09; reproduced). Emitted once the click is over.
+        from PySide6.QtCore import QTimer
+        uid, on = it.data(0, Qt.ItemDataRole.UserRole), it.checkState(1) == Qt.CheckState.Checked
+        QTimer.singleShot(0, lambda: self.toggled.emit(uid, on))
 
     def dropEvent(self, e):
         super().dropEvent(e)
@@ -379,6 +401,7 @@ class ResultsModel(QAbstractTableModel):
         super().__init__(parent)
         self.rows = []                                # (seed, details)
         self.loc = {}                                 # seed -> (x, z) | "…" (being located)
+        self.mcs = {}                                 # seed -> (text, tip): Minecraft check
         self._mono = theme.mono_font(9.5)
 
     def rowCount(self, parent=QModelIndex()):
@@ -392,6 +415,12 @@ class ResultsModel(QAbstractTableModel):
         r = self._row_of().get(seed)
         if r is not None:
             self.dataChanged.emit(self.index(r, 1), self.index(r, 2))
+
+    def set_mc_status(self, seed, st):
+        self.mcs[seed] = st
+        r = self._row_of().get(seed)
+        if r is not None:
+            self.dataChanged.emit(self.index(r, 1), self.index(r, 1))
 
     def _row_of(self):
         # kept up to date by add() (before: rebuilt for EVERY row each time the
@@ -428,8 +457,13 @@ class ResultsModel(QAbstractTableModel):
                     if isinstance(loc, tuple) else "Click the result to locate it")
         if role == Qt.ItemDataRole.UserRole:              # the two-line cell (delegate)
             return self.loc.get(seed)
+        if role == Qt.ItemDataRole.UserRole + 1:          # Minecraft check (delegate)
+            return self.mcs.get(seed)
         if role == Qt.ItemDataRole.ToolTipRole:
             u = seed & 0xFFFFFFFFFFFFFFFF
+            mcs = self.mcs.get(seed)
+            if mcs:
+                return f"{seed}\n{mcs[0]}  {mcs[1]}"
             loc = self.loc.get(seed)
             where = (f"X {loc[0]}   Z {loc[1]}  (right-click: copy /tp, centre the map)\n"
                      if isinstance(loc, tuple) else "")
@@ -454,7 +488,7 @@ class ResultsModel(QAbstractTableModel):
         self.endInsertRows()
 
     def clear(self):
-        self.beginResetModel(); self.rows = []; self.loc = {}; self._rows_idx = None
+        self.beginResetModel(); self.rows = []; self.loc = {}; self.mcs = {}; self._rows_idx = None
         self.endResetModel()
 
 
@@ -475,8 +509,22 @@ class _SeedCellDelegate(QStyledItemDelegate):
         p.setPen(QColor(theme.TEXT))
         fm = p.fontMetrics()
         top = QRect(r.left(), r.top(), r.width(), r.height() // 2 + 1)
+        mcs = idx.data(Qt.ItemDataRole.UserRole + 1)
+        if mcs:                                         # Minecraft check, right of the seed
+            txt0 = mcs[0]
+            col = theme.DANGER if txt0.startswith("✗") else theme.TEXT3
+            if txt0.startswith("✓"):                    # the colour of the cause (03/10)
+                from .stronghold_page import cause_color
+                col = cause_color(mcs[2]) if len(mcs) > 2 and mcs[2] else theme.OK
+            p.save()
+            p.setFont(theme.mono_font(8.5))
+            p.setPen(QColor(theme.TEXT if sel and not txt0.startswith(("✓", "✗")) else col))
+            w0 = p.fontMetrics().horizontalAdvance(txt0) + 4
+            p.drawText(top, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), txt0)
+            p.restore()
+            top = top.adjusted(0, 0, -w0 - 4, 0)
         p.drawText(top, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-                   fm.elidedText(seed, Qt.TextElideMode.ElideMiddle, r.width()))
+                   fm.elidedText(seed, Qt.TextElideMode.ElideMiddle, top.width()))
         bot = QRect(r.left(), r.top() + r.height() // 2, r.width(), r.height() // 2)
         p.setFont(theme.mono_font(8.5))
         if isinstance(loc, tuple):
@@ -510,6 +558,12 @@ class SessionsPage(QWidget):
         self._explain = _Explain(self)
         self._explain.done.connect(self._on_explained)
         self._explained = None
+        from .mc_confirm import McConfirm
+        self._mcc = McConfirm(self)                  # "Broken portal": Minecraft confirms (03/10)
+        self._mcc.one.connect(self._mc_one)
+        self._mcc_pending = {}                       # seed -> details, waiting for Minecraft
+        self._mcc_rejected = 0
+        self._mcc_target = None                      # "Stop after N results": confirmed ones
 
         outer = QVBoxLayout(self); outer.setContentsMargins(0, 2, 10, 4); outer.setSpacing(8)
         split = QSplitter(Qt.Orientation.Horizontal); split.setHandleWidth(10)
@@ -534,6 +588,7 @@ class SessionsPage(QWidget):
 
         # ── centre: map ────────────────────────────────────────────────────
         self.map = MapView(world, link=link)
+        self.map.arrow_handler = self._arrow_results     # ↑ / ↓ = previous / next result
         self.map.picked.connect(self._picked)
         self.map.pickCancelled.connect(lambda: self.status.emit(""))
         split.addWidget(self.map)
@@ -553,6 +608,10 @@ class SessionsPage(QWidget):
 
         # wiring
         self.model.changed.connect(self._model_changed)
+        # the tree bakes the theme's text colours into its items: a theme switch
+        # left e.g. the light text of a dark theme on Arctic's white (01/10)
+        theme.signals.changed.connect(
+            lambda: self.tree.fill(self.model, keep_uid=self.tree.current_uid()))
         self.runner.resultsReady.connect(self._results_in)
         self.runner.progress.connect(self._progress)
         self.world.changed.connect(self._world_seed_changed)
@@ -777,9 +836,49 @@ class SessionsPage(QWidget):
         sw = QWidget(); sl = QHBoxLayout(sw); sl.setContentsMargins(0, 0, 0, 0); sl.setSpacing(2)
         sl.addWidget(self.start_seed)
         dice = QToolButton(); icons.bind(dice, "dice", 16); dice.setToolTip("Random start")
-        dice.clicked.connect(lambda: self.start_seed.setText(str(random_seed() >> 1)))
+        dice.clicked.connect(lambda: (self.start_seed.setText(str(random_seed() >> 1)),
+                                      self._start_edited(self.start_seed.text())))
         sl.addWidget(dice)
-        labeled("Start", sw, "First seed (Incremental) or first 48-bit value (other modes).")
+        self._dice = dice
+        # start seed source (02/10): « Session » = the session's own start (an
+        # opened / imported session sets it, as before); « Saved » = YOUR start,
+        # kept in the settings: opening a session never changes it, and when a
+        # search stops it moves on to where that search ended — the next search
+        # continues where the last one stopped.
+        from PySide6.QtCore import QSettings
+        _qs = QSettings("SSA", "SimpleSeedAnalyser")
+        self._start_mode = "Saved" if _qs.value("sessions/start_mode", "Session") == "Saved" \
+            else "Session"
+        self._eph_start = "0"
+        from .start_source import saved_store
+        # ONE saved start for the whole app (Sessions, Stronghold, Draw — 03/10)
+        self._saved_start = saved_store().value
+        saved_store().changed.connect(self._saved_from_elsewhere)
+        scol = QVBoxLayout(); scol.setSpacing(2)
+        shead = QHBoxLayout(); shead.setSpacing(6); shead.setContentsMargins(0, 0, 0, 0)
+        slab = QLabel("START"); slab.setObjectName("FieldLabel")
+        tip = "First seed (Incremental) or first 48-bit value (other modes)."
+        slab.setToolTip(tip); self.start_seed.setToolTip(tip)
+        shead.addWidget(slab); shead.addStretch(1)
+        self.start_src = Segmented(["Session", "Saved"], self._start_mode)
+        for b in self.start_src.buttons.values():
+            b.setStyleSheet("font-size: 7.5pt; padding: 0px 7px; min-height: 14px; max-height: 16px;")
+        self.start_src.buttons["Session"].setToolTip(
+            "Session start: the start of the open session — opening or importing a\n"
+            "session sets it (as before).")
+        self.start_src.buttons["Saved"].setToolTip(
+            "Saved start: your own start seed, kept between sessions and launches.\n"
+            "Opening a session never changes it, and when a search stops it moves on\n"
+            "to the last seed searched — the next search continues from there.")
+        self.start_src.changed.connect(self._start_mode_changed)
+        shead.addWidget(self.start_src)
+        scol.addLayout(shead); scol.addWidget(sw)
+        row.addLayout(scol)
+        if self._start_mode == "Saved":
+            self.start_seed.setText(self._saved_start)
+        from .start_source import hide_dice_keep_place
+        hide_dice_keep_place(self._dice, self._start_mode == "Saved")   # no random Saved start
+        self.start_seed.textEdited.connect(self._start_edited)
         self.threads = QSpinBox(); self.threads.setRange(1, os.cpu_count() or 4)
         self.threads.setValue(max(1, (os.cpu_count() or 4) // 2))
         labeled("Threads", self.threads, "CPU threads. Can be changed while paused.")
@@ -815,12 +914,12 @@ class SessionsPage(QWidget):
         self.list_btn.clicked.connect(self._seed_list)
         labeled("Source", self.list_btn)
         row.addStretch(1)
-        self.b_start = QPushButton("  Start"); self.b_start.setProperty("kind", "primary")
+        self.b_start = AdaptiveButton("  Start"); self.b_start.setProperty("kind", "primary")
         icons.bind(self.b_start, "play", 16, "#ffffff", "#ffffff")
         self.b_start.clicked.connect(self._start_or_resume)
-        self.b_pause = QPushButton("  Pause"); icons.bind(self.b_pause, "pause", 16)
+        self.b_pause = AdaptiveButton("  Pause"); icons.bind(self.b_pause, "pause", 16)
         self.b_pause.clicked.connect(self.runner.pause)
-        self.b_stop = QPushButton("  Stop"); icons.bind(self.b_stop, "stop", 16)
+        self.b_stop = AdaptiveButton("  Stop"); icons.bind(self.b_stop, "stop", 16)
         self.b_stop.setProperty("kind", "danger"); self.b_stop.clicked.connect(self.runner.stop)
         for b in (self.b_start, self.b_pause, self.b_stop):
             row.addWidget(b, 0, Qt.AlignmentFlag.AlignBottom)
@@ -882,15 +981,19 @@ class SessionsPage(QWidget):
         self.b_stats.setEnabled(bool(valid))
         base = ("Stats: share of the search time and pass rate of every condition "
                 "(shown after a search)")
+        modes = [m for m in getattr(self.runner, "_engine_modes", []) if isinstance(m, int)]
         if valid:
-            why = ""
+            why = ("GPU search: the times are the CPU validation of the GPU survivors; "
+                   "the pre-filtered condition's pass rate includes the seeds the GPU "
+                   "rejected (its GPU time is not counted)."
+                   if modes and modes[-1] == 3 else "")
         elif prof is not None:
             why = "The conditions changed since the last search: run it again to get stats."
         else:
-            modes = [m for m in getattr(self.runner, "_engine_modes", []) if isinstance(m, int)]
             if modes and modes[-1] == 3:
-                why = ("No stats for this search: it ran on the GPU pre-filter, and the "
-                       "per-condition timing comes from the C engine (CPU searches).")
+                why = ("No stats for this GPU search: they need the current libcubiomes "
+                       "(py tools/build_native.py --cubiomes), then appear once the GPU's "
+                       "first survivors are validated.")
             else:
                 why = "No stats yet: they appear after a search (C engine)."
         self.b_stats.setToolTip(base + ("\n\n" + why if why else ""))
@@ -973,6 +1076,7 @@ class SessionsPage(QWidget):
                 if k in old and c.get("area_mode") is not None and t not in ("logic_or", "logic_not"):
                     c[k] = old[k]
             parent = self.model.get(self._editing_uid).get("_parent", 0)
+            self.form.plan_gpu = False
             self.form.edit(c, self._parent_label(parent), self._mc(), is_new=False)
         else:
             self.form.edit(new_condition(t), self._parent_label(self._new_parent), self._mc(),
@@ -993,6 +1097,7 @@ class SessionsPage(QWidget):
             return
         c = self.model.get(uid)
         self._editing_uid = uid
+        self.form.plan_gpu = self._plan_gpu_on(uid)
         self.form.edit(self.model.export(only={uid})[0], self._parent_label(c.get("_parent", 0)),
                        self._mc())
         self.left_stack.setCurrentWidget(self.form)
@@ -1293,7 +1398,7 @@ class SessionsPage(QWidget):
             self._model_changed()
         self.world.set(version_name=r["mc_str"] if r.get("mc_str") else None,
                        large_biomes=bool(r.get("large_biomes")))
-        self.start_seed.setText(str(r.get("seed_min", 0) or 0))
+        self._set_session_start(r.get("seed_min", 0) or 0)
         if r.get("threads"):
             self.threads.setValue(max(1, min(self.threads.maximum(), int(r["threads"]))))
         inv = {v: k for k, v in MODES.items()}
@@ -1304,9 +1409,26 @@ class SessionsPage(QWidget):
             self._set_rule_ui(rule)
         # results
         self.results.clear()
+        self._mcc_reset()
         self._explained = None
         seeds = list(dict.fromkeys(int(x) for x in r.get("results", [])))
         self.results.add([(sd, "") for sd in seeds])
+        self._run_confirm = "unset"
+        self._restore_mc_status(st.get("mc_status"), seeds)
+        self._mcc_rejected = int(st.get("mc_rejected", 0) or 0)
+        pend = st.get("mc_pending") or []
+        cp = self._confirm_params(self.model.export(), force=True) if pend else None
+        if cp is not None:                    # candidates left unchecked: check them now
+            rows = []
+            for k, d in pend:
+                try:
+                    rows.append((int(k), d))
+                except (TypeError, ValueError):
+                    pass
+            for k, d in rows:
+                self._mcc_pending[k] = d
+            self._mcc.add([k for k, _d in rows], self._mc(), cp, bool(self.world.large_biomes))
+            self._results_count()
         self._results_count()
         self._show_zones()
         # the search: SSA state, or a cubiomes-viewer #Progress
@@ -1315,8 +1437,12 @@ class SessionsPage(QWidget):
         resumed = False
         self._run_world = (self.world.version_name, bool(self.world.large_biomes))
         if search.get("resume_point") is not None:
+            # a search started from the Saved start (autosave) keeps moving it on;
+            # a session's own paused search never does
+            self._run_from_saved = bool(search.get("from_saved"))
             resumed = self.runner.restore_paused(conds, self._mc(), self.threads.value(), search, seeds)
         elif not st and r.get("progress") not in (None, r.get("seed_min", 0)):
+            self._run_from_saved = False             # a session's own paused search
             resumed = self.runner.restore_paused(
                 conds, self._mc(), self.threads.value(),
                 dict(mode="inc", eff_mode="inc", base_start=int(r.get("seed_min", 0) or 0),
@@ -1499,29 +1625,48 @@ class SessionsPage(QWidget):
             pass
         rs = self.runner.export_state()
         if rs and rs.get("resume_point") is not None and self.runner.state == "paused":
+            if getattr(self, "_run_from_saved", False):
+                rs["from_saved"] = True       # started from the Saved start (02/10)
             st["search"] = rs
         meta = getattr(self, "_lib_meta", None) or {}
         st.update(name=self.model.name, description=meta.get("description", ""),
                   created=meta.get("created", ""))
+        if self.results.mcs:                  # the Minecraft checks (03/10)
+            st["mc_status"] = {str(k): list(v) for k, v in
+                               list(self.results.mcs.items())[:200000]}
+        if self._mcc_pending:                 # candidates still waiting for Minecraft
+            st["mc_pending"] = [[str(k), v] for k, v in list(self._mcc_pending.items())[:200000]]
+        if self._mcc_rejected:
+            st["mc_rejected"] = int(self._mcc_rejected)
         prof = self.runner.profile()
         if prof is not None and getattr(self, "_prof_sig", None) == self._sig(self.model.export()):
             st["profile"] = dict(rows=prof[0], total=prof[1], seeds=int(self.runner._done_before),
                                  n=len(prof[0]))
         return st
 
-    def _write_file(self, path, state):
-        from cubiomes_session_writer import write_session_file
+    def _write_args(self, state):
+        """Everything the session file needs, read from the widgets NOW (the
+        writing itself can then run in another thread)."""
         try:
             start = int(self.start_seed.text() or 0)
         except ValueError:
             start = 0
         prog = self.runner.resume_point if self.runner.state == "paused" else None
+        return dict(conds=self.model.export(), mc_str=self.world.version_name, seed_min=start,
+                    threads=self.threads.value(), results=[s for s, _d in self.results.rows],
+                    progress=prog, large=self.world.large_biomes, state=state)
+
+    @staticmethod
+    def _write_args_to(path, a):
+        from cubiomes_session_writer import write_session_file
         tmp = path + ".tmp"
-        write_session_file(tmp, self.model.export(), mc_str=self.world.version_name,
-                           seed_min=start, threads=self.threads.value(),
-                           results=[s for s, _d in self.results.rows], progress=prog,
-                           large=self.world.large_biomes, state=state)
+        write_session_file(tmp, a["conds"], mc_str=a["mc_str"], seed_min=a["seed_min"],
+                           threads=a["threads"], results=a["results"], progress=a["progress"],
+                           large=a["large"], state=a["state"])
         os.replace(tmp, path)                 # never a half-written session file
+
+    def _write_file(self, path, state):
+        self._write_args_to(path, self._write_args(state))
 
     def _write(self, path):
         try:
@@ -1545,10 +1690,8 @@ class SessionsPage(QWidget):
     # ── autosave: the session comes back as it was at the next launch ───────
     @staticmethod
     def autosave_path():
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
-        d = os.path.join(base, "SimpleSeedAnalyser")
-        os.makedirs(d, exist_ok=True)
-        return os.path.join(d, "autosave.session")
+        import ssa_paths
+        return os.path.join(ssa_paths.data_dir(), "autosave.session")
 
     def autosave(self, closing=False):
         """Write the current session (conditions, results, paused search) to
@@ -1569,10 +1712,32 @@ class SessionsPage(QWidget):
                 return
             st = self._session_state()
             st.update(path=self.model.path, name=self.model.name, dirty=bool(self.model.dirty))
-            self._write_file(self.autosave_path(), st)
+            args = self._write_args(st)
+            if closing:
+                self._autosave_join()
+                self._write_args_to(self.autosave_path(), args)
+                return
+            # periodic autosave: the file is written in the background (1 M
+            # results = ~0.3 s, 10 M = seconds of frozen window every 90 s)
+            if getattr(self, "_as_thread", None) is not None and self._as_thread.is_alive():
+                return                                  # previous one still writing
+
+            def work(path=self.autosave_path(), a=args):
+                try:
+                    self._write_args_to(path, a)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            self._as_thread = threading.Thread(target=work, name="ssa-autosave", daemon=True)
+            self._as_thread.start()
         except Exception:
             import traceback
             traceback.print_exc()
+
+    def _autosave_join(self, timeout=30):
+        t = getattr(self, "_as_thread", None)
+        if t is not None and t.is_alive():
+            t.join(timeout)
 
     def restore_autosave(self):
         p = self.autosave_path()
@@ -1632,6 +1797,23 @@ class SessionsPage(QWidget):
         if not active:
             QMessageBox.information(self, "Start", "Add at least one enabled condition.")
             return
+        if self._topy_family_ok(active) and self.mode.value() != "48-bit family":
+            box = QMessageBox(self)
+            box.setWindowTitle("Top Y")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText("This Top Y search runs much faster in 48-bit family mode "
+                        "(the Stronghold page's engine: exact, CPU + GPU).")
+            box.setInformativeText("Start and Count are then in families (1 family = 65 536 "
+                                   "seeds). Switch the session to 48-bit family?")
+            b_sw = box.addButton("Switch to 48-bit family", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Keep Incremental", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is b_sw:
+                self.mode.set_value("48-bit family")
+                try:
+                    self.mode.changed.emit("48-bit family")
+                except Exception:
+                    pass
         try:
             start = self._read_start()
             rule = self._read_rule()
@@ -1639,11 +1821,17 @@ class SessionsPage(QWidget):
             QMessageBox.warning(self, "Start", str(e))
             return
         self.results.clear()
+        self._mcc_reset()
+        self._run_confirm = self._confirm_params(conds)
         self._explained = None
         self._results_count()
         self._run_sig = self._sig(conds)
         self._prof_sig = self._run_sig
         self._run_world = (self.world.version_name, bool(self.world.large_biomes))
+        # only a search started from the Saved start moves it on (a restored /
+        # imported session's paused search never does)
+        self._run_from_saved = (self._start_mode == "Saved" and self.seed_list is None)
+        rule = self._runner_rule(rule, self._run_confirm)
         self.runner.start(conds, self._mc(), start, self.threads.value(),
                           MODES[self.mode.value()], seed_list=self.seed_list, rule=rule,
                           **self._engine_args(conds))
@@ -1736,6 +1924,8 @@ class SessionsPage(QWidget):
         if self._sig(conds) != getattr(self, "_prof_sig", None):
             self.runner.profile_base = None           # other conditions: new profile
             self._prof_sig = self._sig(conds)
+        self._run_confirm = self._confirm_params(conds)
+        rule = self._runner_rule(rule, self._run_confirm)
         err = self.runner.resume(conditions=conds, threads=self.threads.value(), rule=rule,
                                  **self._engine_args(conds))
         if err:
@@ -1747,25 +1937,149 @@ class SessionsPage(QWidget):
         if not seeds:
             return
         import custom_search as cs
+        from PySide6.QtWidgets import QApplication, QProgressDialog
+        import time as _t
         keep = set()
         ev = threading.Event()
-        try:
-            cs.evaluate_session(conds, 0, 0, self._mc(), self.threads.value(), ev,
-                                lambda s, d="": keep.add(int(s)), lambda a, b: None,
-                                seed_list=seeds)
-        except Exception as e:
-            QMessageBox.warning(self, "Re-check", f"Could not re-check the results:\n{e}")
+        box = {"done": 0, "err": None, "end": False}
+
+        def work():
+            try:
+                cs.evaluate_session(conds, 0, 0, self._mc(), self.threads.value(), ev,
+                                    lambda s, d="": keep.add(int(s)),
+                                    lambda a, b: box.__setitem__("done", int(a)),
+                                    seed_list=seeds)
+            except Exception as e:           # noqa: BLE001 — shown below
+                box["err"] = e
+            box["end"] = True
+        # in a thread with a progress window: on thousands of results with slow
+        # conditions the re-check froze the whole window (audit 28/09)
+        th = threading.Thread(target=work, name="ssa-recheck", daemon=True)
+        th.start()
+        dlg = None
+        t0 = _t.time()
+        while not box["end"]:
+            if dlg is None and _t.time() - t0 > 0.4:
+                dlg = QProgressDialog(f"Re-checking {fmt_int(len(seeds))} results with the new "
+                                      "conditions…", "Cancel", 0, len(seeds), self)
+                dlg.setWindowTitle("Re-check"); dlg.setMinimumDuration(0); dlg.setAutoClose(False)
+                dlg.show()
+            if dlg is not None:
+                dlg.setValue(min(len(seeds), box["done"]))
+                if dlg.wasCanceled():
+                    ev.set()
+            QApplication.processEvents()
+            _t.sleep(0.03)
+        th.join()
+        if dlg is not None:
+            canceled = dlg.wasCanceled()
+            dlg.close(); dlg.deleteLater()
+            if canceled:
+                self.status.emit("Re-check cancelled: the results were kept as they were.")
+                return
+        if box["err"] is not None:
+            QMessageBox.warning(self, "Re-check", f"Could not re-check the results:\n{box['err']}")
             return
         rows = [(s, d) for s, d in self.results.rows if s in keep]
         removed = len(self.results.rows) - len(rows)
+        old_mcs = self.results.mcs
         self.results.clear(); self.results.add(rows)
+        self.results.mcs = {s: v for s, v in old_mcs.items() if s in keep}
         with self.runner._lock:
             self.runner._seen = {s for s, _d in rows}
             self.runner.found = len(rows)
         self._results_count()
         self.status.emit(f"Re-check: {removed} result(s) no longer match and were removed.")
 
+    # ── start seed source: Session / Saved (02/10) ─────────────────────────
+    def _settings(self):
+        from PySide6.QtCore import QSettings
+        return QSettings("SSA", "SimpleSeedAnalyser")
+
+    def _save_start(self):
+        from .start_source import saved_store
+        saved_store().set(self._saved_start, origin=self)
+
+    def _saved_from_elsewhere(self, v, origin):
+        """The Saved start moved on in another page (Stronghold / Draw)."""
+        if origin is self:
+            return
+        self._saved_start = v
+        if (self._start_mode == "Saved" and self.start_seed.isEnabled()
+                and self.runner.state != "paused"):
+            self.start_seed.setText(v)
+
+    def _set_session_start(self, v):
+        """An opened / imported session's start: shown in Session mode only —
+        the Saved start is never replaced by a session."""
+        self._eph_start = str(v)
+        if self._start_mode == "Session":
+            self.start_seed.setText(self._eph_start)
+
+    def _start_edited(self, text):
+        """Typed (or dice) start: belongs to the mode shown."""
+        if self._start_mode == "Saved":
+            self._saved_start = text.strip() or "0"
+            self._save_start()
+        else:
+            self._eph_start = text.strip() or "0"
+
+    def _start_mode_changed(self, mode):
+        if mode == self._start_mode:
+            return
+        # keep what is in the field for the mode we leave
+        if self._start_mode == "Saved":
+            self._saved_start = self.start_seed.text().strip() or "0"
+            self._save_start()
+        else:
+            self._eph_start = self.start_seed.text().strip() or "0"
+        self._start_mode = mode
+        self._settings().setValue("sessions/start_mode", mode)
+        self.start_seed.setText(self._saved_start if mode == "Saved" else self._eph_start)
+        from .start_source import hide_dice_keep_place
+        hide_dice_keep_place(self._dice, mode == "Saved")
+        self._clear_summary()
+        self.status.emit("Start seed: " + ("your saved start — it continues from the last "
+                                           "search and opening a session does not change it."
+                                           if mode == "Saved" else "the session's start."))
+
+    def _next_start(self):
+        """Where the last search stopped, in the unit of the Start field (a seed
+        in Incremental, a 48-bit value in the other modes), or None."""
+        from .search_runner import FAMILY, M48, U64
+        r = self.runner
+        if r.params is None or r.params.get("seed_list") is not None:
+            return None
+        if r.resume_point is not None:
+            v = int(r.resume_point)
+        else:
+            eff = getattr(r, "eff_mode", None) or r.params.get("mode")
+            if eff == "inc":
+                v = (int(r.base_start) + int(r._done_before)) % U64
+            else:
+                v = ((int(r.base_start) & M48) + int(r._done_before) // FAMILY) & M48
+        if v >= 1 << 63:
+            v -= U64                                # signed 64-bit, like the seeds
+        return v
+
+    def _remember_start(self, st):
+        """Saved mode: a stopped / paused search moves the saved start on."""
+        if (self._start_mode != "Saved" or st not in ("done", "paused")
+                or not getattr(self, "_run_from_saved", False)):
+            return
+        try:
+            v = self._next_start()
+        except Exception:
+            v = None
+        if v is None:
+            return
+        self._saved_start = str(v)
+        self._save_start()
+        if st == "done":           # paused: the field keeps the paused search's start
+            self.start_seed.setText(self._saved_start)
+
     def _run_state(self, st):
+        self._remember_start(st)
         running = st in ("running", "pausing", "stopping")
         if st in ("paused", "done", "error", "running"):
             self._show_profile()
@@ -1776,8 +2090,9 @@ class SessionsPage(QWidget):
         # mode / start / source define WHICH seeds are searched. They stay
         # editable during a pause: Resume then asks whether to start a NEW
         # search with them or to continue the paused one (27/09).
-        for w in (self.mode, self.start_seed, self.list_btn):
+        for w in (self.mode, self.list_btn):
             w.setEnabled(not running)
+        self._sync_start_ui(running)
         for w in (self.threads, self.rule_kind, self.rule_seeds, self.rule_results, self.rule_time):
             w.setEnabled(not running)
         self.b_engine.setEnabled(not running)
@@ -1787,6 +2102,37 @@ class SessionsPage(QWidget):
             self.stat.setText("Idle")
         if not running and self.prog.maximum() == 0:     # unlimited: stop the busy bar
             self.prog.setRange(0, 1000); self.prog.setValue(0)
+        if st == "paused" and self.runner.auto_paused == "safety":
+            self.runner.auto_paused = None
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self._safety_dialog)
+
+    def _safety_dialog(self):
+        """The search paused itself at N results (see search_runner.SAFETY_*)."""
+        n = fmt_int(len(self.results.rows))
+        box = QMessageBox(self)
+        box.setWindowTitle("Many results")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"The search paused itself at {n} results.")
+        nxt = self.runner.safety_limit * 10
+        from .search_runner import SAFETY_MAX
+        can_more = self.runner.safety_limit < SAFETY_MAX
+        box.setInformativeText(
+            "The conditions are probably too broad: every result is kept in memory and in the "
+            "table, and millions of them make SSA slow or crash.\n\n"
+            "Make the conditions stricter (the stats show which condition lets almost every seed "
+            "through), or export the results and continue."
+            + ("" if can_more else "\n\nThis is the maximum SSA keeps in one search."))
+        b_more = box.addButton(f"Continue up to {fmt_int(min(nxt, SAFETY_MAX))}",
+                               QMessageBox.ButtonRole.AcceptRole) if can_more else None
+        b_exp = box.addButton("Export the results…", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Keep paused", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if b_more is not None and box.clickedButton() is b_more:
+            self.runner.raise_safety()
+            self._resume()
+        elif box.clickedButton() is b_exp:
+            self._export()
 
     # ── engine (CPU / GPU) ──────────────────────────────────────────────────
     def _engine_ctx(self):
@@ -1832,6 +2178,18 @@ class SessionsPage(QWidget):
             self.engine_plan = plan
             self._engine_plan_sig = self._sig(self.model.export())
         self._update_engine_button()
+
+    def _plan_gpu_on(self, uid):
+        """True when the applied engine plan pre-filters this condition on the GPU
+        (the plan changes the search, not the condition: its own GPU box stays
+        unticked, which read as « CPU » after Apply, 01/10)."""
+        if self.engine_mode != "plan" or not self._engine_plan_valid():
+            return False
+        try:
+            i = [c["_uid"] for c in self.model.conds].index(uid)
+            return bool(self.engine_plan.conditions[i].get("params", {}).get("use_gpu"))
+        except (ValueError, IndexError, AttributeError):
+            return False
 
     def _engine_plan_valid(self):
         p = self.engine_plan
@@ -1905,7 +2263,10 @@ class SessionsPage(QWidget):
         else:
             self.prog.setRange(0, 0)                    # unlimited → busy bar
         unit = d.get("unit", "seeds")
-        parts = [f"{fmt_int(d['done'])} {unit}", fmt_rate(d["sps"]), f"{fmt_int(d['found'])} found",
+        rc = getattr(self, "_run_confirm", None)
+        found = (f"{fmt_int(len(self.results.rows))} confirmed / {fmt_int(d['found'])} found"
+                 if isinstance(rc, dict) else f"{fmt_int(d['found'])} found")
+        parts = [f"{fmt_int(d['done'])} {unit}", fmt_rate(d["sps"]), found,
                  f"elapsed {fmt_time(d['elapsed'])}"]
         if frac is not None:
             parts.insert(1, f"{frac * 100:.2f} %")
@@ -1915,19 +2276,216 @@ class SessionsPage(QWidget):
 
     def _results_in(self, batch):
         at_end = self.table.verticalScrollBar().value() >= self.table.verticalScrollBar().maximum() - 2
+        rc = getattr(self, "_run_confirm", "unset")
+        if rc == "unset":                       # a restored paused search, resumed
+            rc = self._run_confirm = self._confirm_params(self.model.export())
+        if self._sisters_on(self.model.export()):     # "Hide sister seeds" (03/10)
+            batch = self._drop_sisters(batch)
+            if not batch:
+                return
+        if rc is not None and batch:
+            # a result is shown only once Minecraft confirms it (03/10)
+            for s, d in batch:
+                self._mcc_pending[s] = d
+            self._mcc.add([s for s, _d in batch], self._mc(), rc, bool(self.world.large_biomes))
+            self._results_count()
+            return
         self.results.add(batch)
         self._results_count()
         if at_end and self.results.rows and len(self.results.rows) < 2000:
             self.table.scrollToBottom()
 
+    def _results_in_confirmed(self, batch):
+        at_end = self.table.verticalScrollBar().value() >= self.table.verticalScrollBar().maximum() - 2
+        self.results.add(batch)
+        if at_end and len(self.results.rows) < 2000:
+            self.table.scrollToBottom()
+
     def _results_count(self):
         n = len(self.results.rows)
         self.res_count.setText(fmt_int(n))
+        wait, rej = len(self._mcc_pending), self._mcc_rejected
+        self.res_hint.setText(
+            (f"Minecraft 1.16.1: <b>{fmt_int(wait)}</b> being checked · "
+             f"<b>{fmt_int(rej)}</b> not broken (dropped). A result appears once confirmed.")
+            if (wait or rej) else
+            "Click a result: the seed is loaded and the map shows where each condition is "
+            "satisfied.")
+        if self.results.mcs:
+            vals = [v[0] for v in self.results.mcs.values()]
+            ok = sum(1 for t in vals if t.startswith("✓"))
+            no = sum(1 for t in vals if t.startswith("✗"))
+            wait = sum(1 for t in vals if t == "checking…")
+            self.res_count.setToolTip(f"Minecraft 1.16.1: {ok} confirmed ✓ · {no} not broken ✗"
+                                      + (f" · {wait} waiting" if wait else ""))
+        else:
+            self.res_count.setToolTip("")
+
+    # ── "Broken portal": Minecraft confirmation (03/10) ───────────────────────
+    def _confirm_params(self, conds, force=False):
+        """Params of the enabled stronghold condition whose broken portal must be
+        confirmed by Minecraft (1.16 only), or None."""
+        from .mc_confirm import can_confirm
+        if not can_confirm(self._mc()):
+            return None
+        for c in conds:
+            if c.get("enabled", True) and c.get("type") in ("first_stronghold", "stronghold"):
+                p = c.get("params") or {}
+                if p.get("corrupt_enabled") and (force or p.get("confirm_mc", True)):
+                    return dict(p)
+        return None
+
+    def _queue_confirm(self, seeds, params):
+        from .mc_confirm import CHECKING
+        for s in seeds:
+            self.results.mcs[s] = CHECKING
+        if seeds and self.results.rows:
+            self.results.dataChanged.emit(self.results.index(0, 1),
+                                          self.results.index(len(self.results.rows) - 1, 1))
+        self._mcc.add(seeds, self._mc(), params, bool(self.world.large_biomes))
+        self._results_count()
+
+    @staticmethod
+    def _sisters_on(conds):
+        """A lone stronghold condition with "Hide sister seeds" (on by default)."""
+        act = [c for c in conds if c.get("enabled", True)]
+        if len(act) != 1 or act[0].get("type") not in ("first_stronghold", "stronghold"):
+            return False
+        return bool((act[0].get("params") or {}).get("hide_sisters", True))
+
+    @staticmethod
+    def _sister_key(seed, details):
+        try:
+            x, z = (int(float(v)) for v in str(details).split(",")[:2])
+        except (TypeError, ValueError):
+            return None
+        return (int(seed) & ((1 << 48) - 1), x >> 4, z >> 4)
+
+    def _drop_sisters(self, batch):
+        keys = getattr(self, "_sis_keys", None)
+        if keys is None:
+            keys = self._sis_keys = {self._sister_key(s, d) for s, d in self.results.rows}
+            keys.update(self._sister_key(s, d) for s, d in self._mcc_pending.items())
+        out = []
+        for s, d in batch:
+            k = self._sister_key(s, d)
+            if k is not None and k in keys:
+                continue
+            if k is not None:
+                keys.add(k)
+            out.append((s, d))
+        return out
+
+    def _topy_family_ok(self, active):
+        """The session is a lone 1.16 Top Y the 48-bit family engine can run."""
+        try:
+            import topy_family as tf
+            from custom_search import _scan_128
+        except Exception:
+            return False
+        if len(active) != 1 or active[0].get("type") not in ("first_stronghold", "stronghold"):
+            return False
+        p = active[0].get("params") or {}
+        if not p.get("maxy_enabled") or p.get("corrupt_enabled") or _scan_128(p):
+            return False
+        if self.seed_list is not None or self._mc() not in tf.VERSIONS:
+            return False
+        lim = tf.MIN_FAST_Y_ROOM if p.get("maxy_target") == "room" else tf.MIN_FAST_Y
+        try:
+            return int(p.get("min_max_y", 60)) >= lim
+        except (TypeError, ValueError):
+            return False
+
+    def _runner_rule(self, rule, confirm):
+        """With the Minecraft confirmation, "Stop after N results" counts the
+        CONFIRMED results: the engine runs on and this page pauses it (03/10)."""
+        self._mcc_target = None
+        if confirm is not None and rule and rule[0] == "results" and int(rule[1]) > 0:
+            self._mcc_target = int(rule[1])
+            return ("never", 0)
+        return rule
+
+    def _mcc_reset(self):
+        self._sis_keys = None                    # sister keys follow the results
+        self._mcc.reset()
+        self._mcc_pending = {}
+        self._mcc_rejected = 0
+
+    def _mc_one(self, seed, st):
+        st = tuple(st) + ("",) * (3 - len(st))
+        if seed in self._mcc_pending:            # a search candidate: kept only if confirmed
+            d = self._mcc_pending.pop(seed)
+            if st[0].startswith("✗"):
+                self._mcc_rejected += 1
+            else:
+                self.results.mcs[seed] = st
+                self._results_in_confirmed([(seed, d)])
+        else:
+            self.results.set_mc_status(seed, st)
+        tgt = self._mcc_target
+        if (tgt and self.runner.state == "running"
+                and sum(1 for v in self.results.mcs.values() if v[0].startswith("✓")) >= tgt):
+            self._mcc_target = None
+            if self.runner.can_pause:
+                self.runner.pause("results")
+            else:
+                self.runner.stop()
+        import time as _t
+        if _t.time() - getattr(self, "_mcc_t", 0) > 0.5 or self._mcc.waiting == 0:
+            self._mcc_t = _t.time()
+            self._results_count()
+
+    def _restore_mc_status(self, saved, seeds):
+        if not isinstance(saved, dict):
+            self._results_count()
+            return
+        alive = set(seeds)
+        again = []
+        for k, v in saved.items():
+            try:
+                s = int(k)
+            except (TypeError, ValueError):
+                continue
+            if s not in alive or not isinstance(v, (list, tuple)) or len(v) < 2:
+                continue
+            if v[0] == "checking…":
+                again.append(s)
+            else:
+                self.results.mcs[s] = (str(v[0]), str(v[1]), str(v[2]) if len(v) > 2 else "")
+        cp = self._confirm_params(self.model.export(), force=True) if again else None
+        if cp is not None:                       # left half-checked: check them again
+            self._queue_confirm(again, cp)
+        self._results_count()
+
+    def _remove_unconfirmed(self):
+        bad = {s for s, v in self.results.mcs.items() if v[0].startswith("✗")}
+        rows = [(s, d) for s, d in self.results.rows if s not in bad]
+        old = self.results.mcs
+        self.results.clear(); self.results.add(rows)
+        self.results.mcs = {s: v for s, v in old.items() if s not in bad}
+        with self.runner._lock:
+            self.runner._seen = {s for s, _d in rows}
+            self.runner.found = len(rows)
+        self._results_count()
+        self.status.emit(f"Removed {len(bad)} result(s) Minecraft did not confirm.")
+
+    def _sync_start_ui(self, running=None):
+        """The start (field, dice, Session / Saved) is greyed while a seed list is
+        the source: the list decides the seeds, the start is ignored (03/10)."""
+        if running is None:
+            running = self.runner.state in ("running", "pausing", "stopping")
+        on = not running and self.seed_list is None
+        for w in (self.start_seed, self.start_src, self._dice):
+            w.setEnabled(on)
+        self.start_seed.setToolTip("Ignored: the seed list is the source (✕ on the list to go "
+                                   "back to a range)." if self.seed_list is not None else
+                                   "First seed (Incremental) or first 48-bit value (other modes).")
 
     def _seed_list(self):
         if self.seed_list is not None:
             self.seed_list = None
             self.list_btn.setText("Seed list…")
+            self._sync_start_ui()
             return
         path, _ = QFileDialog.getOpenFileName(self, "Seed list", user_path(),
                                               "Seed lists (*.txt *.seeds *.csv);;All files (*.*)")
@@ -1946,8 +2504,28 @@ class SessionsPage(QWidget):
         self.seed_list = src
         self.list_btn.setText(f"{os.path.basename(path)} · {fmt_int(n)}  ✕")
         self.list_btn.setToolTip("Click to go back to a seed range.")
+        self._sync_start_ui()
 
     # ── results ─────────────────────────────────────────────────────────────
+    def _arrow_results(self, key):
+        """Arrows on the map (01/10): ↓ next result, ↑ previous one (the map
+        follows the selected seed); ← / → do nothing. The map keeps the focus."""
+        if key not in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            return
+        n = self.results.rowCount()
+        if n == 0:
+            return
+        cur = self.table.currentIndex()
+        r = cur.row() if cur.isValid() else -1
+        r = (r + 1 if key == Qt.Key.Key_Down else r - 1) if r >= 0 else 0
+        r = max(0, min(n - 1, r))
+        if cur.isValid() and r == cur.row():
+            return
+        idx = self.results.index(r, 0)
+        self.table.setCurrentIndex(idx)
+        self.table.selectRow(r)
+        self.table.scrollTo(idx)
+
     def _result_selected(self, cur, _prev):
         if not cur.isValid():
             return
@@ -1956,6 +2534,10 @@ class SessionsPage(QWidget):
         self._explain_seed(seed)
 
     def _world_seed_changed(self):
+        try:                                   # the open condition follows the version
+            self.form.set_mc(self._mc())
+        except Exception:
+            pass
         ex = self._explained
         if getattr(self.tree, "_check", None) and (ex is None or ex[0] != self.world.seed):
             self.tree.set_check(None)
@@ -2098,9 +2680,22 @@ class SessionsPage(QWidget):
         a_tp = m.addAction(f"Copy /tp {loc[0]} ~ {loc[1]}") if has_loc else None
         a_go = m.addAction("Centre the map on the location") if has_loc else None
         a_map = m.addAction("Open on the Map page") if len(seeds) == 1 else None
+        cp = self._confirm_params(self.model.export(), force=True)
+        a_conf = (m.addAction(f"Confirm the broken portal with Minecraft ({len(seeds)})")
+                  if cp is not None else None)
+        n_x = sum(1 for v in self.results.mcs.values() if v[0].startswith("✗"))
+        busy = self.runner.state in ("running", "pausing", "stopping")
+        a_rmx = (m.addAction(f"Remove the {n_x} result(s) Minecraft did not confirm (✗)")
+                 if n_x and not busy else None)
         m.addSeparator()
         a_exp = m.addAction("Export all results…")
         act = m.exec(self.table.viewport().mapToGlobal(pt))
+        if act is not None and act is a_conf:
+            self._queue_confirm(seeds, cp)
+            return
+        if act is not None and act is a_rmx:
+            self._remove_unconfirmed()
+            return
         if act is a_copy:
             QGuiApplication.clipboard().setText("\n".join(str(s) for s in seeds))
         elif act is not None and act is a_tp:
@@ -2141,6 +2736,7 @@ class SessionsPage(QWidget):
         if self.runner.state in ("running", "pausing", "stopping"):
             return
         self.results.clear()
+        self._mcc_reset()
         self._explained = None
         self._results_count()
         self._show_zones()

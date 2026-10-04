@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 import custom_search as cs
 
 GPU_TYPES_1_18 = ("biome_sample", "biome_filter", "biome_center", "climate_minmax",
-                  "climate_center", "noise_sample")
+                  "noise_sample")   # climate_center (flood fill): CPU only for now (01/10)
 MARK = "_gpu_plan_id"
 BENCH_STEADY = 3.5            # seconds of measurement after the first progress
 BENCH_MAX = 14.0              # hard cap per candidate (CUDA warm-up included)
@@ -106,11 +106,12 @@ def _gpu_available():
 # is a NECESSARY condition → a sound GPU pre-filter (the C engine still checks
 # every survivor with the exact position). Only for tests of the kind "there
 # is at least one point that…"; coverage tests (a % of the area) cannot widen.
-UNION_SOUND = ("climate_minmax", "climate_center", "biome_filter", "biome_center")
+UNION_SOUND = ("climate_minmax", "biome_filter", "biome_center")
 GPU_GRID_MAX = 1 << 20          # cells at scale 4 accepted for a zone englobante (~4 100×4 100 blocks)
 MARGIN = 16
 # conditions whose pushed position is their parent's or a point of their area
-_MOVES_IN_AREA = {"spiral", "climate_minmax", "climate_center", "biome_center", "biome_filter",
+# (not climate_center: its region's centre can lie ±128 cells away when its area is 0)
+_MOVES_IN_AREA = {"spiral", "climate_minmax", "biome_center", "biome_filter",
                   "biome_sample", "noise_sample", "climate_noise", "slime", "height",
                   "logic_or", "logic_not", "crunchiness"}
 

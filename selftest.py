@@ -6,7 +6,7 @@ selftest.py — quick check that an installed SSA works on this PC.
 Checks the native libraries with known answers (biomes, the session engine,
 eyes of ender, exact Y), that worker processes start (frozen multiprocessing)
 and reports the GPU state. The report goes to the console, to
-%LOCALAPPDATA%\\SimpleSeedAnalyser\\selftest.txt (~/SimpleSeedAnalyser on Linux)
+%LOCALAPPDATA%\\SimpleSeedAnalyser\\selftest.txt (~/.local/state/SimpleSeedAnalyser on Linux)
 and, when possible, to a message box. Exit code 0 = everything passed.
 """
 from __future__ import annotations
@@ -115,8 +115,8 @@ SESSION_REF = 10911
 def main() -> int:
     ok, report = run()
     try:
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        d = os.path.join(base, "SimpleSeedAnalyser"); os.makedirs(d, exist_ok=True)
+        import ssa_paths
+        d = ssa_paths.log_dir()
         with open(os.path.join(d, "selftest.txt"), "w", encoding="utf-8") as f:
             f.write(report + "\n")
         report += f"\n\n(saved to {os.path.join(d, 'selftest.txt')})"

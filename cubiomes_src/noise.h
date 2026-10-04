@@ -59,6 +59,8 @@ void octaveInitBeta(OctaveNoise *noise, uint64_t *seed, PerlinNoise *octaves,
         int octcnt, double lac, double lacMul, double persist, double persistMul);
 int xOctaveInit(OctaveNoise *noise, Xoroshiro *xr, PerlinNoise *octaves,
         const double *amplitudes, int omin, int len, int nmax);
+void xOctaveInitOne(PerlinNoise *octave, uint64_t xlo, uint64_t xhi,
+        const double *amplitudes, int omin, int len, int i);
 
 double sampleOctave(const OctaveNoise *noise, double x, double y, double z);
 double sampleOctaveAmp(const OctaveNoise *noise, double x, double y, double z,
@@ -76,6 +78,11 @@ int xDoublePerlinInit(DoublePerlinNoise *noise, Xoroshiro *xr,
 
 double sampleDoublePerlin(const DoublePerlinNoise *noise,
         double x, double y, double z);
+/* SSA (p93): same value as sampleDoublePerlin, faster for scattered samples
+ * (Monte Carlo); slower for neighbouring ones (grid scans). */
+double sampleDoublePerlinScattered(const DoublePerlinNoise *noise,
+        double x, double y, double z);
+double samplePerlinScattered(const PerlinNoise *noise, double d1, double d2, double d3);
 
 
 #ifdef __cplusplus

@@ -26,11 +26,11 @@ IS_WIN = sys.platform == "win32"
 if IS_WIN:
     REQUIRED_LIBS = ["libcubiomes.dll", "gaider_layouts.dll", "terrain.dll"]
     OPTIONAL_LIBS = ["gaider_cuda.dll", "structure_cuda.dll", "noise_gpu.dll",
-                     "terrain_gpu.dll"]
+                     "terrain_gpu.dll", "topy_gpu.dll"]
 else:                                # Linux test build of the same spec
     REQUIRED_LIBS = ["libcubiomes.so", "libgaider_layouts.so", "libterrain.so"]
     OPTIONAL_LIBS = [ "terrain_gpu.so", "libgaider_cuda.so",
-                     "libstructure_cuda.so", "libnoise_gpu.so"]
+                     "libstructure_cuda.so", "libnoise_gpu.so", "libtopy_gpu.so"]
 
 binaries = []
 for name in REQUIRED_LIBS:
@@ -51,6 +51,10 @@ datas = [
     (os.path.join(ROOT, "colormaps"), "colormaps"),              # colormaps.py
     (os.path.join(ROOT, "ruined_footprints.json"), "."),         # ruined_portal.py
 ]
+# the Minecraft checker's Java source (mc_checker.py compiles it once with the JDK;
+# no Minecraft code is shipped: the jars come from the user's seed-checker setup)
+if os.path.isdir(os.path.join(ROOT, "tools", "checker")):
+    datas.append((os.path.join(ROOT, "tools", "checker"), os.path.join("tools", "checker")))
 if os.path.isfile(os.path.join(ROOT, "native_build.json")):      # native_libs.py
     datas.append((os.path.join(ROOT, "native_build.json"), "."))
 # drawing_presets.json = the classic UI's Draw presets; the Qt Draw page imports
@@ -73,10 +77,11 @@ hiddenimports = (
         # structure_cuda: __import__("native_libs")
         "native_libs",
         # modules only imported lazily inside functions / in worker processes
-        "search_worker", "stronghold_eyes", "ruined_portal", "custom_search",
+        "search_worker", "stronghold_eyes", "ruined_portal", "custom_search", "ssa_paths", "selftest",
         "gaider_layouts", "terrain", "biome_gpu", "checker_client", "seedlist_io",
         "cubiomes_session", "cubiomes_session_writer", "condition_types",
         "biome_catalog", "noise_palettes", "colormaps", "draw_engine",
+        "topy_family", "topy_gpu", "lake_portals", "mc_checker", "session_confirm",
         # Qt: the stylesheet uses url(*.svg) → qsvg image-format plugin → Qt6Svg
         "PySide6.QtSvg",
         # map_engine noise resize

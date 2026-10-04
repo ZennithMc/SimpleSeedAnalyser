@@ -35,14 +35,14 @@ CONDITION_TYPES = [
         "icon": "🌀",
         "desc": "",
         "params": {
-            "step": {"type": "choice", "label": "Grid step (chunks)",
-                      "options": [1, 4, 16, 64, 256, 512, 1024],
-                      "default": 16},
+            # stored in BLOCKS like cubiomes-viewer (position = cell × step);
+            # « step_unit » only chooses how the editor shows it (01/10)
+            "step": {"type": "spiral_step", "label": "Step", "default": 16},
         },
     },
 
     # ── Structures ──
-    {"key": "first_stronghold", "name": "First stronghold",  "category": "Structures", "icon": "🏰", "desc": "", "no_area": True, "params": dict(_STRONGHOLD_PARAMS)},
+    {"key": "first_stronghold", "name": "Stronghold",  "category": "Structures", "icon": "🏰", "desc": "", "no_area": True, "params": dict(_STRONGHOLD_PARAMS)},
     {"key": "monument",         "name": "Ocean monument",    "category": "Structures", "icon": "🌊", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {"key": "mansion",          "name": "Woodland mansion",  "category": "Structures", "icon": "🏚", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {"key": "outpost",          "name": "Pillager outpost",  "category": "Structures", "icon": "🗼", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
@@ -56,7 +56,14 @@ CONDITION_TYPES = [
     {"key": "trial_chambers",   "name": "Trial chambers",    "category": "Structures", "icon": "⚔", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {"key": "ocean_ruin",       "name": "Ocean ruin",        "category": "Structures", "icon": "🌊", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {"key": "trail_ruins",      "name": "Trail ruins",       "category": "Structures", "icon": "🏺", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
-    {"key": "abandoned_camp",   "name": "Abandoned camp",    "category": "Structures", "icon": "⛺", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
+    # TEMPORARILY DISABLED (01/10, Édouard): its generation (salt, rules) changes
+    # with almost every small Minecraft version — right once, wrong now. Hidden
+    # from the condition menu and the map; the code stays (a loaded session
+    # that has one still runs it). Remove « disabled » to bring it back.
+    {"key": "abandoned_camp",   "name": "Abandoned camp",    "category": "Structures", "icon": "⛺", "desc": "",
+     "disabled": "Abandoned camps are temporarily disabled: their generation changes with "
+                 "almost every small Minecraft version, so the positions are not reliable.",
+     "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {
         "key": "igloo",
         "name": "Igloo",
@@ -64,8 +71,11 @@ CONDITION_TYPES = [
         "icon": "🏔",
         "desc": "",
         "params": {
-            "variant": {"type": "choice", "label": "Variant filter",
+            "variant": {"type": "choice", "label": "Basement",
                          "options": ["any", "basement", "no_basement"],
+                         "labels": {"any": "Any", "basement": "With basement",
+                                    "no_basement": "Without"},
+                         "segmented": True,
                          "default": "any"},
             "use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False},
         },
@@ -77,8 +87,11 @@ CONDITION_TYPES = [
         "icon": "🏘",
         "desc": "",
         "params": {
-            "variant": {"type": "choice", "label": "Variant filter",
+            "variant": {"type": "choice", "label": "Abandoned (zombie village)",
                          "options": ["any", "abandoned", "not_abandoned"],
+                         "labels": {"any": "Any", "abandoned": "Abandoned",
+                                    "not_abandoned": "Not abandoned"},
+                         "segmented": True,
                          "default": "any"},
             "use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False},
         },
@@ -142,8 +155,10 @@ CONDITION_TYPES = [
         "params": {
             "biome_id":  {"type": "biome_single", "label": "Biome",
                            "default": 0},
+            # cubiomes keeps it as a 32-bit int: record-size biomes go far past
+            # the old 10 000 cap (01/10)
             "min_size":  {"type": "int", "label": "Minimum size (chunks²)",
-                           "default": 1, "min": 1, "max": 10000},
+                           "default": 1, "min": 1, "max": 2_000_000_000},
             "tolerance": {"type": "int", "label": "Border tolerance (chunks)",
                            "default": 4, "min": 0, "max": 32},
             "count":     {"type": "int", "label": "Min centers",
@@ -189,29 +204,32 @@ CONDITION_TYPES = [
         "category": "Biomes",
         "icon": "🎯",
         "section_title": "Locate climate center",
-        "desc": "Find the position with the strongest (or weakest) value of a "
-                "climate noise within the search area. Optionally restrict to "
-                "values inside a given range (empty = ±infinity).",
+        # coarse flood fill (01/10, idea of CoffeeAddicted): the connected
+        # region of ONE climate value around the reference position
+        "desc": "Measures the connected region where a climate value stays in "
+                "the range, starting from the reference position (coarse flood "
+                "fill, like biome size checks but for one climate noise). Passes "
+                "when the region is big enough; dependent conditions are tested "
+                "at its centre. Explored within the area (area 0 = ±128 cells).",
         "params": {
             "para":     {"type": "choice", "label": "Climate parameter",
                           "options": ["Temperature", "Humidity",
                                       "Continentalness", "Erosion", "Weirdness"],
                           "default": "Continentalness"},
-            "locate":   {"type": "choice", "label": "Locate",
-                          "options": [
-                              ("Locate max (strongest positive)", 0),
-                              ("Locate min (strongest negative)", 1),
-                          ],
-                          "default": 0},
             "range":    {"type": "range", "label": "Value range",
                           "default": (None, None)},
+            "invert":   {"type": "bool",  "label": "Outside the range",
+                          "default": False},
             "nmax":     {"type": "octave_choice", "label": "Generate up to octave",
                           "default": -1, "depends_on": "para"},
-            "invert":   {"type": "bool",  "label": "Invert test",
-                          "default": False},
-            "use_gpu":  {"type": "bool",
-                          "label": "GPU CUDA (1.18+, full octaves)",
-                          "default": False},
+            "scale":    {"type": "choice", "label": "Cell size (scale)",
+                          "options": [("1:4 (fine, slow)", 4), ("1:16 (chunk)", 16),
+                                      ("1:64", 64), ("1:256 (coarse, fast)", 256)],
+                          "default": 16},
+            "min_size": {"type": "int", "label": "Minimum region size (cells)",
+                          "default": 64, "min": 1, "max": 1_000_000},
+            "max_size": {"type": "int", "label": "Maximum region size (cells, 0 = none)",
+                          "default": 0, "min": 0, "max": 1_000_000},
         },
     },
     {
@@ -253,7 +271,7 @@ CONDITION_TYPES = [
                            "default": 0},
             "threshold": {"type": "slider_with_entry",
                            "label": "Threshold",
-                           "min": 0.0, "max": 0.5, "step": 0.001,
+                           "min": 0.001, "max": 0.5, "step": 0.001,
                            "default": 0.10},
             "use_gpu":   {"type": "bool", "label": "GPU CUDA acceleration",
                            "default": False},
@@ -504,3 +522,7 @@ def _build_octave_options(climate_name: str, large: bool = False):
     return options
 
 
+
+
+# types hidden for now (kept in the code, see « disabled » above)
+DISABLED_TYPES = {t["key"]: t["disabled"] for t in CONDITION_TYPES if t.get("disabled")}
