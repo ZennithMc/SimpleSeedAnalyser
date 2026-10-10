@@ -99,6 +99,80 @@ class LayersPanel(QWidget):
                 lay.addWidget(tg)
         lay.addWidget(body("Structures appear when zoomed in (≤ 48 blocks per pixel).",
                            muted=True, small=True))
+        # (10/10) 1.16 dungeons / lava lakes, with a Y range
+        lay.addSpacing(6)
+        lay.addWidget(section_title("1.16 features"))
+        for key, tip in (("dungeon", "The dungeons that really generate: SSA rebuilds the 1.16.1 terrain\n"
+                                     "(caves, ravines, lakes, mineshafts) like Minecraft, block for block.\n"
+                                     "Near a village / outpost (not modelled) they are marked « ? ».\n"
+                                     "Shown from 4 blocks/pixel (the terrain is rebuilt: heavy), Y from 0.25."),
+                         ("lava_lake", "The lava lakes that really generate, with their real top lava Y\n"
+                                       "(surface ones dropped to the ground) — exact 1.16.1 terrain.\n"
+                                       "Shown from 2 blocks/pixel (4 with « Surface »), shape + Y from 0.75.")):
+            tg = self._toggle(key, struct_icons.label(key), key)
+            tg.setToolTip(tip)
+            if key != "lava_lake":
+                lay.addWidget(tg)
+                continue
+            # (10/10 bis) « Surface »: only the surface lakes — shown while the
+            # lava lakes are on
+            lrow = QHBoxLayout(); lrow.setSpacing(8); lrow.setContentsMargins(0, 0, 0, 0)
+            lrow.addWidget(tg)
+            self.f116_surf = QCheckBox("Surface")
+            self.f116_surf.setChecked(bool(self.map.ov.get("f116_surface_only", False)))
+            self.f116_surf.setToolTip("Only the surface lava lakes (the game placed them at Y ≥ 63, then\n"
+                                      "they drop to the ground). Off: every lava lake.")
+            self.f116_surf.setVisible(tg.isChecked())
+
+            def _surf(on):
+                self.map.ov["f116_surface_only"] = bool(on)
+                self.map.update(); self.changed.emit()
+            self.f116_surf.toggled.connect(_surf)
+            tg.toggled.connect(self.f116_surf.setVisible)
+            lrow.addWidget(self.f116_surf)
+            lrow.addStretch(1)
+            lay.addLayout(lrow)
+        yrow = QHBoxLayout(); yrow.setSpacing(6)
+        yrow.addWidget(body("Y", muted=True))
+        from PySide6.QtWidgets import QSpinBox
+        lo, hi = self.map.ov.get("f116_y", (0, 255))
+        self.f116_lo = QSpinBox(); self.f116_lo.setRange(0, 255); self.f116_lo.setValue(int(lo))
+        self.f116_hi = QSpinBox(); self.f116_hi.setRange(0, 255); self.f116_hi.setValue(int(hi))
+        for w in (self.f116_lo, self.f116_hi):
+            w.setToolTip("Only the dungeons (spawner Y) / lava lakes (top lava Y) in this range.\n"
+                         "Surface lakes are shown with the full range only.")
+            w.valueChanged.connect(self._f116_y)
+        yrow.addWidget(self.f116_lo); yrow.addWidget(body("to", muted=True)); yrow.addWidget(self.f116_hi)
+        yrow.addStretch(1)
+        lay.addLayout(yrow)
+        self.f116_ground = QCheckBox("Attempts below the ground only (Alt+S view)")
+        self.f116_ground.setChecked(bool(self.map.ov.get("f116_ground", True)))
+        self.f116_ground.setToolTip("Structure-seed view (48 bits, no terrain): hides the dungeon attempts\n"
+                                    "more than 10 blocks above the approximate ground.")
+
+        def _gr(on):
+            self.map.ov["f116_ground"] = bool(on)
+            self.map.update(); self.changed.emit()
+        self.f116_ground.toggled.connect(_gr)
+        lay.addWidget(self.f116_ground)
+        # (10/10) what the map shows are the places the game TRIES: zoomed in,
+        # they are checked with the real Minecraft 1.16.1 by themselves
+        for key, txt, tip in (
+                ("f116_auto", "Check the unsure ones with Minecraft",
+                 "Zoomed in (icons), the « ? » dungeons / lava lakes on screen (near a village,\n"
+                 "or every one with an older library) are sent to the real Minecraft 1.16.1\n"
+                 "a moment after the map stops: ✓ real, ✗ not generated."),
+                ("f116_only_real", "Hide the ones Minecraft does not have",
+                 "Removes the ✗ ones (most dungeon attempts: no cave next to them).")):
+            cb = QCheckBox(txt)
+            cb.setChecked(bool(self.map.ov.get(key, True)))
+            cb.setToolTip(tip)
+
+            def _set(on, key=key):
+                self.map.ov[key] = bool(on)
+                self.map.update(); self.changed.emit()
+            cb.toggled.connect(_set)
+            lay.addWidget(cb)
         # coordinate grid (like cubiomes-viewer), 01/10
         grow = QHBoxLayout(); grow.setSpacing(6)
         self.grid = QCheckBox("Grid")
@@ -385,6 +459,12 @@ class LayersPanel(QWidget):
         self.map.update()
         self.changed.emit()
 
+    def _f116_y(self, _v=None):
+        lo, hi = self.f116_lo.value(), self.f116_hi.value()
+        self.map.ov["f116_y"] = (min(lo, hi), max(lo, hi))
+        self.map.update()
+        self.changed.emit()
+
     def _set_all(self, on):
         for key, cb in self.boxes.items():
             if not key.startswith("__") and cb.isEnabled():
@@ -426,12 +506,21 @@ class LayersPanel(QWidget):
             cb.setToolTip("" if ok else f"Not generated in {self.world.version_name}")
         modern = self.world.mc >= cw.MC_VERSIONS["Java 1.18"]
         m = self.noise.model()
+        # (10/10) "Approx height" also before 1.18 (cubiomes mapApproxHeight:
+        # biome depth / scale + surface noise, like cubiomes-viewer's height map)
+        # (10/10 bis) "Exact Y" in 1.16 too: the exact 1.16.1 terrain (terrain116)
+        v116 = int(self.world.mc) in (19, 20)
+        pre_ok = ("Off", "Approx height") + (("Exact Y",) if v116 else ())
         for i, name in enumerate(NOISE_CHOICES):
-            if name != "Off":
+            if name not in pre_ok:
                 m.item(i).setEnabled(modern)
-        if not modern and self.noise.currentText() != "Off":
+        if not modern and self.noise.currentText() not in pre_ok:
             self.noise.setCurrentText("Off")
-        self.noise.setToolTip("" if modern else "Noise layers exist from Java 1.18 (noise-based generation).")
+        self.noise.setToolTip("" if modern else
+                              ("1.16: Approx height and Exact Y (the exact 1.16.1 terrain);\n"
+                               "the climate noises exist from Java 1.18." if v116 else
+                               "Before 1.18: Approx height only (the climate noises\n"
+                               "and Exact Y exist from Java 1.18, noise-based generation)."))
         if self.noise.currentText() in CLIMATE:
             self._fill_octaves(self.noise.currentText())
 

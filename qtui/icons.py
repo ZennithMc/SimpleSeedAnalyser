@@ -142,6 +142,15 @@ def _draw(name: str, p: QPainter, c: QColor):
         p.drawLine(4.5, 7, 19.5, 7); p.drawPolyline([QPointF(9.5, 7), QPointF(10, 4.5), QPointF(14, 4.5), QPointF(14.5, 7)])
         path = QPainterPath(); path.moveTo(6.5, 7); path.lineTo(7.5, 20); path.lineTo(16.5, 20)
         path.lineTo(17.5, 7); p.drawPath(path); p.drawLine(10.5, 10.5, 10.5, 16.5); p.drawLine(13.5, 10.5, 13.5, 16.5)
+    elif name == "trash-all":        # a bin with a cross: everything (08/10)
+        p.drawLine(4.5, 7, 19.5, 7); p.drawPolyline([QPointF(9.5, 7), QPointF(10, 4.5), QPointF(14, 4.5), QPointF(14.5, 7)])
+        path = QPainterPath(); path.moveTo(6.5, 7); path.lineTo(7.5, 20); path.lineTo(16.5, 20)
+        path.lineTo(17.5, 7); p.drawPath(path)
+        p.drawLine(QPointF(9.5, 10.5), QPointF(14.5, 16.5)); p.drawLine(QPointF(14.5, 10.5), QPointF(9.5, 16.5))
+    elif name == "more":             # three dots (08/10)
+        p.setBrush(c)
+        for x in (6.0, 12.0, 18.0):
+            p.drawEllipse(QPointF(x, 12), 1.6, 1.6)
     elif name == "edit":
         path = QPainterPath(); path.moveTo(15.5, 4.5); path.lineTo(19.5, 8.5); path.lineTo(9, 19)
         path.lineTo(4.5, 19.5); path.lineTo(5, 15); path.closeSubpath(); p.drawPath(path)

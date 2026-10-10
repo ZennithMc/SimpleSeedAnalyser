@@ -193,7 +193,7 @@ def _why_not(c, mc, mode, avail):
             return "no usable CUDA GPU"
         if mode != "inc":
             return "the GPU crunchiness filter scans seed by seed (not in 48-bit family mode)"
-        return "a spiral iterator is present: the C engine is faster for this session"
+        return "it is not at the top level of the session (under another condition)"
     if not avail["noise_gpu"]:
         return "no usable CUDA GPU"
     if int(mc) < 22:
@@ -294,11 +294,11 @@ def _candidates(conditions, mc, mode="inc", excluded=None):
             out.append((f"#{i + 1} {_name(c)}{zname}", cfg, "cond", i))
         else:
             excluded.append((f"#{i + 1} {_name(c)}", _why_not(c, mc, mode, avail)))
-    # crunchiness (skipped by the engine when a spiral is present)
+    # crunchiness: a top-level one (08/10: with a spiral too — the survivors are
+    # validated by all the CPU threads now)
     ci = next((i for i, c in enumerate(base) if c.get("type") == "crunchiness"
-               and c.get("enabled", True)), None)
-    if ci is not None and avail["gaider_cuda"] and mode == "inc" and not any(
-            c.get("type") == "spiral" and c.get("enabled", True) for c in base):
+               and c.get("enabled", True) and int(c.get("relative", 0) or 0) == 0), None)
+    if ci is not None and avail["gaider_cuda"] and mode == "inc":
         cfg = copy.deepcopy(base)
         cfg[ci]["params"]["use_gpu"] = True
         out.append(("crunchiness", cfg, "crunch", ci))

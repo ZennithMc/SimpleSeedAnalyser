@@ -282,6 +282,7 @@ class MainWindow(QMainWindow):
             if k:
                 QShortcut(QKeySequence(f"Alt+Shift+{k}"), self,
                           activated=lambda k=k: self._octave_key(k, True))
+        QShortcut(QKeySequence("Alt+O"), self, activated=self._octave_mode_key)   # 08/10
         QShortcut(QKeySequence("Alt+Shift+G"), self, activated=self._arrow_mode_key)
         QShortcut(QKeySequence("Alt+S"), self, activated=self._seed_view_key)
         QShortcut(QKeySequence("F1"), self, activated=self.show_shortcuts)
@@ -364,6 +365,25 @@ class MainWindow(QMainWindow):
         name = lp.oct_list.item(k - 1).text().split()[0]
         self._flash(f"{self.map.ov['noise']}: {'up to' if upto else 'only'} octave {name}"
                     "   ·   Alt+0: all octaves")
+
+    def _octave_mode_key(self):
+        """Alt+O: the same octave, Up to ↔ Only (All → Only)."""
+        if not self._page_has_map():
+            return
+        from .map_engine import CLIMATE
+        lp = self.layers
+        if self.map.ov.get("noise") not in CLIMATE:
+            self._flash("Octaves: choose a climate noise first (Alt+T / H / C / E / W).")
+            return
+        cur = lp.oct_mode.value()
+        new = "Up to" if cur == "Only" else "Only"
+        if lp.oct_list.currentRow() < 0 and lp.oct_list.count():
+            lp.oct_list.setCurrentRow(0)
+        lp.oct_mode.set_value(new)
+        lp._apply_octave()
+        it = lp.oct_list.currentItem()
+        name = it.text().split()[0] if it is not None else ""
+        self._flash(f"{self.map.ov['noise']}: {new.lower()} octave {name}   ·   Alt+O to switch")
 
     def _seed_view_key(self):
         """Structure-seed view (Alt+S, like cubiomes-viewer): every potential

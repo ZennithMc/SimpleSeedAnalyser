@@ -168,6 +168,9 @@ CAUSES = (("ruined", "ruined portal", "Ruined portal", "#b46cf0"),
           ("lava", "lava lake", "Lava lake", "#ff7a1f"),
           ("water", "water lake", "Water lake", "#3aa2ff"))
 _CAUSE_HEX = {c[1]: c[3] for c in CAUSES}
+# 1.16 spawn categories (09/10, Sessions results)
+_CAUSE_HEX.update({"lava": "#ff6a1f", "cave": "#b98cff", "structure": "#e3b341",
+                   "stuck": "#c0504d", "chance": "#c9a06a", "feat_ok": "#3fb27f", "feat_no": "#c0504d", "water": "#4aa3ff", "surface": "#8a8f98", "normal": "#8a8f98"})
 _DOTS = {}
 
 

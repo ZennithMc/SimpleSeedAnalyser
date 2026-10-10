@@ -25,6 +25,8 @@
 #define ALGO_LARGE    1
 #define ALGO_OUTPOST  2
 #define ALGO_END_CITY 3
+#define ALGO_DUNGEON116 4     /* (10/10) 1.16 dungeon attempts: rx/rz = CHUNK range */
+#define ALGO_LAKE116    5     /* (10/10) 1.16 lava lakes: rx/rz = CHUNK range */
 
 struct GpuStructJob {
     int32_t algo_kind, salt, region_size, chunk_range;
@@ -32,6 +34,9 @@ struct GpuStructJob {
     int32_t x1, z1, x2, z2;
     int64_t rmax_sq;
     int32_t cx, cz, min_count, exclude, _pad;
+    /* (10/10) 1.16 features: Y range (ylo <= -1000000 = no bound below, yhi >=
+     * 1000000 = none above), lake variant (5 underground / 6 surface), skip_ref */
+    int32_t ylo, yhi, variant, skip_ref;
 };
 
 #define LCG_K 0x5deece66dULL
@@ -85,7 +90,59 @@ __device__ __forceinline__ int d_structurePos(const GpuStructJob*j,uint64_t seed
     default: return 0;
     }
 }
+/* ── (10/10) 1.16 dungeons / lava lakes — mirror of session_engine.c
+ * f116_chunk / f116_keep with no biome (both feature indices: a superset),
+ * as ssa_test_seed_pos_only. Integers only (no lake shape here). */
+__device__ __forceinline__ uint64_t d_nextLong(uint64_t*s){
+    int64_t hi=(int64_t)(int32_t)d_next(s,32); int64_t lo=(int64_t)(int32_t)d_next(s,32);
+    return (uint64_t)((hi<<32)+lo);
+}
+__device__ __forceinline__ uint64_t d_popSeed(uint64_t ws,int bx,int bz){
+    uint64_t r; d_setSeed(&r,ws);
+    uint64_t a=d_nextLong(&r)|1ULL, b=d_nextLong(&r)|1ULL;
+    return ((uint64_t)(int64_t)bx*a+(uint64_t)(int64_t)bz*b)^ws;
+}
+__device__ __forceinline__ int d_f116_keep(const GpuStructJob*j,int kind,int x,int y,int z,int surf){
+    if(j->rmax_sq){ int64_t dx=x-j->cx,dz=z-j->cz; if(dx*dx+dz*dz>=j->rmax_sq) return 0; }
+    else if(x<j->x1||x>j->x2||z<j->z1||z>j->z2) return 0;
+    if(j->skip_ref&&x==j->cx&&z==j->cz) return 0;
+    if(kind==1){
+        if(j->variant==5&&surf) return 0;
+        if(j->variant==6&&!surf) return 0;
+        if(surf) return j->ylo<=-1000000&&j->yhi>=1000000;
+    } else if(y<1||y>251) return 0;
+    return y>=j->ylo&&y<=j->yhi;
+}
+__device__ int d_test_f116(const GpuStructJob*j,uint64_t seed){
+    int hits=0, kind=(j->algo_kind==ALGO_LAKE116)?1:0;
+    for(int cz=j->rz1;cz<=j->rz2;cz++) for(int cx=j->rx1;cx<=j->rx2;cx++){
+        uint64_t pop=d_popSeed(seed,cx*16,cz*16);
+        if(kind==0){
+            for(int idx=2;idx<=3;idx++){
+                uint64_t r; d_setSeed(&r,pop+(uint64_t)idx+30000ULL);
+                for(int i=0;i<8;i++){
+                    int x=d_nextInt(&r,16),z=d_nextInt(&r,16),y=d_nextInt(&r,256);
+                    d_nextInt(&r,2); d_nextInt(&r,2);
+                    if(d_f116_keep(j,0,cx*16+x,y,cz*16+z,0)){ hits++; if(hits>=j->min_count) return 1; }
+                }
+            }
+        } else {
+            for(int idx=0;idx<2;idx++){
+                uint64_t r; d_setSeed(&r,pop+(uint64_t)idx+10000ULL);
+                if(d_nextInt(&r,8)!=0) continue;
+                int x=d_nextInt(&r,16)+cx*16, z=d_nextInt(&r,16)+cz*16;
+                int y=d_nextInt(&r,d_nextInt(&r,248)+8);
+                if(!(y<63||d_nextInt(&r,10)==0)) continue;
+                if(y<=4) continue;
+                if(d_f116_keep(j,1,x+8,y-1,z+8,y>=63)){ hits++; if(hits>=j->min_count) return 1; }
+            }
+        }
+    }
+    return 0;
+}
+
 __device__ __forceinline__ int d_test_job(const GpuStructJob*j,uint64_t seed){
+    if(j->algo_kind>=ALGO_DUNGEON116) return d_test_f116(j,seed);
     int hits=0;
     for(int rz=j->rz1;rz<=j->rz2;rz++) for(int rx=j->rx1;rx<=j->rx2;rx++){
         int px,pz; if(!d_structurePos(j,seed,rx,rz,&px,&pz)) continue;

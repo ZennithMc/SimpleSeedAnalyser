@@ -169,11 +169,32 @@ def _classes_dir():
 
 def _sources():
     out = []
-    for root in (_seedchecker_src(), os.path.join(_SRC, "stubs")):
+    # (09/10) tools/checker/overrides: files compiled INSTEAD of the seed-checker's
+    # file at the same path (SeedChunkGenerator: a faster region, opt-in)
+    ov_root = os.path.join(_SRC, "overrides")
+    ov = {}
+    if os.path.isdir(ov_root):
+        for dp, _dn, fn in os.walk(ov_root):
+            for f in fn:
+                if f.endswith(".java"):
+                    full = os.path.join(dp, f)
+                    ov[os.path.relpath(full, ov_root).replace("\\", "/")] = full
+    sc_root = _seedchecker_src()
+    for root in (sc_root, os.path.join(_SRC, "stubs")):
         if root:
             for dp, _dn, fn in os.walk(root):
-                out += [os.path.join(dp, f) for f in fn if f.endswith(".java")]
+                for f in fn:
+                    if not f.endswith(".java"):
+                        continue
+                    full = os.path.join(dp, f)
+                    rel = os.path.relpath(full, root).replace("\\", "/")
+                    if root == sc_root and rel in ov:
+                        continue
+                    out.append(full)
+    out += list(ov.values())
     out.append(os.path.join(_SRC, "SsaChecker.java"))
+    if os.path.isfile(os.path.join(_SRC, "SpawnWorker.java")):     # 1.16 spawns (09/10)
+        out.append(os.path.join(_SRC, "SpawnWorker.java"))
     return out
 
 
@@ -232,9 +253,9 @@ def _compile():
 
 # ── worker processes ─────────────────────────────────────────────────────────
 class _Worker:
-    def __init__(self, cp, workdir):
+    def __init__(self, cp, workdir, main="SsaChecker"):
         self.p = subprocess.Popen(
-            [_jdk_bin("java"), "-Xmx1500m", "-XX:+UseSerialGC", "-cp", cp, "SsaChecker"],
+            [_jdk_bin("java"), "-Xmx1500m", "-XX:+UseSerialGC", "-cp", cp, main],
             cwd=workdir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
             creationflags=_NO_WINDOW)
@@ -315,7 +336,9 @@ def default_workers():
 class CheckerPool:
     """N warm Minecraft workers; requests are served in order of submission."""
 
-    def __init__(self, n=None):
+    def __init__(self, n=None, main="SsaChecker", parse=None):
+        self.main = main
+        self.parse = parse or _parse
         out, jars = _compile()
         self.cp = os.pathsep.join([os.path.join(out, "classes")] + jars)
         self.workdir = os.path.join(out, "run")
@@ -338,7 +361,7 @@ class CheckerPool:
         while not self.closed:
             try:
                 if w is None or not w.alive():
-                    w = _Worker(self.cp, self.workdir)
+                    w = _Worker(self.cp, self.workdir, self.main)
                     self.ready.set()
             except Exception as e:                    # cannot start: report, retry later
                 self.error = str(e)
@@ -353,7 +376,7 @@ class CheckerPool:
                 break
             line, cb = item
             try:
-                res = _parse(w.ask(line))
+                res = self.parse(w.ask(line))
                 err = None
             except Exception as e:
                 res, err = None, str(e)
@@ -377,6 +400,10 @@ class CheckerPool:
         if sh is not None:
             flag += "S:%d,%d " % (int(sh[0]), int(sh[1]))
         line = flag + "%d %d %d %s" % (seed, rox, roz, cells)
+        self.q.put((line, callback))
+
+    def submit_line(self, line, callback):
+        """A raw request line (workers other than SsaChecker)."""
         self.q.put((line, callback))
 
     def pending(self):

@@ -27,7 +27,56 @@ class GpuStructJob(ctypes.Structure):
         ("cx", ctypes.c_int32), ("cz", ctypes.c_int32),
         ("min_count", ctypes.c_int32), ("exclude", ctypes.c_int32),
         ("_pad", ctypes.c_int32),
+        # (10/10) 1.16 dungeons / lava lakes (structure_cuda.cu ALGO_*116)
+        ("ylo", ctypes.c_int32), ("yhi", ctypes.c_int32),
+        ("variant", ctypes.c_int32), ("skip_ref", ctypes.c_int32),
     ]
+
+
+ALGO_DUNGEON116, ALGO_LAKE116 = 4, 5
+
+
+def _feature116_job(c, mc):
+    """GpuStructJob of a top-level dungeon / lava lake condition (48 bits, the
+    two feature indices: what ssa_test_seed_pos_only tests), or None."""
+    if int(mc) not in (19, 20):
+        return None
+    from custom_search import feature116_yrange
+    t = c.get("type")
+    p = c.get("params", {}) or {}
+    need = c.get("instances", 1)
+    try:
+        need = int(need)
+    except (TypeError, ValueError):
+        need = 1
+    if need <= 0:
+        return None                       # exclusions: CPU only (as for structures)
+    rmax = int(c.get("rmax", 0) or 0)
+    if not rmax and c.get("area_mode") == 0 and int(c.get("radial", 0) or 0) > 0:
+        rmax = int(c["radial"]) + 1
+    if rmax > 0:
+        rb = rmax - 1
+        bx1, bz1, bx2, bz2, rsq = -rb, -rb, rb, rb, rb * rb + 1
+    else:
+        bx1, bz1, bx2, bz2 = int(c.get("x1", 0)), int(c.get("z1", 0)), int(c.get("x2", 0)), int(c.get("z2", 0))
+        if bx1 > bx2: bx1, bx2 = bx2, bx1
+        if bz1 > bz2: bz1, bz2 = bz2, bz1
+        rsq = 0
+    lake = t == "lava_lake"
+    if not lake:
+        # (10/10) no GPU pre-filter for dungeons: a dungeon that generates
+        # shifts the later attempts of its chunk, the 48-bit attempts are not a
+        # superset of the real dungeons (only of the first one per chunk)
+        return None
+    lo, hi = feature116_yrange(p)
+    var = {"underground": 5, "surface": 6}.get(p.get("variant"), 0) if lake else 0
+    return GpuStructJob(algo_kind=ALGO_LAKE116 if lake else ALGO_DUNGEON116, salt=0, region_size=1,
+                        chunk_range=0,
+                        rx1=((bx1 - 23) if lake else bx1) >> 4, rz1=((bz1 - 23) if lake else bz1) >> 4,
+                        rx2=bx2 >> 4, rz2=bz2 >> 4, x1=bx1, z1=bz1, x2=bx2, z2=bz2,
+                        rmax_sq=rsq, cx=0, cz=0, min_count=need, exclude=0, _pad=0,
+                        ylo=lo if lo > 0 else -1000000, yhi=hi if hi < 255 else 1000000,
+                        variant=var, skip_ref=1 if c.get("ignore_ref") else 0)
 
 
 def _here(): return os.path.dirname(os.path.abspath(__file__))
@@ -61,6 +110,9 @@ def get_load_error():
     _load(); return _CUDA_LOAD_ERROR
 
 
+LAST_JOB_CONDS = []
+
+
 def build_jobs(conditions, lib, mc):
     """Build GpuStructJob list for top-level GPU-supported structure conditions.
     Returns (jobs, all_structures_supported)."""
@@ -72,11 +124,19 @@ def build_jobs(conditions, lib, mc):
     from custom_search import STRUCT_TYPES
     import sys as _dbg
     jobs=[]; all_sup=True; n_struct=0
+    global LAST_JOB_CONDS
+    LAST_JOB_CONDS=[]                  # the condition of each job (statistics)
     for c in conditions:
         if not c.get("enabled",True): continue
         rel=c.get("relative",c.get("parent_idx",0)) or 0
         if rel!=0: continue
         t=c.get("type","")
+        if t in ("dungeon","lava_lake"):          # (10/10) 1.16 features
+            n_struct+=1
+            fj=_feature116_job(c,mc)
+            if fj is None: all_sup=False
+            else: jobs.append(fj); LAST_JOB_CONDS.append(c)
+            continue
         if t not in STRUCT_TYPES: continue
         n_struct+=1
         stype=STRUCT_TYPES[t]
@@ -139,6 +199,7 @@ def build_jobs(conditions, lib, mc):
             chunk_range=cr.value,rx1=rx1,rz1=rz1,rx2=rx2_,rz2=rz2_,x1=bx1,z1=bz1,x2=bx2,z2=bz2,
             rmax_sq=rmax_sq,cx=cx,cz=cz,min_count=_min_count,
             exclude=_exclude,_pad=0))
+        LAST_JOB_CONDS.append(c)
     return jobs, (all_sup and n_struct>0)
 
 

@@ -229,10 +229,22 @@ class EvalContext:
                 return p
         return (0, 0)
 
-    def push_position(self, idx: int, pos) -> None:
+    def push_position(self, idx: int, pos, y=None) -> None:
         while len(self.positions) <= idx:
             self.positions.append(None)
+        prev = self.positions[idx]
         self.positions[idx] = pos if pos is not None else (0, 0)
+        # (10/10 ter) the Y of a position (1.16 dungeon / lava lake, stronghold
+        # end portal): its children's height link. The same place pushed again
+        # without a Y (a parent re-wired at its own position) keeps it.
+        ys = self.__dict__.setdefault("ys", {})
+        if y is not None:
+            ys[idx] = int(y)
+        elif prev is None or tuple(prev) != tuple(self.positions[idx]):
+            ys.pop(idx, None)
+
+    def get_parent_y(self, parent_idx: int):
+        return getattr(self, "ys", {}).get(parent_idx)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -275,6 +287,20 @@ def _spiral_positions(x1, z1, x2, z2, step, rmax_sq=0, at_x=0, at_z=0):
 # ─────────────────────────────────────────────────────────────────────────
 # Slime chunk check (pure Python, matches finders.h isSlimeChunk)
 # ─────────────────────────────────────────────────────────────────────────
+
+def feature116_yrange(params) -> tuple:
+    """(y_min, y_max) of a dungeon / lava lake condition (full range 0…255)."""
+    try:
+        lo = int(params.get("y_min", 0) or 0)
+    except (TypeError, ValueError):
+        lo = 0
+    try:
+        hi = params.get("y_max", 255)
+        hi = 255 if hi is None else int(hi)
+    except (TypeError, ValueError):
+        hi = 255
+    return max(0, lo), min(255, hi)
+
 
 def _is_slime_chunk(seed: int, cx: int, cz: int) -> bool:
     rnd = seed & _U64
@@ -406,6 +432,165 @@ class _RangeSeedList:
                 break
             yield ((s + (1 << 63)) % (1 << 64)) - (1 << 63)   # signed 64-bit, wraps at 2^63
             s += 1
+
+
+class _SisterList:
+    """A seed list searched in "48-bit family" mode (08/10): every listed seed
+    stands for its whole family — the 65 536 seeds sharing its lower 48 bits
+    (its sister seeds). Lazy (len / iter): the families are expanded on the fly.
+    Several listed seeds of one family are searched once."""
+    __slots__ = ("lows", "stop")
+    M48 = (1 << 48) - 1
+
+    def __init__(self, seeds, stop_event=None):
+        self.lows = list(dict.fromkeys(int(x) & self.M48 for x in seeds))
+        self.stop = stop_event
+
+    def __len__(self):
+        return len(self.lows) << 16
+
+    def __iter__(self):
+        st = self.stop
+        for low in self.lows:
+            for hi in range(1 << 16):
+                if (hi & 1023) == 0 and st is not None and st.is_set():
+                    return
+                v = low | (hi << 48)
+                yield v - (1 << 64) if v >= (1 << 63) else v
+
+
+def _evaluate_sisters(conditions, sl, mc_version, num_workers, stop_event,
+                      on_match, on_progress):
+    """The families of a _SisterList through the C engine: the 48-bit structure
+    position pre-filter (ssa_test_lows48, as the Blocks engine) skips the
+    families that cannot match, then all 65 536 seeds of the others are fully
+    tested on every thread. Progress in families. False → not expressible in C."""
+    import ctypes as ct
+    import numpy as _np
+    raw = CubiomesLib()._lib
+    res = _build_ssacond_array(conditions, raw)
+    if res is None or not hasattr(raw, "ssa_test_seeds_batch"):
+        return False
+    arr, n_conds = res
+    raw.ssa_test_seeds_batch.argtypes = [ct.c_void_p, ct.c_int, ct.c_int, ct.c_int,
+                                         ct.POINTER(ct.c_int64), ct.c_int64,
+                                         ct.POINTER(ct.c_int64), ct.c_int64]
+    raw.ssa_test_seeds_batch.restype = ct.c_int64
+    pre = getattr(raw, "ssa_test_lows48", None)
+    if pre is not None:
+        pre.argtypes = raw.ssa_test_seeds_batch.argtypes
+        pre.restype = ct.c_int64
+    try:
+        from cubiomes_wrap import get_large_biomes
+        large = 1 if get_large_biomes() else 0
+    except Exception:
+        large = 0
+    stop = stop_event if stop_event is not None else threading.Event()
+    emit = on_match or (lambda *_: None)
+    highs = _np.arange(1 << 16, dtype=_np.uint64) << _np.uint64(48)
+    lows = sl.lows
+    total = len(lows)
+    CH = 4096
+    for i in range(0, total, CH):
+        if stop.is_set():
+            break
+        sub = _np.array(lows[i:i + CH], dtype=_np.int64)
+        n = len(sub)
+        if pre is not None:
+            out = _np.empty(n, _np.int64)
+            k = int(pre(arr, n_conds, int(mc_version), large,
+                        sub.ctypes.data_as(ct.POINTER(ct.c_int64)), n,
+                        out.ctypes.data_as(ct.POINTER(ct.c_int64)), n))
+            keep = set(out[:k].tolist())
+        else:
+            keep = None
+        for j, low in enumerate(sub.tolist()):
+            if stop.is_set():
+                break
+            if keep is None or low in keep:
+                fam = (highs | _np.uint64(low)).view(_np.int64)
+                _parallel_validate(raw, arr, n_conds, mc_version, large, fam,
+                                   num_workers, stop, emit)
+                if on_progress and not stop.is_set():
+                    on_progress(i + j + 1, total)
+        if on_progress and not stop.is_set():
+            on_progress(i + n, total)
+    return True
+
+
+def _exy_c_view(enabled):
+    """The C engine's part of a session whose Exact Y conditions are LINKED to
+    another condition (08/10): the tree without them (and without what is linked
+    to them). It accepts a superset of the seeds — as long as no Exact Y sits under
+    an OR / NOT — so every seed it emits is then checked with the whole tree.
+    Before, such a session ran in the single-threaded Python loop: one core busy,
+    no statistics, no Pause. None → not possible (Python search)."""
+    n = len(enabled)
+    par = [int(c.get("relative", 0) or 0) for c in enabled]
+    drop = set()
+    for i, c in enumerate(enabled):
+        if c.get("type") != "precise_y":
+            continue
+        p, hops = par[i], 0
+        while p and hops <= n:
+            if not 1 <= p <= n or enabled[p - 1].get("type") in ("logic_or", "logic_not"):
+                return None
+            p, hops = par[p - 1], hops + 1
+        drop.add(i)
+    if not drop:
+        return None
+    grew = True
+    while grew:
+        grew = False
+        for i in range(n):
+            if i not in drop and par[i] and (par[i] - 1) in drop:
+                drop.add(i); grew = True
+    keep = [i for i in range(n) if i not in drop]
+    if not keep:
+        return None
+    new = {old + 1: k + 1 for k, old in enumerate(keep)}
+    out = []
+    for i in keep:
+        d = copy.deepcopy(enabled[i])
+        d["relative"] = new.get(par[i], 0)
+        out.append(d)
+    return out
+
+
+def _exy_view_rows(enabled):
+    """For _exy_c_view(enabled): the session row of each row of the view."""
+    n = len(enabled)
+    par = [int(c.get("relative", 0) or 0) for c in enabled]
+    drop = {i for i, c in enumerate(enabled) if c.get("type") == "precise_y"}
+    grew = True
+    while grew:
+        grew = False
+        for i in range(n):
+            if i not in drop and par[i] and (par[i] - 1) in drop:
+                drop.add(i); grew = True
+    return [i for i in range(n) if i not in drop]
+
+
+_TICKS_HZ = []
+
+
+def _ticks_hz():
+    """Ticks per second of the engine's statistics clock (rdtsc), or 0."""
+    if _TICKS_HZ:
+        return _TICKS_HZ[0]
+    hz = 0.0
+    try:
+        f = CubiomesLib()._lib.ssa_ticks_now
+        f.restype = ctypes.c_uint64; f.argtypes = []
+        t0, k0 = time.perf_counter(), f()
+        time.sleep(0.05)
+        t1, k1 = time.perf_counter(), f()
+        if k1 > k0 and t1 > t0:
+            hz = (k1 - k0) / (t1 - t0)
+    except Exception:
+        hz = 0.0
+    _TICKS_HZ.append(hz)
+    return hz
 
 
 def _inc_count(seed_count, search_mode):
@@ -670,6 +855,104 @@ def _stronghold_match_detail(lib, mc_version: int, seed: int, sh_conds: list) ->
     return "  ·  ".join(parts)
 
 
+def dy_link(cond) -> int:
+    """(10/10 ter) The height link of a condition to its parent: the max |ΔY|
+    in blocks (0 = the same Y), None = no link. Only the 1.16 dungeons / lava
+    lakes have one, and it only acts below a parent with a Y (see y_tracking)."""
+    if cond.get("type") not in Y_CHILD_TYPES or not cond.get("dy_on"):
+        return None
+    try:
+        return max(0, int(cond.get("dy_max", 0) or 0))
+    except (TypeError, ValueError):
+        return None
+
+
+# the conditions whose position has a Y, and the ones that can be height-linked
+Y_CHILD_TYPES = ("dungeon", "lava_lake")
+
+
+def y_tracking(cond) -> bool:
+    """(10/10 ter) Does this condition's position carry a Y for its children:
+    1.16 dungeon (spawner Y), lava lake (top lava Y), stronghold in End portal
+    mode (the portal frames' Y)?"""
+    t = (cond or {}).get("type")
+    if t in Y_CHILD_TYPES:
+        return True
+    return t == "first_stronghold" and _portal_anchor((cond or {}).get("params"))
+
+
+def _f116_instances(ctx, cond, at, parent_y):
+    """(10/10 ter) The real 1.16 dungeons / lava lakes of a condition around
+    `at`, kept as the C engine keeps them (area, Y range, lake kind, « ignore
+    the reference », height link to parent_y), in its scan order. None when
+    the library has no exact terrain."""
+    import feature116 as f116
+    if int(ctx.mc_version) not in f116.VERSIONS:
+        return []
+    if not f116.has_exact():
+        return None
+    t = cond.get("type")
+    p = cond.get("params", {}) or {}
+    x1, z1, x2, z2, rmax_sq = _get_box(cond, int(at[0]), int(at[1]))
+    dun, lak = f116.features_exact(ctx.mc_version, ctx.seed, x1, z1, x2, z2)
+    feats = dun if t == "dungeon" else lak
+    lo, hi = feature116_yrange(p)
+    ylo = lo if lo > 0 else -10 ** 9
+    yhi = hi if hi < 255 else 10 ** 9
+    var = p.get("variant", "any") if t == "lava_lake" else "any"
+    dy = dy_link(cond)
+    out = []
+    for f in feats:
+        if rmax_sq and (f.x - at[0]) ** 2 + (f.z - at[1]) ** 2 >= rmax_sq:
+            continue
+        if (cond.get("ignore_ref") and f.x == at[0] and f.z == at[1]
+                and (parent_y is None or f.y == int(parent_y))):
+            continue          # the parent itself (same Y: not a stacked one, 10/10)
+        if f.kind == 1 and (var == "underground" and f.surface or var == "surface" and not f.surface):
+            continue
+        if not (ylo <= f.y <= yhi):
+            continue
+        if dy is not None and parent_y is not None and abs(f.y - int(parent_y)) > dy:
+            continue
+        out.append(f)
+    # the C engine's order: chunk rows (z, then x), then the chunk's own order
+    out.sort(key=lambda f: ((f.oz >> 4), (f.ox >> 4)) if f.kind == 1 else ((f.z >> 4), (f.x >> 4)))
+    return out
+
+
+def _c_eval_single_y(ctx, cond, parent_idx, px, pz):
+    """(ok, x, z, y | None) of a 1.16 dungeon / lava lake condition at the
+    parent position, with the parent's Y for the height link — None when the
+    library is older (no ssa_eval_single_y)."""
+    import ctypes as ct
+    raw = ctx.lib._lib
+    f = getattr(raw, "ssa_eval_single_y", None)
+    if f is None:
+        return None
+    one = copy.deepcopy(cond)
+    one["relative"] = 0
+    one["enabled"] = True
+    res = _build_ssacond_array([one], raw)
+    if res is None:
+        return None
+    arr, _n = res
+    f.argtypes = [ct.c_void_p, ct.c_int, ct.c_int, ct.c_int64, ct.c_int32, ct.c_int32,
+                  ct.c_int, ct.c_int32, ct.POINTER(ct.c_int32), ct.POINTER(ct.c_int32)]
+    f.restype = ct.c_int
+    try:
+        from cubiomes_wrap import get_large_biomes
+        large = 1 if get_large_biomes() else 0
+    except Exception:
+        large = 0
+    py = ctx.get_parent_y(parent_idx) if hasattr(ctx, "get_parent_y") else None
+    out = (ct.c_int32 * 2)()
+    oy = (ct.c_int32 * 2)()
+    s64 = ((int(ctx.seed) + (1 << 63)) % (1 << 64)) - (1 << 63)
+    ok = f(arr, int(ctx.mc_version), large, s64, int(px), int(pz),
+           1 if py is not None else 0, int(py or 0), out, oy)
+    return bool(ok), int(out[0]), int(out[1]), (int(oy[1]) if oy[0] else None)
+
+
 def _c_eval_single(ctx, cond, cond_idx, all_conds, px, pz, want_samples=False):
     """One condition evaluated by the C engine at the parent position (px, pz)
     for ctx.seed: (passed, x, z), or None when the DLL lacks ssa_eval_single."""
@@ -846,7 +1129,17 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
             if pp is None:
                 return False
             ctx.match_pos = pp
-            ctx.push_position(cond_idx, pp)
+            # (10/10 ter) the portal's Y, when a child is height-linked to it
+            py = None
+            if any(cc.get("relative", 0) == cond_idx and dy_link(cc) is not None for cc in all_conds):
+                try:
+                    import stronghold_eyes as _se
+                    fr = _se.get_end_portal_frames(int(ctx.seed), int(base[0]), int(base[1]),
+                                                   int(ctx.mc_version))
+                    py = int(fr[3]) if fr is not None else None
+                except Exception:
+                    py = None
+            ctx.push_position(cond_idx, pp, py)
             return True
         ctx.push_position(cond_idx, (pos.x, pos.z))
         return True
@@ -876,6 +1169,25 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
         if len(hits) < min_count:
             return False
         ctx.push_position(cond_idx, hits[0])
+        return True
+
+    # ── (09/10) 1.16 fallback-point feature: the C engine's prediction ─
+    # (10/10) and the 1.16 dungeons / lava lakes of an area
+    if t in ("dungeon", "lava_lake"):
+        # (10/10 ter) with the parent's Y (height link) and its own Y back
+        r = _c_eval_single_y(ctx, cond, parent_idx, px, pz)
+        if r is None:
+            r = _c_eval_single(ctx, cond, cond_idx, all_conds, px, pz)
+            r = (r[0], r[1], r[2], None) if r else None
+        if not r or not r[0]:
+            return False
+        ctx.push_position(cond_idx, (r[1], r[2]), r[3])
+        return True
+    if t == "spawn_feature116":
+        r = _c_eval_single(ctx, cond, cond_idx, all_conds, px, pz)
+        if not r or not r[0]:
+            return False
+        ctx.push_position(cond_idx, (r[1], r[2]))
         return True
 
     # ── Slime chunks ──────────────────────────────────────────────────
@@ -1507,6 +1819,33 @@ def _eval_node(ctx: EvalContext, conditions: List[dict],
                 return True
             return False
 
+        elif t in Y_CHILD_TYPES and direct_children and _cond_min_count(cond) > 0:
+            # (10/10 ter) 1.16 dungeons / lava lakes with linked conditions, as
+            # the C engine (clust_node): instances == 1 → OR over every real
+            # one (its X Y Z for the children), > 1 → their centroid
+            insts = _f116_instances(ctx, cond, at, ctx.get_parent_y(parent_idx))
+            mc_ = _cond_min_count(cond)
+            if insts is None:                          # older library: the old way
+                ok = _evaluate_condition(ctx, cond, cond_1idx, conditions)
+                cp = ctx.get_parent_pos(cond_1idx)
+                return ok and all(_eval_node(ctx, conditions, ch, cp) for ch in direct_children)
+            if mc_ == 1:
+                for f in insts:
+                    ctx.push_position(cond_1idx, (f.x, f.z), f.y)
+                    if all(_eval_node(ctx, conditions, ch, (f.x, f.z)) for ch in direct_children):
+                        return True
+                return False
+            if len(insts) < mc_:
+                return False
+            n = len(insts)
+
+            def _tdiv(a, b):                          # C integer division (toward 0)
+                q = abs(a) // b
+                return q if a >= 0 else -q
+            cpos = (_tdiv(sum(f.x for f in insts), n), _tdiv(sum(f.z for f in insts), n))
+            ctx.push_position(cond_1idx, cpos, _tdiv(sum(f.y for f in insts), n))
+            return all(_eval_node(ctx, conditions, ch, cpos) for ch in direct_children)
+
         elif (t in STRUCT_TYPES and t not in STRUCT_DIM and direct_children
               and _cond_min_count(cond) > 0):
             # cubiomes-viewer BR_CLUST (see eval_node in session_engine.c):
@@ -1683,10 +2022,31 @@ def _explain_seed_py(conditions: List[dict], seed: int, mc_version: int, lib: Cu
     anchors = [None] * len(active)
     orig = _eval_node
 
+    kids = {}
+    for j, c in enumerate(active):
+        kids.setdefault(int(c.get("relative", 0) or 0), []).append(j + 1)
+
+    def clear(idx):
+        # only the positions of the evaluation that succeeded (08/10): an
+        # earlier spiral cell / instance left stale ones in the subtree, and
+        # the map was centred on them
+        st = [idx]
+        while st:
+            k = st.pop()
+            if 0 < k < len(ctx.positions):
+                ctx.positions[k] = None
+            if 0 < k <= len(anchors):
+                anchors[k - 1] = None
+            st.extend(kids.get(k, ()))
+
     def spy(ctx_, conds_, idx, at):
+        clear(idx)
         if 1 <= idx <= len(anchors):
             anchors[idx - 1] = (int(at[0]), int(at[1]))
-        return orig(ctx_, conds_, idx, at)
+        r = orig(ctx_, conds_, idx, at)
+        if not r:
+            clear(idx)
+        return r
     ok = True
     g = globals()
     g["_eval_node"] = spy
@@ -1966,6 +2326,9 @@ def _get_ctype_map(lib) -> dict:
         "logic_or":            "logic_or",
         "logic_not":           "logic_not",
         "crunchiness":         "crunchiness",
+        "spawn_feature116":    "spawn_feature",     # (09/10) 1.16 fallback point
+        "dungeon":             "feature116",        # (10/10) 1.16 per-chunk features
+        "lava_lake":           "feature116",
     }
     # All standard overworld structures
     for k in ("village","monument","mansion","outpost","hut","igloo",
@@ -2191,6 +2554,7 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
             ("crunch_threshold",    ct.c_float),
             ("skip_ref",            ct.c_int32),
             ("yield_samples",       ct.c_int32),
+            ("dy_max",              ct.c_int32),     # (10/10 ter) height link to the parent
         ]
 
     # Verify size matches C
@@ -2254,15 +2618,30 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
         # biome / noise sample « Yield individual samples » (cubiomes-viewer count == 1)
         s.yield_samples = 1 if (t in ("biome_sample", "noise_sample")
                                 and params.get("yield_samples")) else 0
+        _dy = dy_link(cond)
+        s.dy_max = _dy + 1 if _dy is not None else 0          # C: limit + 1, 0 = none
 
         # struct_type
         s.struct_type = STRUCT_TYPES.get(t, 0)
+        if t == "spawn_feature116":          # (09/10) kind: 0 dungeon, 1 lava lake
+            s.struct_type = 1 if params.get("kind") == "lava_lake" else 0
+            s.min_count, s.exclude = 1, 0
+        if t in ("dungeon", "lava_lake"):     # (10/10) kind + lake variant + Y range
+            s.struct_type = 1 if t == "lava_lake" else 0
+            s.variant_filter = {"underground": 5, "surface": 6}.get(params.get("variant"), 0)
+            ylo, yhi = feature116_yrange(params)
+            s.height_ymin = ylo if ylo > 0 else -1e9
+            s.height_ymax = yhi if yhi < 255 else 1e9
 
         # variant_filter (village abandoned, igloo basement)
         _variant_str = params.get("variant", "any")
         _variant_int = {"any":0, "abandoned":1, "not_abandoned":2,
                          "basement":3, "no_basement":4}.get(_variant_str, 0)
         s.variant_filter = _variant_int
+        if t == "lava_lake":                  # (10/10) underground 5 / surface 6
+            s.variant_filter = {"underground": 5, "surface": 6}.get(params.get("variant"), 0)
+        elif t == "dungeon":                  # (10/10 ter) the exact terrain decides: no
+            s.variant_filter = 0              # "below the approximate ground" any more
 
         # spiral step. Default 0 → C uses 512 (cubiomes-viewer convention).
         try:    s.step = int(params.get("step", 0) or 0)
@@ -2543,7 +2922,7 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
             s.height_ymin   = ymin if ymin > -64 else -1e9
             s.height_ymax   = ymax if ymax < 320 else  1e9
             s.height_invert = 1 if params.get("invert", False) else 0
-        else:
+        elif t not in ("dungeon", "lava_lake"):      # (10/10) set above for those
             s.height_ymin   = 0.0
             s.height_ymax   = 0.0
             s.height_invert = 0
@@ -2602,7 +2981,7 @@ def evaluate_seed(conditions: List[dict], seed: int, mc_version: int,
 
 def _structure_type_keys():
     """Set of condition 'type' keys that are structures (GPU-eligible subset)."""
-    return set(STRUCT_TYPES.keys())
+    return set(STRUCT_TYPES.keys()) | {"dungeon", "lava_lake"}     # (10/10) 1.16 features
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2732,6 +3111,19 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
     finish the whole range -> still correct, just CPU-speed."""
     import threading, queue as _q, concurrent.futures as _cf, numpy as _np
     warmup()                       # build g_child_order single-threaded (then thread-safe)
+    # Pause / Resume (08/10): a chunk counts once ALL its seeds are checked (its
+    # GPU survivors validated, or its raw seeds full-tested) without a Stop in
+    # between; the resume point is the first seed not covered that way.
+    _rcb = getattr(_HYB_TLS, "on_resume", None)
+    trk = tcb = None
+    if _rcb is not None:
+        from broken_search import ResumeTracker
+        trk = ResumeTracker(seed_start, ["h"])
+        tcb = trk.chunk_cb("h")
+        _rmode = getattr(_HYB_TLS, "on_mode", None)
+        if _rmode is not None:
+            try: _rmode(("resumable", True))
+            except Exception: pass
     nw = max(1, int(num_workers or 0))   # all chosen threads (>=1 validator)
     take_lock = threading.Lock(); prog_lock = threading.Lock()
     st = {"next": int(seed_start), "end": int(seed_start) + int(total), "done": 0}
@@ -2746,7 +3138,9 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
             n = min(chunk, st["end"] - s); st["next"] = s + n
             return (s, n)
 
-    def _bump(n):
+    def _bump(s0, n):
+        if tcb is not None and not stop_event.is_set():
+            tcb(s0, n)
         with prog_lock:
             st["done"] += n; d = st["done"]
         on_progress(min(d, total), total)
@@ -2779,7 +3173,7 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
                 except Exception:
                     import traceback; traceback.print_exc(); surv = None
                 if surv is None:                   # GPU failed/raised -> hand raw chunk to CPU
-                    _put((_seed_arange(c[0], c[1]), [1, c[1]]))
+                    _put((_seed_arange(c[0], c[1]), [1, c[1], c[0]]))
                     break
                 _gpu_prof_note(c[1], len(surv))                          # stop the GPU; CPU finishes the rest
                 _dt = _time.perf_counter() - _t0
@@ -2805,11 +3199,11 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
                     # validated: counted when queued, the rate showed the GPU
                     # speed (500 M/s), then 0 while the queue drained, and a
                     # Stop counted seeds never checked (REMIRRORS V6, 01/10)
-                    rec = [-(-len(surv) // step), c[1]]
+                    rec = [-(-len(surv) // step), c[1], c[0]]
                     for _o in range(0, len(surv), step):
                         _put((surv[_o:_o + step], rec))   # blocks if full (backpressure)
                 else:
-                    _bump(c[1])
+                    _bump(c[0], c[1])
         finally:
             gpu_done.set()
 
@@ -2833,7 +3227,7 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
                 rec[0] -= 1
                 last = rec[0] == 0
             if last:
-                _bump(rec[1])
+                _bump(rec[2], rec[1])
 
     def _cpu_worker():
         csz = 64                                   # per worker, adapts to ~0.3 s
@@ -2854,7 +3248,7 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
                     csz *= 2
                 elif _dt > 0.6 and csz > 16:
                     csz //= 2
-                _bump(c[1])
+                _bump(c[0], c[1])
                 continue
             # no raw chunks left to steal
             if gpu_done.is_set():
@@ -2874,6 +3268,11 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
         futs = [ex.submit(_gpu_worker)] + [ex.submit(_cpu_worker) for _ in range(nw)]
         for f in futs:
             f.result()
+    if trk is not None and trk.used:
+        try:
+            _rcb(trk.point())
+        except Exception:
+            pass
     return True
 
 
@@ -3942,6 +4341,9 @@ def _run_structure_gpu_search(conditions, jobs, seed_start, seed_count,
             _run_range(start, half)
             _run_range(start + half, n - half)
             return
+        if not _so or inc:          # (structure-seed-only output: no stats)
+            _k = 1 if inc else 0x10000
+            _gpu_prof_note(n * _k, len(_survivors) * _k)
         if inc:
             # survivors are lows of [start, start+n) (no 2^48 wrap inside a
             # call, see the producer) → back to the exact 64-bit seeds
@@ -3994,6 +4396,30 @@ def _run_structure_gpu_search(conditions, jobs, seed_start, seed_count,
                 except _queue.Full:
                     continue
 
+    # Hide sister seeds / Structure seed only (08/10)
+    _hs, _so = _fam_opts("fam48") if fam48 and not inc else (False, False)
+    _x_large = int(large) | ((1 << 16) if _hs else 0)
+    _pre48 = getattr(raw, "ssa_test_lows48", None) if _so else None
+    if _pre48 is not None:
+        _pre48.argtypes = [ct.c_void_p, ct.c_int, ct.c_int, ct.c_int,
+                           ct.POINTER(ct.c_int64), ct.c_int64,
+                           ct.POINTER(ct.c_int64), ct.c_int64]
+        _pre48.restype = ct.c_int64
+    # statistics (10/10): the Blocks validation counts into _GPU_PROF, and what
+    # the GPU filtered out is credited to the first pre-filtered condition
+    # (seeds: one low = 65 536 seeds in Blocks mode)
+    _xprof = None
+    if _GPU_PROF["buf"] is not None and _GPU_PROF["n"] == n_conds:
+        _xprof = getattr(raw, "ssa_expand_lows_prof", None)
+        if _xprof is not None:
+            _xprof.argtypes = [ct.c_void_p, ct.c_int, ct.c_int, ct.c_int,
+                               ct.POINTER(ct.c_int64), ct.c_int64,
+                               ct.POINTER(ct.c_int64), ct.c_int64, ct.c_int,
+                               ct.POINTER(ct.c_int), ct.POINTER(ct.c_int64)]
+            _xprof.restype = ct.c_int64
+        _jc = getattr(_sc, "LAST_JOB_CONDS", None) or []
+        if _jc:
+            _gpu_prof_target(conditions, _jc[0])
     _producer = _th.Thread(target=_gpu_producer, daemon=True)
     _producer.start()
     _nl_dbg(f"[GPU-DBG] producer started (double-buffer pipeline)")
@@ -4043,11 +4469,21 @@ def _run_structure_gpu_search(conditions, jobs, seed_start, seed_count,
                     break
                 chunk = survivors[off:off + EXPAND_CHUNK]
                 in_arr = (ct.c_int64 * len(chunk))(*chunk)
-                kept = raw.ssa_expand_lows(
-                    arr, ct.c_int(n_conds), ct.c_int(mc_version), ct.c_int(large),
-                    in_arr, ct.c_int64(len(chunk)),
-                    out_buf, ct.c_int64(OUT_CAP), ct.c_int(num_workers),
-                    ct.byref(_cstop))
+                if _pre48 is not None:
+                    # structure seed only: every top-level structure position
+                    # (the GPU checked those it supports), no biome, no expansion
+                    kept = _pre48(arr, n_conds, int(mc_version), int(large),
+                                  in_arr, len(chunk), out_buf, OUT_CAP)
+                elif _xprof is not None:      # statistics on (10/10)
+                    kept = _xprof(arr, n_conds, int(mc_version), _x_large,
+                                  in_arr, len(chunk), out_buf, OUT_CAP,
+                                  int(num_workers), ct.byref(_cstop), _GPU_PROF["buf"])
+                else:
+                    kept = raw.ssa_expand_lows(
+                        arr, ct.c_int(n_conds), ct.c_int(mc_version), ct.c_int(_x_large),
+                        in_arr, ct.c_int64(len(chunk)),
+                        out_buf, ct.c_int64(OUT_CAP), ct.c_int(num_workers),
+                        ct.byref(_cstop))
                 ncopy = min(int(kept), OUT_CAP)
                 for i in range(ncopy):
                     if stop_event.is_set():
@@ -4518,7 +4954,34 @@ def _run_precise_y_postfilter(precise_conds, other_conds, seed_start, seed_count
 
 def evaluate_session(conditions, seed_start, seed_count, mc_version, num_workers,
                      stop_event, on_match, on_progress, search_mode="inc", on_mode=None,
-                     seed_list=None, on_resume=None, on_profile=None, max_found=0):
+                     seed_list=None, on_resume=None, on_profile=None, max_found=0,
+                     options=None):
+    """The search. options (08/10, "48-bit family"): hide_sisters = one seed per
+    family; struct_only = the structure seed alone decides. A nested call (an
+    engine running part of a session) keeps the options of the outer one."""
+    depth = getattr(_OPT_TLS, "depth", 0)
+    if depth == 0:
+        _OPT_TLS.opts = dict(options or {})
+        if _OPT_TLS.opts.get("struct_only") and struct_only_blocker(conditions):
+            # (10/10) the structure seed cannot decide this session: exact
+            # search instead
+            _OPT_TLS.opts["struct_only"] = False
+    _OPT_TLS.depth = depth + 1
+    try:
+        return _evaluate_session_outer(conditions, seed_start, seed_count, mc_version,
+                                       num_workers, stop_event, on_match, on_progress,
+                                       search_mode, on_mode, seed_list, on_resume,
+                                       on_profile, max_found)
+    finally:
+        _OPT_TLS.depth = depth
+        if depth == 0:
+            _OPT_TLS.opts = {}
+
+
+def _evaluate_session_outer(conditions, seed_start, seed_count, mc_version, num_workers,
+                            stop_event, on_match, on_progress, search_mode="inc",
+                            on_mode=None, seed_list=None, on_resume=None, on_profile=None,
+                            max_found=0):
     """The search (see _evaluate_session_impl). With on_profile, the GPU
     pipelines report per-condition statistics too (01/10): their validators
     count into _GPU_PROF, reported every 0.5 s and at the end. The C engine
@@ -4569,6 +5032,48 @@ def evaluate_session(conditions, seed_start, seed_count, mc_version, num_workers
 # 1 k/s, in waves. Now batches of candidates go to worker processes (every core).
 _PF_W = {}
 _PPF_TLS = threading.local()
+# the running search's Pause / Resume callbacks for _hybrid_loop (GPU pipelines,
+# 08/10): set by _evaluate_session_impl0 for a seed-by-seed range search
+_HYB_TLS = threading.local()
+_OPT_TLS = threading.local()          # evaluate_session(options=…) of this thread
+
+
+def _fam_opts(search_mode):
+    """(hide_sisters, struct_only) of the running search ("48-bit family" only)."""
+    o = getattr(_OPT_TLS, "opts", None) or {}
+    if search_mode != "fam48":
+        return False, False
+    so = bool(o.get("struct_only"))
+    return bool(o.get("hide_sisters")) or so, so
+
+
+def struct_only_blocker(conditions):
+    """Why "Structure seed only" cannot decide this session (10/10), or None.
+    That mode only checks the 48-bit POSITIONS of the top-level structures: a
+    linked condition (village near a village, dungeon near a dungeon) was never
+    tested, nor was a 1.16 dungeon / lava lake real (it depends on the biomes,
+    i.e. on the 64 bits) -> results with one dungeon only."""
+    try:
+        act = active_conditions(conditions)
+    except Exception:
+        act = [c for c in conditions if c.get("enabled", True)]
+    for c in act:
+        if c.get("type") in ("dungeon", "lava_lake"):
+            return "1.16 dungeons / lava lakes depend on the biomes (the whole seed)"
+    for c in act:
+        if int(c.get("relative", 0) or 0):
+            return "it has linked conditions, which only a full test checks"
+    return None
+
+
+def struct_only_seed(low):
+    """The one seed shown for a structure seed (Structure seed only): its lower
+    48 bits with fixed pseudo-random upper bits (the same for the same structure
+    seed, so a resumed search does not list it twice)."""
+    low = int(low) & ((1 << 48) - 1)
+    hi = ((low * 0x9E3779B97F4A7C15) >> 40) & 0xFFFF
+    v = low | (hi << 48)
+    return v - (1 << 64) if v >= (1 << 63) else v
 
 
 def _pf_worker_batch(args):
@@ -4581,13 +5086,50 @@ def _pf_worker_batch(args):
         try:
             if kind == "joint":
                 ok, mp = _joint_seed_eval(payload, int(s), mc, lib)
+            elif kind == "full":            # the whole tree, Python evaluator (08/10)
+                ok, summ = evaluate_seed(payload, int(s), mc, lib)
+                if ok:
+                    out.append((int(s), summ or det))
+                continue
+            elif kind == "exy":             # absolute Exact Y conditions: batched below
+                break
             else:
                 ok, mp = _stronghold_session_ok(lib, mc, int(s), payload)
         except Exception:
             ok, mp = False, None
         if ok:
             out.append((int(s), f"{mp[0]},{mp[1]}" if mp else det))
+    if kind == "exy":
+        out = _exy_abs_check(payload, mc, items)
     return out
+
+
+def _exy_abs_check(filt, mc, items):
+    """The ABSOLUTE Exact Y conditions (filt = _precise_filter_params of each) on
+    a batch of candidates, block-exact terrain in C (one context per thread)."""
+    import numpy as _np
+    import terrain as _terr
+    if not items:
+        return []
+    arr = _np.array([int(s) for s, _d in items], dtype=_np.int64)
+    det = {int(s): d for s, d in items}
+    keep = arr
+    for (ax, az, r, ymn, ymx, cv, inv, cov, conf, step) in filt:
+        if len(keep) == 0:
+            break
+        m = _terr.precise_y_filter_ctx(keep, mc, ax, az, r, ymn, ymx, caves=cv, invert=inv,
+                                       sample_step=step, coverage=cov, confidence=conf)
+        if m is None:
+            raise RuntimeError("the terrain library has no Exact Y filter (rebuild it)")
+        keep = keep[m.astype(bool)]
+    return [(int(s), det.get(int(s), "")) for s in keep.tolist()]
+
+
+def _pf_worker_batch2(args):
+    """_pf_worker_batch + (seeds checked, seconds) for the statistics (08/10)."""
+    t = time.perf_counter()
+    out = _pf_worker_batch(args)
+    return out, len(args[3]), time.perf_counter() - t
 
 
 class _ParallelPostFilter:
@@ -4604,11 +5146,20 @@ class _ParallelPostFilter:
         self.ex = None
         self.failed = False
         self.closed = threading.Event()
+        self.n_checked = self.n_passed = 0     # statistics (08/10)
+        self.after_close = None
+        self.secs = 0.0
         self.th = threading.Thread(target=self._loop, name="ssa-postfilter", daemon=True)
         self.th.start()
 
+    def _note(self, n, k, dt):
+        with self.lock:
+            self.n_checked += int(n); self.n_passed += int(k); self.secs += float(dt)
+
     def _sync(self, items):             # no worker processes: in this thread
-        for s, d in _pf_worker_batch((self.kind, self.payload, self.mc, items)):
+        res, n, dt = _pf_worker_batch2((self.kind, self.payload, self.mc, items))
+        self._note(n, len(res), dt)
+        for s, d in res:
             self.emit(s, d)
 
     def _submit_locked(self):
@@ -4625,7 +5176,7 @@ class _ParallelPostFilter:
             self._sync(items)
             return
         try:
-            self.futs.append((self.ex.submit(_pf_worker_batch,
+            self.futs.append((self.ex.submit(_pf_worker_batch2,
                                              (self.kind, self.payload, self.mc, items)), items))
         except Exception:
             self.failed = True
@@ -4638,14 +5189,15 @@ class _ParallelPostFilter:
             if not block and not f.done():
                 continue
             try:
-                res = f.result()
+                res, n, dt = f.result()
             except Exception:           # a worker died: check these here
-                res = _pf_worker_batch((self.kind, self.payload, self.mc, items))
+                res, n, dt = _pf_worker_batch2((self.kind, self.payload, self.mc, items))
             with self.lock:
                 try:
                     self.futs.remove((f, items))
                 except ValueError:
                     continue
+            self._note(n, len(res), dt)
             for s, d in res:
                 self.emit(s, d)
             if block:
@@ -4692,10 +5244,18 @@ def _evaluate_session_impl(*args):
     try:
         return _evaluate_session_impl0(*args)
     finally:
+        _HYB_TLS.on_resume = None
+        _HYB_TLS.on_mode = None
         ppf = getattr(_PPF_TLS, "obj", None)
         if ppf is not None:
             _PPF_TLS.obj = None
             ppf.close()
+            _ac = getattr(ppf, "after_close", None)
+            if _ac is not None:
+                try:
+                    _ac()
+                except Exception:
+                    pass
 
 
 def _evaluate_session_impl0(
@@ -4733,6 +5293,33 @@ def _evaluate_session_impl0(
     enabled = conditions
     if not enabled:
         return
+    # GPU pipelines (_hybrid_loop) scan seed by seed: they can give a resume
+    # point only for an Incremental range search (08/10)
+    _HYB_TLS.on_resume = (on_resume if (seed_list is None and search_mode == "inc")
+                          else None)
+    _HYB_TLS.on_mode = on_mode
+    # "48-bit family" on a seed list (08/10): the list's families, i.e. every
+    # sister seed of each listed seed (before: only the listed seeds)
+    if seed_list is not None and search_mode == "fam48" and not isinstance(seed_list, _SisterList):
+        seed_list = _SisterList(seed_list, stop_event)
+    _hide_sis, _struct_only = _fam_opts(search_mode)
+    if _hide_sis:
+        # one result per 48-bit family; the engines also skip the rest of a
+        # family once it matched (flags below), this keeps it exact
+        _fam_seen = set()
+        _fam_lock = threading.Lock()
+        _fam_base = on_match
+
+        def on_match(_seed, _details="", _b=_fam_base):
+            lo = int(_seed) & ((1 << 48) - 1)
+            with _fam_lock:
+                if lo in _fam_seen:
+                    return
+                _fam_seen.add(lo)
+            if _struct_only:
+                _seed = struct_only_seed(lo)
+                _details = _details or "structure seed only"
+            _b(_seed, _details)
 
     # ── Fast path : first_stronghold eye/maxY SEUL → moteur de l'onglet ──────
     # Si la seule condition est un first_stronghold avec eye/maxY (pas corrupted),
@@ -4904,7 +5491,79 @@ def _evaluate_session_impl0(
     _sh_pf = [c for c in enabled
               if c.get("type") in ("stronghold", "first_stronghold")
               and _stronghold_extra_enabled(c.get("params", {}))]
-    if _joint_children:
+    # Exact Y linked to another condition (08/10): the C engine runs the rest of
+    # the tree on every thread, each of its seeds is checked with the whole tree
+    # by worker processes (statistics, Pause / Resume as a C search)
+    # (absolute Exact Y too: the old streaming post-filter had no statistics and
+    # no Pause, and kept a single thread on the candidates)
+    _exy_view = None
+    if (not _joint_children and not _sh_pf
+            and any(c.get("type") == "precise_y" for c in enabled)):
+        _exy_view = _exy_c_view(enabled)
+        if _exy_view is not None:
+            try:
+                if _build_ssacond_array(_exy_view, CubiomesLib()._lib) is None:
+                    _exy_view = None
+            except Exception:
+                _exy_view = None
+    if _exy_view is not None:
+        _x_full = list(enabled)
+        _x_abs = all(int(c.get("relative", 0) or 0) == 0 for c in _x_full
+                     if c.get("type") == "precise_y")
+        _x_kind, _x_pay = "full", _x_full
+        if _x_abs:
+            # only absolute Exact Y: the candidates need just those (batched C)
+            try:
+                import terrain as _terr_x, numpy as _np_x
+                if _terr_x.precise_y_filter_ctx(_np_x.zeros(1, _np_x.int64), mc_version,
+                                                0, 0, 0, -(1 << 30), 1 << 30) is not None:
+                    _x_kind = "exy"
+                    _x_pay = [_precise_filter_params(c) for c in _x_full
+                              if c.get("type") == "precise_y"]
+            except Exception:
+                pass
+        _x_base = on_match
+        max_found = 0       # the engine's matches are candidates, not results
+        _ppf_x = _ParallelPostFilter(_x_kind, _x_pay, mc_version, num_workers, _x_base)
+        _PPF_TLS.obj = _ppf_x
+        _x_rows = _exy_view_rows(_x_full)          # view row -> session row
+        enabled = _exy_view
+        if on_mode is not None:
+            try: on_mode(("note", "Exact Y checked on the C engine's candidates"))
+            except Exception: pass
+        if on_profile is not None:
+            _x_prof = on_profile
+            _x_hz = _ticks_hz()
+
+            _x_last = []
+
+            def on_profile(rows, total, _n=len(_x_full)):
+                _x_last[:] = [(rows, total)]
+                full = [None] * _n
+                for k, r in enumerate(rows):
+                    if k < len(_x_rows):
+                        full[_x_rows[k]] = r
+                with _ppf_x.lock:
+                    nc, npass, secs = _ppf_x.n_checked, _ppf_x.n_passed, _ppf_x.secs
+                # the engine times 1 seed in 32: the same scale for the post-filter
+                tk = int(secs * _x_hz / 32) if _x_hz else 0
+                ex = [i for i, c in enumerate(_x_full) if c.get("type") == "precise_y"]
+                for j, i in enumerate(ex):
+                    full[i] = (nc, npass, tk if j == 0 else 0, nc, npass)
+                for i in range(_n):
+                    if full[i] is None:
+                        full[i] = (0, 0, 0, 0, 0)
+                _x_prof(full, int(total) + tk)
+            # once every candidate is checked (end / pause): the final numbers
+            _ppf_x.after_close = lambda: _x_last and on_profile(*_x_last[0])
+
+        def _exy_postfilter_on_match(_seed, _details=""):
+            if stop_event is not None and stop_event.is_set():
+                _pf_pending.append(int(_seed))
+                return
+            _ppf_x.add(_seed, _details)
+        on_match = _exy_postfilter_on_match
+    elif _joint_children:
         # ── Linking JOINT scan_128 ────────────────────────────────────────────
         # Le moteur C a sérialisé le stronghold scan_128 en ANNEAU et émet donc
         # « enfant (village) près d'UN stronghold » — candidats RARES. Ici on
@@ -4961,6 +5620,22 @@ def _evaluate_session_impl0(
         on_match = _sh_postfilter_on_match
 
     if seed_list is not None:
+        if isinstance(seed_list, _SisterList):
+            if on_mode is not None:
+                on_mode(1)                     # progress in families of 65 536 seeds
+            if _evaluate_sisters(enabled, seed_list, mc_version, num_workers,
+                                 stop_event, on_match, on_progress):
+                return
+            if on_mode is not None:
+                on_mode(0)                     # Python: the expanded seeds one by one
+            for _k, _low in enumerate(seed_list.lows):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                _evaluate_seed_list(enabled, list(_SisterList([_low])), mc_version,
+                                    num_workers, stop_event, on_match, None)
+                if on_progress:
+                    on_progress((_k + 1) << 16, len(seed_list))
+            return
         _evaluate_seed_list(enabled, seed_list, mc_version, num_workers,
                             stop_event, on_match, on_progress)
         return
@@ -5017,203 +5692,109 @@ def _evaluate_session_impl0(
     # POURQUOI : le moteur C-natif (ssa_engine_create) n'appelle jamais le
     # code Python de criteria.py — écrire dans _CRUNCH_CONFIG n'avait donc
     # aucun effet quand le moteur C prenait la main.
-    _crunch_cond = next((c for c in enabled if c.get("type") == "crunchiness"), None)
-    # The crunchiness GPU short-circuit validates each surviving candidate
-    # single-threaded on the CPU. That's great for light sessions, but if the
-    # session contains a spiral iterator (or similar heavy area scan), the
-    # per-candidate validation dominates: one core crawls, the GPU sits idle,
-    # and the search appears to do nothing. In that case skip the short-circuit
-    # and let the multi-threaded C engine handle crunchiness AND the spiral
-    # together (it evaluates crunchiness natively — same result — in parallel,
-    # short-circuiting per seed, exactly like the working no-crunchiness search).
-    _has_heavy_iter = any(c.get("type") == "spiral" and c.get("enabled", True)
-                          for c in enabled)
-    if _crunch_cond and not _has_heavy_iter:
-        _params      = _crunch_cond.get("params", {})
-        _use_gpu     = bool(_params.get("use_gpu", False))
-        _thresh      = float(_params.get("threshold", 0.10))
-        _climate     = int(_params.get("climate", 2))
-        _mode        = int(_params.get("mode", 0))
-
-        # GPU path works for any weighting — the kernel uses Commission weights
-        # internally as a pre-filter; CPU re-validates with the exact weights.
-        if _use_gpu:
+    # 08/10: the GPU scores every seed and the survivors go to the hybrid loop
+    # (_hybrid_loop): ALL the CPU threads validate them with the C engine and
+    # full-test raw seeds when the GPU is ahead, with Pause / Resume. Before, a
+    # session with a spiral iterator never took this path (one CPU thread
+    # validated: too slow), so a ticked "GPU" did nothing; and only the FIRST
+    # crunchiness condition was looked at, even when it was not the GPU one.
+    _crunch_cond = next((c for c in enabled if c.get("type") == "crunchiness"
+                         and int(c.get("relative", 0) or 0) == 0
+                         and (c.get("params") or {}).get("use_gpu")), None)
+    if _crunch_cond is not None:
+        if True:
             try:
                 import gaider_cuda as _gc
-
-                if _gc.is_available():
-                    _lib_cpu     = CubiomesLib()
-
-                    # ── C-native candidate validation (spiral-aware) ──────────
-                    # The CPU step must re-check the FULL condition tree on every
-                    # GPU candidate. Doing that with the pure-Python evaluate_seed
-                    # re-runs the entire spiral scan (tens of thousands of
-                    # positions × every child) PER seed → it FREEZES on imported
-                    # cubiomes sessions whose root is a wide spiral iterator
-                    # (e.g. box ±3.75M / step 32768 ≈ 52k positions). The C engine
-                    # ssa_test_seeds_batch is the same one the normal search uses:
-                    # it evaluates the spiral AND crunchiness EXACTLY (crunch
-                    # params are serialized identically in _build_ssacond_array)
-                    # and is orders of magnitude faster. Fall back to the Python
-                    # validator only if the C array cannot be built.
-                    import numpy as _np
-                    _raw_v   = _lib_cpu._lib
-                    _v_res   = _build_ssacond_array(enabled, _raw_v)
+                import numpy as _np
+                if not _gc.is_available():
+                    raise RuntimeError("the CUDA library is not available")
+                if not _gc.has_exact_crunchiness():
+                    raise RuntimeError("the GPU library is older than the exact "
+                                       "crunchiness filter — rebuild it "
+                                       "(py tools/build_native.py)")
+                _raw_v = CubiomesLib()._lib
+                _v_res = _build_ssacond_array(enabled, _raw_v)
+                if _v_res is None:
+                    raise RuntimeError("this session's tree is not supported by the C engine")
+                _v_arr, _v_nc = _v_res
+                _raw_v.ssa_test_seeds_batch.argtypes = [
+                    ct.c_void_p, ct.c_int, ct.c_int, ct.c_int,
+                    ct.POINTER(ct.c_int64), ct.c_int64,
+                    ct.POINTER(ct.c_int64), ct.c_int64]
+                _raw_v.ssa_test_seeds_batch.restype = ct.c_int64
+                try:
+                    from cubiomes_wrap import get_large_biomes
+                    _v_large = 1 if get_large_biomes() else 0
+                except Exception:
                     _v_large = 0
-                    if _v_res is not None:
-                        _v_arr, _v_nc = _v_res
-                        try:
-                            _raw_v.ssa_test_seeds_batch.argtypes = [
-                                ct.c_void_p, ct.c_int, ct.c_int, ct.c_int,
-                                ct.POINTER(ct.c_int64), ct.c_int64,
-                                ct.POINTER(ct.c_int64), ct.c_int64]
-                            _raw_v.ssa_test_seeds_batch.restype = ct.c_int64
-                        except Exception:
-                            _v_res = None
-                        try:
-                            from cubiomes_wrap import get_large_biomes
-                            _v_large = 1 if get_large_biomes() else 0
-                        except Exception:
-                            _v_large = 0
+                # the crunchiness entry of the C array (same order as `enabled`),
+                # so the GPU uses the very parameters the CPU re-test uses (p96)
+                _pos = next(i for i, c in enumerate(enabled) if c is _crunch_cond)
+                _cc = _v_arr[_pos]
+                if int(_cc.ctype) != 19:
+                    raise RuntimeError("the crunchiness condition was not found in the C array")
+                if not hasattr(_raw_v, "ssa_crunch_gpu_params"):
+                    raise RuntimeError("libcubiomes is older than the exact crunchiness "
+                                       "filter — rebuild it (py tools/build_native.py --cubiomes)")
+                _ch = (ct.c_uint64 * 2)(); _ol = (ct.c_uint64 * 6)(); _oh = (ct.c_uint64 * 6)()
+                _wa = (ct.c_float * 6)(); _wb = (ct.c_float * 6)()
+                _raw_v.ssa_crunch_gpu_params.restype = ct.c_int
+                _raw_v.ssa_crunch_gpu_params.argtypes = [
+                    ct.c_int, ct.c_int, ct.c_uint32, ct.POINTER(ct.c_float),
+                    ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint64),
+                    ct.POINTER(ct.c_float), ct.POINTER(ct.c_float), ct.c_int]
+                _kp = _raw_v.ssa_crunch_gpu_params(
+                    int(_cc.crunch_climate), int(_v_large), int(_cc.crunch_octave_mask),
+                    _cc.crunch_weights, _ch, _ol, _oh, _wa, _wb, 6)
+                _gp = dict(clim_hash=(_ch[0], _ch[1]), oct_lo=list(_ol[:_kp]),
+                           oct_hi=list(_oh[:_kp]), w_a=list(_wa[:_kp]), w_b=list(_wb[:_kp]),
+                           threshold=float(_cc.crunch_threshold), mode_flag=int(_cc.crunch_mode))
 
-                    # Large batch = fewer kernel launches = GPU stays busy.
-                    # Double-buffer: while CPU validates batch N, GPU runs batch N+1.
-                    BATCH        = 1 << 26          # 64 M seeds per GPU batch
-                    MAX_RES      = 1 << 20          # 1 M candidates max per batch
-                    _total_seeds = seed_count if seed_count > 0 else (1 << 48)
-                    _done        = 0
+                def _scan(ss, n):
+                    ss = ((int(ss) + (1 << 63)) % (1 << 64)) - (1 << 63)
+                    _t, _c = _gc.crunchiness_filter_w(ss, int(n), max_results=int(n), **_gp)
+                    return _np.asarray(_c, _np.int64)
 
-                    # ── Double-buffer pipeline ────────────────────────────────
-                    # Slot A: currently being validated by CPU
-                    # Slot B: currently being scanned by GPU (in a thread)
-                    # They alternate each iteration so GPU never waits for CPU.
-                    import concurrent.futures as _cf
+                # a threshold that keeps most seeds: the GPU would not help
+                _probe = 1 << 20
+                _kept0 = len(_scan(seed_start, _probe))
+                if _kept0 > _probe // 20:
+                    raise RuntimeError(f"this crunchiness threshold keeps {_kept0 / _probe:.0%} "
+                                       f"of the seeds: the GPU pre-filter would not help")
 
-                    # p96: the GPU computes EXACTLY the CPU score (the octaves
-                    # and A/B weights of THIS condition, Large Biomes). Before,
-                    # it used fixed Commission weights on the wrong octaves:
-                    # not a superset of the CPU test → most results were missed
-                    # (« 400× faster but far fewer results »).
-                    if not _gc.has_exact_crunchiness():
-                        raise RuntimeError("the GPU library is older than the exact "
-                                           "crunchiness filter — rebuild it "
-                                           "(py tools/build_native.py)")
-                    _cc = None
-                    if _v_res is not None:
-                        # the crunchiness entry of the C array (ctype 19), so the GPU
-                        # uses the very parameters the CPU re-test uses
-                        _cc = next((_v_arr[i] for i in range(_v_nc)
-                                    if int(_v_arr[i].ctype) == 19), None)
-                    if _cc is not None and int(_cc.parent_idx) != 0:
-                        # under a NOT / OR / another condition, it is not a
-                        # pre-filter of the whole session
-                        raise RuntimeError("the crunchiness condition is not at the top "
-                                           "level of the session")
-                    if _cc is None or not hasattr(_raw_v, "ssa_crunch_gpu_params"):
-                        raise RuntimeError("libcubiomes is older than the exact crunchiness "
-                                           "filter — rebuild it (py tools/build_native.py --cubiomes)")
-                    _ch = (ct.c_uint64 * 2)(); _ol = (ct.c_uint64 * 6)(); _oh = (ct.c_uint64 * 6)()
-                    _wa = (ct.c_float * 6)(); _wb = (ct.c_float * 6)()
-                    _raw_v.ssa_crunch_gpu_params.restype = ct.c_int
-                    _raw_v.ssa_crunch_gpu_params.argtypes = [
-                        ct.c_int, ct.c_int, ct.c_uint32, ct.POINTER(ct.c_float),
-                        ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint64),
-                        ct.POINTER(ct.c_float), ct.POINTER(ct.c_float), ct.c_int]
-                    _kp = _raw_v.ssa_crunch_gpu_params(
-                        int(_cc.crunch_climate), int(_v_large), int(_cc.crunch_octave_mask),
-                        _cc.crunch_weights, _ch, _ol, _oh, _wa, _wb, 6)
-                    _gp = dict(clim_hash=(_ch[0], _ch[1]), oct_lo=list(_ol[:_kp]),
-                               oct_hi=list(_oh[:_kp]), w_a=list(_wa[:_kp]), w_b=list(_wb[:_kp]),
-                               threshold=float(_cc.crunch_threshold), mode_flag=int(_cc.crunch_mode))
+                _emit_lock = threading.Lock()
 
-                    def _gpu_batch(ss, n):
-                        """Run one GPU batch, return (total_found, candidates).
-                        Une erreur GPU n'est plus convertie en « 0 candidat »
-                        (recherche vide en silence) : elle remonte au handler
-                        ci-dessous, qui repasse proprement sur le moteur CPU.
-                        Si le buffer MAX_RES déborde, le lot est re-découpé au
-                        lieu de perdre les candidats en trop."""
-                        _t, _c = _gc.crunchiness_filter_w(ss, n, max_results=MAX_RES, **_gp)
-                        if _t <= MAX_RES:
-                            return (_t, _c)
-                        if _t > max(MAX_RES, n // 20):
-                            raise RuntimeError(
-                                f"this crunchiness threshold keeps {_t / n:.0%} of the seeds: "
-                                f"the GPU pre-filter would not help")
-                        _h = n // 2
-                        _t1, _c1 = _gpu_batch(ss, _h)
-                        _t2, _c2 = _gpu_batch(ss + _h, n - _h)
-                        return (_t1 + _t2, _c1 + _c2)
+                def _validate(seeds_i64):
+                    if seeds_i64 is None or len(seeds_i64) == 0:
+                        return
+                    seeds_i64 = _np.ascontiguousarray(seeds_i64, _np.int64)
+                    nn = len(seeds_i64)
+                    out = _np.empty(nn, _np.int64)
+                    kept = _tsb(_raw_v, _v_arr, ct.c_int(_v_nc), ct.c_int(mc_version),
+                                ct.c_int(_v_large),
+                                seeds_i64.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn),
+                                out.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(nn))
+                    for k in range(int(kept)):
+                        if stop_event.is_set():
+                            break
+                        with _emit_lock:
+                            on_match(int(out[k]), "")
 
-                    with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                        # Kick off the first GPU batch immediately
-                        _n0  = min(BATCH, _total_seeds)
-                        _fut = _ex.submit(_gpu_batch, seed_start + _done, _n0)
-                        _done += _n0
-                        _pend_n = _n0                      # seeds of the running batch (stats)
-                        _gpu_prof_target(enabled, _crunch_cond)
+                def _warmup():                 # build g_child_order single-threaded
+                    s0 = _np.zeros(1, _np.int64); o0 = _np.empty(1, _np.int64)
+                    _raw_v.ssa_test_seeds_batch(
+                        _v_arr, ct.c_int(_v_nc), ct.c_int(mc_version), ct.c_int(_v_large),
+                        s0.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(1),
+                        o0.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(1))
 
-                        while True:
-                            if stop_event.is_set():
-                                _fut.cancel()
-                                break
-
-                            # Collect result of current GPU batch
-                            _total_found, _candidates = _fut.result()
-                            _gpu_prof_note(_pend_n, len(_candidates) if _candidates is not None else 0)
-
-                            # Immediately launch the next GPU batch (overlaps CPU validation)
-                            if _done < _total_seeds and not stop_event.is_set():
-                                _nn  = min(BATCH, _total_seeds - _done)
-                                _fut = _ex.submit(_gpu_batch, seed_start + _done, _nn)
-                                _done += _nn
-                                _pend_n = _nn
-                            else:
-                                _fut = None
-
-                            # CPU validates candidates from the batch we just collected
-                            if _total_found > MAX_RES:
-                                import sys
-                                print(
-                                    f"[WARNING] GPU batch overflow: {_total_found} hits "
-                                    f"but MAX_RES={MAX_RES}. Lower threshold or increase MAX_RES.",
-                                    file=sys.stderr,
-                                )
-                            if _candidates:
-                                if _v_res is not None:
-                                    # Fast path: validate the whole batch in C
-                                    # (spiral-aware) in a single call.
-                                    _ci  = _np.ascontiguousarray(_candidates, _np.int64)
-                                    _cn  = len(_ci)
-                                    _co  = _np.empty(_cn, _np.int64)
-                                    _kept = _tsb(_raw_v, 
-                                        _v_arr, ct.c_int(_v_nc), ct.c_int(mc_version),
-                                        ct.c_int(_v_large),
-                                        _ci.ctypes.data_as(ct.POINTER(ct.c_int64)),
-                                        ct.c_int64(_cn),
-                                        _co.ctypes.data_as(ct.POINTER(ct.c_int64)),
-                                        ct.c_int64(_cn))
-                                    for _k in range(int(_kept)):
-                                        if stop_event.is_set():
-                                            break
-                                        on_match(int(_co[_k]), "")
-                                else:
-                                    # Fallback: pure-Python validation (correct but
-                                    # slow on spiral-rooted sessions).
-                                    for _seed in _candidates:
-                                        if stop_event.is_set():
-                                            break
-                                        _ok, _summary = evaluate_seed(
-                                            enabled, _seed, mc_version, _lib_cpu)
-                                        if _ok:
-                                            on_match(_seed, _summary)
-
-                            on_progress(_done, _total_seeds)
-
-                            if _fut is None or _done >= _total_seeds:
-                                break
-
-                    return   # chemin CUDA terminé, on ne passe pas au moteur C
+                if on_mode is not None:
+                    try: on_mode(3)            # 3 = GPU (CUDA) + C validation
+                    except Exception: pass
+                _gpu_prof_target(enabled, _crunch_cond)
+                _total_seeds = seed_count if seed_count > 0 else (1 << 48)
+                _hybrid_loop(_scan, _validate, _warmup, seed_start, _total_seeds,
+                             num_workers, stop_event, on_progress)
+                return   # chemin CUDA terminé, on ne passe pas au moteur C
             except Exception as _gpu_ex:
                 import traceback; traceback.print_exc()
                 if on_mode is not None:
@@ -5419,6 +6000,8 @@ def _evaluate_session_impl0(
         except Exception:
             large_bit = 0
         large_encoded = large_bit | ((mode_code & 0xFF) << 8)
+        _hs, _so = _fam_opts(search_mode)
+        large_encoded |= ((1 if _hs else 0) | (2 if _so else 0)) << 16
 
         # Pass NULL callback — matches are delivered via ring buffer drain instead.
         # This eliminates the GIL bottleneck: the C threads never need to acquire
@@ -5601,23 +6184,31 @@ def _evaluate_session_impl0(
                 raise
 
     # ── Python fallback ──────────────────────────────────────────────────────
+    # (08/10) the seeds are evaluated by worker processes (every thread chosen),
+    # not one by one in this thread; Pause gives the exact resume point (every
+    # seed handed in is checked before the search returns)
     seed = seed_start
     done = 0
     progress_every = 500
     last_prog = 0
-
-    while True:
-        if stop_event.is_set():
-            break
-        if seed_count > 0 and done >= seed_count:
-            break
-        passed, summary = evaluate_seed(enabled, seed, mc_version, lib)
-        if passed:
-            on_match(seed, summary)
-        done += 1
-        seed += 1
-        if done - last_prog >= progress_every:
-            on_progress(done, total)
-            last_prog = done
-
+    if on_mode is not None:
+        try: on_mode(0)
+        except Exception: pass
+    _ppf_py = _ParallelPostFilter("full", list(enabled), mc_version, num_workers, on_match)
+    try:
+        while True:
+            if stop_event.is_set():
+                break
+            if seed_count > 0 and done >= seed_count:
+                break
+            _ppf_py.add(((seed + (1 << 63)) % (1 << 64)) - (1 << 63), "")
+            done += 1
+            seed += 1
+            if done - last_prog >= progress_every:
+                on_progress(done, total)
+                last_prog = done
+    finally:
+        _ppf_py.close()
     on_progress(done, total)
+    if on_resume is not None and search_mode == "inc":
+        on_resume(((seed + (1 << 63)) % (1 << 64)) - (1 << 63))

@@ -72,5 +72,7 @@ class WorldState(QObject):
         self.changed.emit()
 
     def structure_available(self, key: str) -> bool:
+        if key in ("dungeon", "lava_lake"):          # (10/10) 1.16 features only
+            return int(self.mc) in (19, 20)
         need = cw.STRUCTURE_MIN_VERSION.get(key)
         return need is None or self.mc >= need

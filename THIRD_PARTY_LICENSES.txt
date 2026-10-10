@@ -67,6 +67,15 @@ Stronghold piece generator used to simulate portal rooms. Used with credit;
 licence to be confirmed with the author before a public release.
 
 ==============================================================================
+seed-checker — jellejurre (Minecraft check, tools/checker)
+https://github.com/jellejurre/seed-checker
+==============================================================================
+
+Used to confirm results with the real Minecraft world generation. SSA ships a
+modified copy of its SeedChunkGenerator.java (tools/checker/overrides); the
+upstream repository does not state a licence. Used with credit.
+
+==============================================================================
 Qt 6 and PySide6 / Shiboken6 — The Qt Company (LGPL-3.0)
 https://www.qt.io  ·  https://pypi.org/project/PySide6/
 ==============================================================================

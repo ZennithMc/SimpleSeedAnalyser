@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import threading
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QRect, QRectF, Qt, QTime, Signal
+from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QObject, QRect, QRectF, Qt, QTime, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from .widgets import AdaptiveButton, user_path, remember_path
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QTimeEdit, QFrame, QHBoxLayout,
@@ -62,6 +62,11 @@ def fmt_int(n):
 
 
 def fmt_rate(r):
+    # SI prefixes up to exa (08/10): "48-bit family" on the GPU counts
+    # 65 536 seeds per family → "23456294.34G/s" was unreadable
+    for v, u in ((1e18, "E"), (1e15, "P"), (1e12, "T")):
+        if r >= v:
+            return f"{r / v:.2f} {u}/s"
     if r >= 1e9:
         return f"{r / 1e9:.2f} G/s"
     if r >= 1e6:
@@ -491,6 +496,30 @@ class ResultsModel(QAbstractTableModel):
         self.beginResetModel(); self.rows = []; self.loc = {}; self.mcs = {}; self._rows_idx = None
         self.endResetModel()
 
+    def remove_rows(self, rows):
+        """Removes these rows (indices), contiguous runs at a time from the
+        bottom (the view keeps its scroll / selection model coherent). Returns
+        the removed seeds."""
+        rows = sorted({int(r) for r in rows if 0 <= int(r) < len(self.rows)})
+        gone = [self.rows[r][0] for r in rows]
+        while rows:
+            hi = rows.pop()
+            lo = hi
+            while rows and rows[-1] == lo - 1:
+                lo = rows.pop()
+            self.beginRemoveRows(QModelIndex(), lo, hi)
+            del self.rows[lo:hi + 1]
+            self.endRemoveRows()
+        self._rows_idx = None
+        keep = {s for s, _d in self.rows}
+        for s in gone:
+            if s not in keep:
+                self.loc.pop(s, None)
+                self.mcs.pop(s, None)
+        if gone:                                      # "#" column renumbered
+            self.dataChanged.emit(self.index(0, 0), self.index(max(0, len(self.rows) - 1), 0))
+        return gone
+
 
 class _SeedCellDelegate(QStyledItemDelegate):
     """Seed on the first line, where the conditions are satisfied under it
@@ -537,6 +566,20 @@ class _SeedCellDelegate(QStyledItemDelegate):
         p.restore()
 
 
+class _DeleteKeyFilter(QObject):
+    """Delete / Backspace on the results table (auto-repeat included)."""
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.KeyPress and ev.key() in (Qt.Key.Key_Delete,
+                                                               Qt.Key.Key_Backspace):
+            self.fn()
+            return True
+        return False
+
+
 class _Explain(QObject):
     done = Signal(object, object)   # 64-bit seeds: never Signal(int) (32-bit)                        # seed, result
 
@@ -561,9 +604,20 @@ class SessionsPage(QWidget):
         from .mc_confirm import McConfirm
         self._mcc = McConfirm(self)                  # "Broken portal": Minecraft confirms (03/10)
         self._mcc.one.connect(self._mc_one)
+        from .spawn_confirm import SpawnConfirm      # 1.16 buggy spawns (09/10)
+        self._spc = SpawnConfirm(self)
+        self._spc.one.connect(self._spawn_one)
         self._mcc_pending = {}                       # seed -> details, waiting for Minecraft
         self._mcc_rejected = 0
         self._mcc_target = None                      # "Stop after N results": confirmed ones
+        self._spw_pending = {}                       # (09/10) buggy-spawn search: waiting
+        self._spw_dropped = 0                        # … ordinary spawns, not shown
+        from .feature_confirm import FeatureConfirm  # (10/10) 1.16 dungeons / lava lakes
+        self._ftc = FeatureConfirm(self)
+        self._ftc.one.connect(self._feat_one)
+        self._ftc_pending = {}
+        self._ftc_dropped = 0
+        self._ftc_feats = {}                         # seed -> [Feat] confirmed (/tp with Y)
 
         outer = QVBoxLayout(self); outer.setContentsMargins(0, 2, 10, 4); outer.setSpacing(8)
         split = QSplitter(Qt.Orientation.Horizontal); split.setHandleWidth(10)
@@ -579,6 +633,7 @@ class SessionsPage(QWidget):
         self.picker.cancelled.connect(self._close_form)
         self.left_stack.addWidget(self.picker)
         self.form = ConditionForm()
+        self.form.parent_lookup = lambda uid: self.model.get(uid)   # (10/10 ter) height link
         self.form.saved.connect(self._form_saved); self.form.cancelled.connect(self._close_form)
         self.form.preview.connect(self._form_preview)
         self.form.pickRequested.connect(self._pick)
@@ -696,20 +751,19 @@ class SessionsPage(QWidget):
         top.addWidget(self._tb("folder", "Open a .session file  (Ctrl+O)", self._load))
         top.addWidget(self._tb("save", "Save  (Ctrl+S)\nA new session goes to the library; "
                                        "a library session or a file is updated in place.", self._save))
-        more = QToolButton(); icons.bind(more, "chevron-down", 17); more.setObjectName("PanelTool")
-        more.setToolTip("More"); more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        # 08/10: the session's other actions, each once (the icons are not
+        # repeated here; condition actions are in the conditions bar below)
+        more = QToolButton(); icons.bind(more, "more", 17); more.setObjectName("PanelTool")
+        more.setToolTip("More session actions")
+        more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         m = QMenu(more)
-        m.addAction("Session library…\tCtrl+L", self.open_library)
-        m.addAction("Save to library as new…", self._save_library_new)
-        m.addAction("Rename the session…", self._rename_session)
-        m.addSeparator()
-        m.addAction("Save as file…", self._save_as)
-        m.addAction("New empty session", self._new_session)
-        rec = m.addMenu("Recent sessions")
+        rec = m.addMenu("Open a recent session")
         rec.aboutToShow.connect(lambda: self._fill_recent(rec))
         m.addSeparator()
-        m.addAction("Copy conditions\tCtrl+C", self._copy)
-        m.addAction("Paste conditions\tCtrl+V", self._paste)
+        m.addAction("Save to the library as a new session…", self._save_library_new)
+        m.addAction("Save as a .session file…", self._save_as)
+        m.addSeparator()
+        m.addAction("Rename the session…", self._rename_session)
         more.setMenu(m)
         top.addWidget(more)
         v.addLayout(top)
@@ -728,9 +782,25 @@ class SessionsPage(QWidget):
         self.b_dup = self._tb("copy", "Duplicate with its dependent conditions  (Ctrl+D)", self._duplicate)
         self.b_up = self._tb("chevron-up", "Move up", lambda: self._move(-1))
         self.b_down = self._tb("chevron-down", "Move down", lambda: self._move(1))
-        self.b_del = self._tb("trash", "Delete (with its dependent conditions)  (Del)", self._remove)
+        self.b_del = self._tb("trash", "Delete the selected condition(s)  (Del)\n"
+                                       "Conditions linked to it stay, relative to the origin.",
+                              self._remove)
         for b in (self.b_edit, self.b_dup, self.b_up, self.b_down, self.b_del):
             bar.addWidget(b)
+        bar.addSpacing(6)
+        cm = QToolButton(); icons.bind(cm, "more", 17); cm.setObjectName("PanelTool")
+        cm.setToolTip("More condition actions")
+        cm.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        cmenu = QMenu(cm)
+        cmenu.addAction("Copy the selected conditions\tCtrl+C", self._copy)
+        cmenu.addAction("Paste conditions\tCtrl+V", self._paste)
+        cmenu.addSeparator()
+        cmenu.addAction("Enable all", lambda: self._set_all_enabled(True))
+        cmenu.addAction("Disable all", lambda: self._set_all_enabled(False))
+        cmenu.addSeparator()
+        self.act_del_all = cmenu.addAction("Delete all conditions…", self._delete_all)
+        cm.setMenu(cmenu)
+        bar.addWidget(cm)
         bar.addStretch(1)
         self.b_stats = self._tb("analyze", "Stats: share of the search time and pass rate of "
                                            "every condition (shown after a search)", self._toggle_stats)
@@ -797,6 +867,10 @@ class SessionsPage(QWidget):
         _cp.activated.connect(lambda: QGuiApplication.clipboard().setText("\n".join(
             str(self.results.rows[r][0]) for r in
             sorted({i.row() for i in self.table.selectionModel().selectedRows()}))))
+        # Delete (08/10): removes the selected results and selects the one
+        # before — keep Delete pressed (or press it again) to go on upward
+        self._del_filter = _DeleteKeyFilter(self._delete_results, self.table)
+        self.table.installEventFilter(self._del_filter)
         self.table.verticalHeader().hide()
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -830,7 +904,34 @@ class SessionsPage(QWidget):
         self.mode = Segmented(list(MODES), "Incremental")
         for b in self.mode.buttons.values():
             b.setToolTip(MODE_TIPS)
-        labeled("Mode", self.mode)
+        # 48-bit family options (08/10), in the label row like Session / Saved
+        mcol = QVBoxLayout(); mcol.setSpacing(2)
+        mhead = QHBoxLayout(); mhead.setSpacing(4); mhead.setContentsMargins(0, 0, 0, 0)
+        mlab = QLabel("MODE"); mlab.setObjectName("FieldLabel"); mlab.setToolTip(MODE_TIPS)
+        mhead.addWidget(mlab); mhead.addStretch(1)
+        self.opt_hide = QPushButton("1 per family"); self.opt_hide.setCheckable(True)
+        self.opt_hide.setToolTip(
+            "Hide sister seeds: one result per 48-bit family (the first seed found;\n"
+            "the rest of the family is skipped → much faster). Run the list later\n"
+            "as a seed list in 48-bit family mode to test every sister seed.")
+        self.opt_struct = QPushButton("Structure seed only"); self.opt_struct.setCheckable(True)
+        self.opt_struct.setToolTip(
+            "Structure seed only: a 48-bit value whose structure POSITIONS pass is a\n"
+            "result, whatever the biomes (the structures may not generate in game).\n"
+            "Only the top-level structure conditions are tested; one seed per\n"
+            "structure seed (random upper bits). GPU compatible.")
+        for b in (self.opt_hide, self.opt_struct):
+            b.setStyleSheet("font-size: 7.5pt; padding: 0px 7px; min-height: 14px; max-height: 16px;")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            mhead.addWidget(b)
+        from PySide6.QtCore import QSettings as _QS
+        _qs = _QS("SSA", "SimpleSeedAnalyser")
+        self.opt_hide.setChecked(str(_qs.value("sessions/hide_sisters", "false")).lower() == "true")
+        self.opt_struct.setChecked(str(_qs.value("sessions/struct_only", "false")).lower() == "true")
+        self.opt_hide.toggled.connect(lambda on: self._fam_opt_changed("hide_sisters", on))
+        self.opt_struct.toggled.connect(lambda on: self._fam_opt_changed("struct_only", on))
+        mcol.addLayout(mhead); mcol.addWidget(self.mode)
+        row.addLayout(mcol)
         self.start_seed = QLineEdit("0"); self.start_seed.setFixedWidth(190)
         self.start_seed.setFont(theme.mono_font(9.5))
         sw = QWidget(); sl = QHBoxLayout(sw); sl.setContentsMargins(0, 0, 0, 0); sl.setSpacing(2)
@@ -879,6 +980,13 @@ class SessionsPage(QWidget):
         from .start_source import hide_dice_keep_place
         hide_dice_keep_place(self._dice, self._start_mode == "Saved")   # no random Saved start
         self.start_seed.textEdited.connect(self._start_edited)
+        # 48-bit family: the start is a 48-bit value → no Saved start (08/10)
+        self._saved_tip = self.start_src.buttons["Saved"].toolTip()
+        self._saved_before_fam = False
+        self.mode.group.buttonToggled.connect(lambda *_: self._sync_saved_for_mode())
+        self.mode.group.buttonToggled.connect(lambda *_: self._sync_fam_opts())
+        self._sync_saved_for_mode()
+        self._sync_fam_opts()
         self.threads = QSpinBox(); self.threads.setRange(1, os.cpu_count() or 4)
         self.threads.setValue(max(1, (os.cpu_count() or 4) // 2))
         labeled("Threads", self.threads, "CPU threads. Can be changed while paused.")
@@ -943,6 +1051,8 @@ class SessionsPage(QWidget):
 
     def _model_changed(self):
         self.tree._check = None                      # ✓/✗ were for the old conditions
+        if hasattr(self, "opt_struct"):
+            self._sync_fam_opts()
         if hasattr(self, "b_undo"):
             self._sync_undo()
         if hasattr(self, "b_stats"):
@@ -1015,14 +1125,19 @@ class SessionsPage(QWidget):
     def _sync_undo(self):
         m = self.model
         self.b_undo.setEnabled(m.can_undo()); self.b_redo.setEnabled(m.can_redo())
-        self.b_undo.setToolTip("Undo" + (f": {m.undo_text()}" if m.can_undo() else "") + "  (Ctrl+Z)")
-        self.b_redo.setToolTip("Redo" + (f": {m.redo_text()}" if m.can_redo() else "") + "  (Ctrl+Y)")
+        self.b_undo.setToolTip("Undo" + (f": {m.undo_text()}" if m.can_undo() else
+                                         "  (Ctrl+Z)\n\nUnavailable: nothing to undo yet.")
+                               + ("  (Ctrl+Z)" if m.can_undo() else ""))
+        self.b_redo.setToolTip("Redo" + (f": {m.redo_text()}" if m.can_redo() else
+                                         "  (Ctrl+Y)\n\nUnavailable: nothing to redo.")
+                               + ("  (Ctrl+Y)" if m.can_redo() else ""))
 
     def _selection_changed(self):
         uid = self.tree.current_uid()
         has = bool(uid)
+        from .widgets import explain_disabled as _xd
         for b in (self.b_edit, self.b_dup, self.b_up, self.b_down, self.b_del):
-            b.setEnabled(has)
+            _xd(b, has, "select a condition in the list first.")
         self.act_add_child.setEnabled(has)
         if self._editing_uid is None:
             self._show_zones()
@@ -1067,20 +1182,72 @@ class SessionsPage(QWidget):
         self._editing_uid = 0
         self.left_stack.setCurrentWidget(self.picker)
 
+    def _parent_choices(self, uid=0):
+        """[(uid, label)]: what a condition may be related to — every other
+        condition, except its own subtree (no cycles)."""
+        bad = ({uid} | set(self.model.subtree(uid))) if uid else set()
+        return [(c["_uid"], f"#{i + 1}  {display_name(c)}")
+                for i, c in enumerate(self.model.conds) if c["_uid"] not in bad]
+
     def _type_chosen(self, t):
+        if t in ("spawn116_preset", "mansion_spawn116_preset", "dungeon_spawn116_preset",
+                 "lavalake_spawn116_preset"):           # (09/10) several conditions at once
+            import spawn_check as sc
+            if self._editing_uid:
+                self._close_form()
+            if t == "spawn116_preset":
+                for c in sc.prefilter_conditions():
+                    self.model.add(c)
+            else:
+                uids = []
+                todo = (sc.mansion_conditions() if t == "mansion_spawn116_preset"
+                        else sc.feature_conditions("dungeon" if t == "dungeon_spawn116_preset"
+                                                   else "lava_lake"))
+                for c, par in todo:
+                    uids.append(self.model.add(c, parent=uids[par] if par is not None else 0))
+                if t != "mansion_spawn116_preset" and self.mode.value() != "48-bit family":
+                    # the feature only depends on the 48 low bits: tested once per
+                    # family, the biome conditions only for the rare families that
+                    # pass (~65 000× faster than Incremental here)
+                    self.mode.set_value("48-bit family")
+                    try:
+                        self.mode.changed.emit("48-bit family")
+                    except Exception:
+                        pass
+            self.left_stack.setCurrentIndex(0)
+            self.tree.fill(self.model)
+            if not sc.is_116(self._mc()):
+                self.status.emit("Buggy spawn preset added — choose Java 1.16 / 1.16.1 in the "
+                                 "version list: it is the 1.16 spawn rule.")
+            else:
+                self.status.emit("Buggy spawn preset added: each result will be checked with "
+                                 "Minecraft 1.16.1 (lava / underground / structure / stone / "
+                                 "under a roof)."
+                                 + (" Search mode: 48-bit family (much faster for it)."
+                                    if t in ("dungeon_spawn116_preset", "lavalake_spawn116_preset")
+                                    else ""))
+            return
         if self._editing_uid:                          # change type of an existing condition
-            old = self.model.export(only={self._editing_uid})[0]
-            c = new_condition(t)
-            for k in ("label", "enabled", "area_mode", "radial", "rmax", "square_side",
-                      "x1", "z1", "x2", "z2"):
-                if k in old and c.get("area_mode") is not None and t not in ("logic_or", "logic_not"):
-                    c[k] = old[k]
-            parent = self.model.get(self._editing_uid).get("_parent", 0)
+            from .session_model import convert_condition
+            uid = self._editing_uid
+            old = self.model.export(only={uid})[0]
+            parent = self.model.get(uid).get("_parent", 0)
+            if self.form.cond is not None and getattr(self, "_form_uid", None) == uid:
+                try:
+                    old = self.form.value()          # what was typed before "Change type"
+                    parent = self.form.parent_uid
+                except Exception:
+                    pass
+            c = convert_condition(old, t)
             self.form.plan_gpu = False
-            self.form.edit(c, self._parent_label(parent), self._mc(), is_new=False)
+            self._form_uid = uid
+            self.form.edit(c, self._parent_label(parent), self._mc(), is_new=False,
+                           parent_choices=self._parent_choices(uid), parent_uid=parent)
         else:
+            self._form_uid = None
             self.form.edit(new_condition(t), self._parent_label(self._new_parent), self._mc(),
-                           is_new=True)
+                           is_new=True, parent_choices=self._parent_choices(),
+                           parent_uid=self._new_parent)
         self.left_stack.setCurrentWidget(self.form)
         from PySide6.QtCore import QTimer as _QT
         _QT.singleShot(0, self._fit_left)
@@ -1098,18 +1265,23 @@ class SessionsPage(QWidget):
         c = self.model.get(uid)
         self._editing_uid = uid
         self.form.plan_gpu = self._plan_gpu_on(uid)
+        self._form_uid = uid
         self.form.edit(self.model.export(only={uid})[0], self._parent_label(c.get("_parent", 0)),
-                       self._mc())
+                       self._mc(), parent_choices=self._parent_choices(uid),
+                       parent_uid=c.get("_parent", 0))
         self.left_stack.setCurrentWidget(self.form)
         from PySide6.QtCore import QTimer as _QT
         _QT.singleShot(0, self._fit_left)
 
     def _form_saved(self, cond):
+        newp = int(getattr(self.form, "parent_uid", 0) or 0)
         if self._editing_uid:
-            self.model.update(self._editing_uid, cond)
             uid = self._editing_uid
+            self.model.update(uid, cond)
+            if newp != int(self.model.get(uid).get("_parent", 0) or 0):
+                self.model.reparent(uid, newp)          # "Related to" changed (08/10)
         else:
-            uid = self.model.add(cond, parent=self._new_parent)
+            uid = self.model.add(cond, parent=newp if self.model.get(newp) else 0)
         self._close_form()
         self.tree.fill(self.model, keep_uid=uid)
         self._selection_changed()
@@ -1136,13 +1308,12 @@ class SessionsPage(QWidget):
         uids = self.tree.selected_uids() or ([self.tree.current_uid()] if self.tree.current_uid() else [])
         if not uids:
             return
-        n_sub = sum(len(self.model.subtree(u)) for u in uids)
-        if n_sub:
-            r = QMessageBox.question(self, "Delete", f"Delete {len(uids)} condition(s) and the "
-                                     f"{n_sub} condition(s) that depend on them?")
-            if r != QMessageBox.StandardButton.Yes:
-                return
-        self.model.remove(uids)
+        # only the selected conditions go (08/10): the ones linked to them stay,
+        # relative to the origin (Undo brings everything back)
+        moved = self.model.remove(uids)
+        if moved:
+            self.status.emit(f"{len(uids)} condition(s) deleted · {moved} linked condition(s) "
+                             f"now relative to the origin (0, 0) — Ctrl+Z to undo.")
 
     def _copy(self):
         uids = self.tree.selected_uids()
@@ -1276,8 +1447,37 @@ class SessionsPage(QWidget):
                             z["num"] = n                 # the legend can hide it
                             zones.append(z)
                     if p is not None and t not in CONTAINERS:
+                        det = f"X {p[0]}  Z {p[1]}"
+                        val = self._climate_value_at(c, p[0], p[1])
+                        if val is not None:     # (08/10) the value the condition saw there
+                            det += f"   ·   {val:+,.0f}".replace(",", " ")
+                        if t in ("dungeon", "lava_lake"):     # (10/10) its Y
+                            fy = self._feature_y_at(c, p[0], p[1])
+                            if fy:
+                                det += "   ·   " + fy
                         markers.append(dict(x=p[0], z=p[1], num=n, color=col, label=name,
-                                            detail=f"X {p[0]}  Z {p[1]}"))
+                                            detail=det))
+            # the condition selected in the tree is always drawn, highlighted, at
+            # its place for this seed (08/10: with a result shown, selecting a
+            # condition showed nothing — e.g. to see a "within 800 blocks" circle)
+            k = self._selected_active_index(active)
+            if k is not None:
+                c = active[k]
+                if anchors[k] is not None:
+                    hit = next((z for z in zones if z.get("num") == k + 1), None)
+                    if hit is not None:
+                        hit["active"] = True
+                    else:
+                        z = self._zone_of(c, anchors[k], label=f"#{k + 1} {display_name(c)}",
+                                          active=True)
+                        if z:
+                            zones.append(z)
+                else:
+                    z = self._zone_of(c, (0, 0), active=True,
+                                      label=f"#{k + 1} {display_name(c)}  (not reached for this seed)")
+                    if z:
+                        z["dashed"] = True
+                        zones.append(z)
             if mode != "Detailed":
                 legend = []
             # conditions shown / hidden from the legend stay while the session's
@@ -1303,8 +1503,66 @@ class SessionsPage(QWidget):
         self.map.set_zones(zones)
         self.map.set_markers(markers)
 
+    _CLIMATE_TYPES = ("climate_minmax", "climate_center", "noise_sample", "climate_noise")
+
+    def _climate_value_at(self, c, x, z):
+        """The climate value (×10 000, the conditions' unit) of a climate
+        condition at its located spot, with its octaves (nmax) — or None."""
+        if c.get("type") not in self._CLIMATE_TYPES or self.world.mc < 22:
+            return None
+        p = c.get("params") or {}
+        para = p.get("para")
+        import cubiomes_wrap as cw
+        if para not in cw.NOISE_PARAMS:
+            return None
+        try:
+            nmax = int(p.get("nmax", -1) if p.get("nmax") is not None else -1)
+        except (TypeError, ValueError):
+            nmax = -1
+        key = (int(self.world.seed), para, bool(self.world.large_biomes), nmax)
+        cache = self.__dict__.setdefault("_clim_libs", {})
+        nm = cache.get(key)
+        try:
+            if nm is None:
+                if len(cache) > 8:
+                    cache.clear()
+                nm = cache[key] = cw.NoiseMapLib(int(self.world.seed), nptype=cw.NOISE_PARAMS[para],
+                                                 large=bool(self.world.large_biomes), nmax=nmax)
+            return float(nm.gen_noise_grid(int(x) >> 2, int(z) >> 2, 1, 1, 4)[0, 0]) * 10000.0
+        except Exception:
+            return None
+
+    def _selected_active_index(self, active):
+        """Position, in the explained `active` list, of the condition selected in
+        the tree (None: none selected, disabled, or the tree changed since)."""
+        uid = self.tree.current_uid()
+        if not uid:
+            return None
+        conds = self.model.conds
+        by = {c["_uid"]: c for c in conds}
+        memo = {}
+
+        def kept(u, depth=0):
+            if u in memo:
+                return memo[u]
+            c = by.get(u)
+            if c is None or not c.get("enabled", True):
+                memo[u] = False
+                return False
+            p = c.get("_parent", 0)
+            r = True if (not p or p not in by or depth > len(conds)) else kept(p, depth + 1)
+            memo[u] = r
+            return r
+        order = [c["_uid"] for c in conds if kept(c["_uid"])]
+        if uid not in order or len(order) != len(active):
+            return None
+        k = order.index(uid)
+        if by[uid].get("type") != active[k].get("type"):
+            return None
+        return k
+
     def _form_preview(self, cond):
-        parent = self.model.get(self._editing_uid).get("_parent", 0) if self._editing_uid else self._new_parent
+        parent = int(getattr(self.form, "parent_uid", 0) or 0)
         c = dict(cond); c["relative"] = 1 if parent else 0
         z = self._zone_of(c, (0, 0), active=True,
                           label=display_name(cond) + ("  (relative to its parent)" if parent else ""))
@@ -1345,6 +1603,25 @@ class SessionsPage(QWidget):
             QMessageBox.information(self, what, "A search is running: pause or stop it first.")
             return True
         return False
+
+    def _delete_all(self):
+        """Every condition removed (08/10, replaces "New empty session"): the
+        session keeps its name / file; Ctrl+Z brings them back."""
+        n = len(self.model.conds)
+        if not n:
+            return
+        r = QMessageBox.question(self, "Delete all conditions",
+                                 f"Delete the {n} condition{'s' if n != 1 else ''} of this session?\n"
+                                 "(Ctrl+Z to undo)")
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self.model.clear()
+        self.status.emit(f"{n} condition(s) deleted — Ctrl+Z to undo.")
+
+    def _set_all_enabled(self, on):
+        for c in self.model.conds:
+            c["enabled"] = bool(on)
+        self.model._touch("Enable all" if on else "Disable all")
 
     def _new_session(self):
         if self._busy_refuse("New session"):
@@ -1441,6 +1718,12 @@ class SessionsPage(QWidget):
             # a session's own paused search never does
             self._run_from_saved = bool(search.get("from_saved"))
             resumed = self.runner.restore_paused(conds, self._mc(), self.threads.value(), search, seeds)
+            _fo = search.get("options") or {}
+            if _fo:                                  # the paused search's 48-bit options
+                for b, on in ((self.opt_struct, _fo.get("struct_only")),
+                              (self.opt_hide, _fo.get("hide_sisters"))):
+                    b.blockSignals(True); b.setChecked(bool(on)); b.blockSignals(False)
+                self._sync_fam_opts()
         elif not st and r.get("progress") not in (None, r.get("seed_min", 0)):
             self._run_from_saved = False             # a session's own paused search
             resumed = self.runner.restore_paused(
@@ -1834,7 +2117,7 @@ class SessionsPage(QWidget):
         rule = self._runner_rule(rule, self._run_confirm)
         self.runner.start(conds, self._mc(), start, self.threads.value(),
                           MODES[self.mode.value()], seed_list=self.seed_list, rule=rule,
-                          **self._engine_args(conds))
+                          options=self.fam_options(), **self._engine_args(conds))
 
     @staticmethod
     def _sig(conds):
@@ -1852,6 +2135,7 @@ class SessionsPage(QWidget):
         world_changed = rw is not None and rw != (self.world.version_name,
                                                   bool(self.world.large_biomes))
         return (MODES[self.mode.value()] != p.get("mode") or start != self.runner.base_start
+                or self.fam_options() != (p.get("options") or {})
                 or self.seed_list is not p.get("seed_list") or world_changed)
 
     def _resume(self):
@@ -2043,6 +2327,68 @@ class SessionsPage(QWidget):
                                            "search and opening a session does not change it."
                                            if mode == "Saved" else "the session's start."))
 
+    def _fam_opt_changed(self, key, on):
+        from PySide6.QtCore import QSettings
+        QSettings("SSA", "SimpleSeedAnalyser").setValue(f"sessions/{key}", "true" if on else "false")
+        self._sync_fam_opts()
+        self._clear_summary()
+
+    def _sync_fam_opts(self):
+        """The two options are shown with "48-bit family" only; Structure seed
+        only implies one per family (shown checked, greyed)."""
+        if not hasattr(self, "opt_hide"):
+            return
+        fam = self.mode.value() == "48-bit family"
+        self.opt_hide.setVisible(fam); self.opt_struct.setVisible(fam)
+        so = self.opt_struct.isChecked()
+        from .widgets import explain_disabled as _xd
+        try:                       # (10/10) sessions the structure seed cannot decide
+            from custom_search import struct_only_blocker
+            why = struct_only_blocker(self.model.export()) if hasattr(self, "model") else None
+        except Exception:
+            why = None
+        _xd(self.opt_struct, why is None, (why + " — this session is searched exactly.")
+                                          if why else "")
+        so = so and why is None
+        _xd(self.opt_hide, not so, "always on with Structure seed only (one seed per "
+                                   "structure seed).")
+
+    def fam_options(self):
+        """The options of a search started now (empty outside 48-bit family)."""
+        if self.mode.value() != "48-bit family" or not hasattr(self, "opt_hide"):
+            return {}
+        so = self.opt_struct.isChecked()
+        if so and not self.opt_struct.isEnabled():   # (10/10) not for this session
+            return dict(hide_sisters=self.opt_hide.isChecked(), struct_only=False)
+        return dict(hide_sisters=bool(self.opt_hide.isChecked() or so), struct_only=so)
+
+    def _sync_saved_for_mode(self):
+        """"48-bit family" searches 48-bit values: its start / resume point is
+        not a seed, and moved the Saved start (shared with the Stronghold and
+        Draw pages) to a far, meaningless seed. The Saved start is therefore
+        greyed in that mode — the session start is used — and comes back
+        (if it was chosen) in Incremental (08/10)."""
+        if not hasattr(self, "start_src"):
+            return
+        fam = self.mode.value() == "48-bit family"
+        b = self.start_src.buttons["Saved"]
+        b.setEnabled(not fam)
+        b.setToolTip("Not available in 48-bit family mode: the start is a 48-bit value\n"
+                     "there, not a seed. The session start is used; your Saved start is\n"
+                     "kept and comes back in Incremental mode." if fam else self._saved_tip)
+        if fam and self._start_mode == "Saved":
+            self._saved_before_fam = True
+            self.start_src.set_value("Session")
+            self._start_mode_changed("Session")
+            self._settings().setValue("sessions/start_mode", "Saved")   # the preference stays
+            self.status.emit("48-bit family: the session start is used (the Saved start is "
+                             "for Incremental searches; it is kept).")
+        elif not fam and self._saved_before_fam:
+            self._saved_before_fam = False
+            if self._start_mode != "Saved":
+                self.start_src.set_value("Saved")
+                self._start_mode_changed("Saved")
+
     def _next_start(self):
         """Where the last search stopped, in the unit of the Start field (a seed
         in Incremental, a 48-bit value in the other modes), or None."""
@@ -2083,19 +2429,27 @@ class SessionsPage(QWidget):
         running = st in ("running", "pausing", "stopping")
         if st in ("paused", "done", "error", "running"):
             self._show_profile()
-        self.b_start.setEnabled(not running)
+        from .widgets import explain_disabled as _xd
+        busy = "a search is running — pause or stop it first."
+        _xd(self.b_start, not running, busy)
         self.b_start.setText("  Resume" if st == "paused" else "  Start")
-        self.b_pause.setEnabled(st == "running" and self.runner.can_pause)
-        self.b_stop.setEnabled(st in ("running", "pausing", "paused"))
+        _xd(self.b_pause, st == "running" and self.runner.can_pause,
+            "no search is running." if st != "running" else
+            "this engine has no resume point (seed list, or a GPU pipeline that "
+            "cannot pause) — Stop only.")
+        _xd(self.b_stop, st in ("running", "pausing", "paused"), "no search to stop.")
         # mode / start / source define WHICH seeds are searched. They stay
         # editable during a pause: Resume then asks whether to start a NEW
         # search with them or to continue the paused one (27/09).
-        for w in (self.mode, self.list_btn):
-            w.setEnabled(not running)
+        for w in (list(self.mode.buttons.values()) + [self.list_btn, self.opt_hide,
+                                                       self.opt_struct]):
+            _xd(w, not running, busy)
+        if not running:
+            self._sync_fam_opts()
         self._sync_start_ui(running)
         for w in (self.threads, self.rule_kind, self.rule_seeds, self.rule_results, self.rule_time):
-            w.setEnabled(not running)
-        self.b_engine.setEnabled(not running)
+            _xd(w, not running, busy)
+        _xd(self.b_engine, not running, busy)
         self.engine_chip.setProperty("state", "ok" if running else "off")
         self.engine_chip.style().unpolish(self.engine_chip); self.engine_chip.style().polish(self.engine_chip)
         if st == "idle":
@@ -2248,9 +2602,10 @@ class SessionsPage(QWidget):
             self.b_engine.setToolTip(f"Engine: {self.runner.plan.label}\n{self.runner.plan.detail}"
                                      "\nClick for the details.")
         if self.runner.state == "running":
-            self.b_pause.setEnabled(self.runner.can_pause)
-            self.b_pause.setToolTip("" if self.runner.can_pause else
-                                    "This engine cannot be paused and resumed exactly.")
+            from .widgets import explain_disabled as _xd
+            _xd(self.b_pause, self.runner.can_pause,
+                "this engine cannot be paused and resumed exactly (seed list, or a GPU "
+                "pipeline without a resume point) — Stop only.")
 
     def _progress(self, d):
         import time as _t
@@ -2265,7 +2620,9 @@ class SessionsPage(QWidget):
         unit = d.get("unit", "seeds")
         rc = getattr(self, "_run_confirm", None)
         found = (f"{fmt_int(len(self.results.rows))} confirmed / {fmt_int(d['found'])} found"
-                 if isinstance(rc, dict) else f"{fmt_int(d['found'])} found")
+                 if isinstance(rc, dict) or self._spw_pending or self._spw_dropped
+                 or self._ftc_pending or self._ftc_dropped
+                 else f"{fmt_int(d['found'])} found")
         parts = [f"{fmt_int(d['done'])} {unit}", fmt_rate(d["sps"]), found,
                  f"elapsed {fmt_time(d['elapsed'])}"]
         if frac is not None:
@@ -2290,10 +2647,146 @@ class SessionsPage(QWidget):
             self._mcc.add([s for s, _d in batch], self._mc(), rc, bool(self.world.large_biomes))
             self._results_count()
             return
+        if batch and self._feature_session():
+            # (10/10) dungeons / lava lakes: shown once Minecraft has them
+            conds = self.model.export()
+            mc = self._mc()
+            for s_, d in batch:
+                self._ftc_pending[s_] = d
+            self._ftc.add([(s_, conds, mc) for s_, _d in batch])
+            self._results_count()
+            return
+        if batch and self._spawn_session():
+            # (09/10) a buggy-spawn search: a result is shown only once the real
+            # Minecraft 1.16.1 confirms a buggy spawn (the others are dropped)
+            for s, d in batch:
+                self._spw_pending[s] = d
+            self._spc.add([s for s, _d in batch])
+            self._results_count()
+            return
         self.results.add(batch)
         self._results_count()
         if at_end and self.results.rows and len(self.results.rows) < 2000:
             self.table.scrollToBottom()
+
+    def _feature_y_at(self, c, x, z):
+        """'Y n' of the 1.16 dungeon / lava lake at (x, z) for the shown seed
+        (+ ✓ / ✗ when Minecraft checked it), or ''."""
+        try:
+            import feature116 as f116
+            seed = int(self.world.seed)
+            for f in f116.features(self._mc(), seed, c.get("type"), x - 1, z - 1, x + 1, z + 1):
+                if f.x == x and f.z == z:
+                    ok = next((True for g in self._ftc_feats.get(seed, ()) if g == f), None)
+                    return ("Y ground" if f.surface else f"Y {f.y}") + ("  ✓" if ok else "")
+        except Exception:
+            pass
+        return ""
+
+    def _feature_session(self):
+        """1.16 session with a top-level dungeon / lava lake condition asking
+        for some: its results are checked with Minecraft (10/10)."""
+        if self._mc() not in (19, 20):
+            return False
+        return any(c.get("enabled", True) and c.get("type") in ("dungeon", "lava_lake")
+                   and not int(c.get("relative", 0) or 0) and int(c.get("instances", 1) or 0) > 0
+                   for c in self.model.export())
+
+    def _feat_one(self, seed, st, feats):
+        st = tuple(st) + ("",) * (3 - len(st))
+        if feats:                                # the map marks them ✓ (any page's map)
+            d = self.map.__dict__.setdefault("f116_checked", {})
+            for f in feats:
+                if not f.surface:
+                    d[(int(seed), f.kind, f.x, f.y, f.z)] = True
+        d = self._ftc_pending.pop(seed, None)
+        if d is None:                            # a manual check of a shown result
+            self.results.set_mc_status(seed, st)
+            if feats:
+                self._ftc_feats[seed] = list(feats)
+            self._results_count()
+            return
+        if st[2] == "feat_no":
+            self._ftc_dropped += 1
+        else:
+            # its layers on (the map shows them) — ONCE per search: a layer the
+            # user switches off afterwards stays off (before, every result
+            # switched it back on behind the unticked box)
+            if not getattr(self, "_f116_layers_done", False):
+                self._f116_layers_done = True
+                lay = getattr(self.window(), "layers", None)
+                for c in self.model.export():
+                    t = c.get("type")
+                    if t not in ("dungeon", "lava_lake") or not c.get("enabled", True):
+                        continue
+                    cb = getattr(lay, "boxes", {}).get(t) if lay is not None else None
+                    if cb is not None:
+                        cb.setChecked(True)          # the box and the map together
+                    elif not self.map.visible.get(t):
+                        self.map.visible[t] = True
+            at_end = (self.table.verticalScrollBar().value()
+                      >= self.table.verticalScrollBar().maximum() - 2)
+            self.results.add([(seed, d)])
+            self.results.set_mc_status(seed, st)
+            if feats:
+                self._ftc_feats[seed] = list(feats)
+            if at_end and len(self.results.rows) < 2000:
+                self.table.scrollToBottom()
+        self._results_count()
+
+    def _spawn_session(self):
+        """Buggy-spawn preset in a 1.16 session: every result is checked."""
+        import spawn_check as sc
+        return sc.is_116(self._mc()) and sc.session_wants_check(self.model.export())
+
+    def _spawn_auto(self, batch):
+        if batch and self._spawn_session():
+            self._queue_spawn([s for s, _d in batch])
+
+    def _queue_spawn(self, seeds):
+        from .spawn_confirm import CHECKING
+        for s in seeds:
+            self.results.mcs[s] = CHECKING
+        if seeds and self.results.rows:
+            self.results.dataChanged.emit(self.results.index(0, 1),
+                                          self.results.index(len(self.results.rows) - 1, 1))
+        self._spc.add(seeds)
+
+    def _spawn_one(self, seed, st):
+        st = tuple(st) + ("",) * (3 - len(st))
+        if seed in self._spw_pending:            # a search candidate: kept only if buggy
+            from .spawn_confirm import KEEP
+            d = self._spw_pending.pop(seed)
+            if st[2] in KEEP or st[0] == "?":    # "?" = no answer: kept, to be re-checked
+                at_end = (self.table.verticalScrollBar().value()
+                          >= self.table.verticalScrollBar().maximum() - 2)
+                self.results.add([(seed, d)])
+                self.results.set_mc_status(seed, st)
+                if at_end and len(self.results.rows) < 2000:
+                    self.table.scrollToBottom()
+            else:
+                self._spw_dropped += 1
+            self._results_count()
+            return
+        self.results.set_mc_status(seed, st)
+        self._results_count()
+
+    def _remove_ordinary_spawns(self):
+        """Keep the buggy spawns (lava / underground / structure) and the ones
+        still being checked."""
+        from .spawn_confirm import WTF
+        keep_rows, gone = [], 0
+        for s, d in self.results.rows:
+            st = self.results.mcs.get(s)
+            if st is None or st[0] == "checking…" or (len(st) > 2 and st[2] in WTF):
+                keep_rows.append((s, d))
+            else:
+                gone += 1
+        old = self.results.mcs
+        self.results.clear(); self.results.add(keep_rows)
+        self.results.mcs = {s: v for s, v in old.items() if any(s == r[0] for r in keep_rows)}
+        self._results_count()
+        self.status.emit(f"Removed {gone} result(s) with an ordinary spawn.")
 
     def _results_in_confirmed(self, batch):
         at_end = self.table.verticalScrollBar().value() >= self.table.verticalScrollBar().maximum() - 2
@@ -2305,10 +2798,16 @@ class SessionsPage(QWidget):
         n = len(self.results.rows)
         self.res_count.setText(fmt_int(n))
         wait, rej = len(self._mcc_pending), self._mcc_rejected
+        sw, sd = len(self._spw_pending), self._spw_dropped
+        if self._ftc_pending or self._ftc_dropped:          # (10/10) dungeons / lava lakes
+            sw, sd = len(self._ftc_pending), self._ftc_dropped
         self.res_hint.setText(
             (f"Minecraft 1.16.1: <b>{fmt_int(wait)}</b> being checked · "
              f"<b>{fmt_int(rej)}</b> not broken (dropped). A result appears once confirmed.")
             if (wait or rej) else
+            (f"Minecraft 1.16.1: <b>{fmt_int(sw)}</b> result(s) being checked · "
+             f"<b>{fmt_int(sd)}</b> dropped. A result appears once Minecraft confirms it.")
+            if (sw or sd) else
             "Click a result: the seed is loaded and the map shows where each condition is "
             "satisfied.")
         if self.results.mcs:
@@ -2408,8 +2907,18 @@ class SessionsPage(QWidget):
     def _mcc_reset(self):
         self._sis_keys = None                    # sister keys follow the results
         self._mcc.reset()
+        if hasattr(self, "_spc"):
+            self._spc.reset()
         self._mcc_pending = {}
         self._mcc_rejected = 0
+        self._spw_pending = {}
+        self._spw_dropped = 0
+        if hasattr(self, "_ftc"):
+            self._ftc.reset()
+        self._ftc_pending = {}
+        self._ftc_dropped = 0
+        self._f116_layers_done = False
+        self._ftc_feats = {}
 
     def _mc_one(self, seed, st):
         st = tuple(st) + ("",) * (3 - len(st))
@@ -2457,6 +2966,35 @@ class SessionsPage(QWidget):
             self._queue_confirm(again, cp)
         self._results_count()
 
+    def _delete_results(self):
+        """Deletes the selected results; the result just above becomes the
+        selected one (its seed is loaded, as a click). A deleted seed is not
+        added again by a resumed search (it stays among the seen ones)."""
+        sel = self.table.selectionModel()
+        rows = sorted({i.row() for i in sel.selectedRows()})
+        if not rows:
+            cur = self.table.currentIndex()
+            rows = [cur.row()] if cur.isValid() else []
+        if not rows:
+            return
+        first = rows[0]
+        gone = self.results.remove_rows(rows)
+        if self.runner.state not in ("running", "pausing", "stopping"):
+            with self.runner._lock:
+                self.runner.found = len(self.results.rows)
+        self._results_count()
+        n = self.results.rowCount()
+        if n:
+            r = max(0, first - 1)
+            idx = self.results.index(r, 1)
+            self.table.setCurrentIndex(idx)
+            self.table.selectRow(r)
+            self.table.scrollTo(idx)
+        else:
+            self.table.clearSelection()
+        self.status.emit(f"{len(gone)} result{'s' if len(gone) != 1 else ''} deleted"
+                         + (" · Delete again for the one above" if n else ""))
+
     def _remove_unconfirmed(self):
         bad = {s for s, v in self.results.mcs.items() if v[0].startswith("✗")}
         rows = [(s, d) for s, d in self.results.rows if s not in bad]
@@ -2477,9 +3015,12 @@ class SessionsPage(QWidget):
         on = not running and self.seed_list is None
         for w in (self.start_seed, self.start_src, self._dice):
             w.setEnabled(on)
-        self.start_seed.setToolTip("Ignored: the seed list is the source (✕ on the list to go "
-                                   "back to a range)." if self.seed_list is not None else
-                                   "First seed (Incremental) or first 48-bit value (other modes).")
+        why = ("\n\nUnavailable: the seed list is the source (✕ on the list to go back to a "
+               "range)." if self.seed_list is not None else
+               "\n\nUnavailable: a search is running — pause or stop it first." if running else "")
+        tip = "First seed (Incremental) or first 48-bit value (other modes)." + why
+        self.start_seed.setToolTip(tip)
+        self._dice.setToolTip("Random start" + why)
 
     def _seed_list(self):
         if self.seed_list is not None:
@@ -2677,19 +3218,53 @@ class SessionsPage(QWidget):
         a_copy = m.addAction(f"Copy seed{'s' if len(seeds) > 1 else ''}")
         loc = self.results.loc.get(seeds[0]) if len(seeds) == 1 else None
         has_loc = isinstance(loc, tuple)
+        fts = self._ftc_feats.get(seeds[0], []) if len(seeds) == 1 else []
+        a_ftp = (m.addAction(f"Copy {fts[0].tp(seeds[0])}  ({fts[0].name.lower()})")
+                 if fts else None)
+        a_fck = (m.addAction(f"Check the dungeons / lava lakes with Minecraft ({len(seeds)})")
+                 if self._mc() in (19, 20) and any(
+                     c.get("enabled", True) and c.get("type") in ("dungeon", "lava_lake")
+                     for c in self.model.export()) else None)
         a_tp = m.addAction(f"Copy /tp {loc[0]} ~ {loc[1]}") if has_loc else None
         a_go = m.addAction("Centre the map on the location") if has_loc else None
         a_map = m.addAction("Open on the Map page") if len(seeds) == 1 else None
         cp = self._confirm_params(self.model.export(), force=True)
         a_conf = (m.addAction(f"Confirm the broken portal with Minecraft ({len(seeds)})")
                   if cp is not None else None)
+        import spawn_check as _sck
+        a_spawn = (m.addAction(f"Check the 1.16 spawn with Minecraft ({len(seeds)})")
+                   if _sck.is_116(self._mc()) else None)
+        n_ord = sum(1 for v in self.results.mcs.values()
+                    if len(v) > 2 and v[2] in ("water", "surface", "normal"))
         n_x = sum(1 for v in self.results.mcs.values() if v[0].startswith("✗"))
         busy = self.runner.state in ("running", "pausing", "stopping")
         a_rmx = (m.addAction(f"Remove the {n_x} result(s) Minecraft did not confirm (✗)")
                  if n_x and not busy else None)
+        a_ord = (m.addAction(f"Remove the {n_ord} result(s) with an ordinary spawn "
+                             "(surface / water / normal)") if n_ord and not busy else None)
         m.addSeparator()
+        a_del = m.addAction(f"Delete {'these ' + str(len(seeds)) + ' results' if len(seeds) > 1 else 'this result'}"
+                            "\tDel")
         a_exp = m.addAction("Export all results…")
         act = m.exec(self.table.viewport().mapToGlobal(pt))
+        if act is not None and act is a_del:
+            self._delete_results()
+            return
+        if act is not None and act is a_spawn:
+            self._queue_spawn(seeds)
+            return
+        if act is not None and act is a_ftp:
+            QGuiApplication.clipboard().setText(fts[0].tp(seeds[0]))
+            return
+        if act is not None and act is a_fck:
+            from .feature_confirm import CHECKING
+            for s_ in seeds:
+                self.results.set_mc_status(s_, CHECKING)
+            self._ftc.add([(s_, self.model.export(), self._mc()) for s_ in seeds])
+            return
+        if act is not None and act is a_ord:
+            self._remove_ordinary_spawns()
+            return
         if act is not None and act is a_conf:
             self._queue_confirm(seeds, cp)
             return

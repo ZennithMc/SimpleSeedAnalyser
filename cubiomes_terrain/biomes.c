@@ -309,7 +309,7 @@ int getCategory(int mc, int id)
 
     case wooded_badlands_plateau:
     case badlands_plateau:
-        return mc <= MC_1_15 ? mesa : badlands_plateau;
+        return mc <= MC_1_16_1 ? mesa : badlands_plateau;   /* SSA: 1.16.1 still has the 1.15 rule (checked in its jar) */
 
     case mushroom_fields:
     case mushroom_field_shore:
@@ -376,7 +376,7 @@ int areSimilar(int mc, int id1, int id2)
 {
     if (id1 == id2) return 1;
 
-    if (mc <= MC_1_15)
+    if (mc <= MC_1_16_1)   /* SSA: BiomeLayers.areSimilar of 1.16.1 still has it */
     {
         if (id1 == wooded_badlands_plateau || id1 == badlands_plateau)
             return id2 == wooded_badlands_plateau || id2 == badlands_plateau;

@@ -157,6 +157,78 @@ BUILTIN.update({
         bg2="#122816", bg3="#18341d", bg4="#1f4125", line="#153019", line2="#234a2a",
         text="#eaf6e9", text2="#a8c9a6", text3="#6a8c69",
         accent="#9fdc3a", ok="#5fdc8a", warn="#f2c14e", danger="#f0616d"),
+    # wood (08/10): Minecraft planks
+    "Oak": _t(
+        base_top="#2a1d11", base_bottom="#170f08", bg0="#140d07", bg1="#22170d",
+        bg2="#2d1f12", bg3="#3a2817", bg4="#47321d", line="#352515", line2="#4d3720",
+        text="#f6ecdf", text2="#d4bc9c", text3="#97805f",
+        accent="#e4a957", ok="#8fd46b", warn="#f2c14e", danger="#ef6a5e"),
+    "Dark Oak": _t(
+        base_top="#18100a", base_bottom="#0b0704", bg0="#0a0604", bg1="#150e08",
+        bg2="#1d140c", bg3="#271b10", bg4="#322315", line="#24190f", line2="#382717",
+        text="#f1e7dc", text2="#c4ad94", text3="#86715b",
+        accent="#c9955c", ok="#86cf73", warn="#e8b64e", danger="#e6655d"),
+    "Cherry": _t(
+        base_top="#f7e3dd", base_bottom="#efd2ca", bg0="#e6c2b8", bg1="#fff8f6",
+        bg2="#ffffff", bg3="#fbeee9", bg4="#f2dbd3", line="#efd9d1", line2="#e1c0b6",
+        text="#2e1c1a", text2="#6d4c47", text3="#a57f78",
+        accent="#c4466a", ok="#2f9a64", warn="#b7791f", danger="#cc3d4f"),
+    "Crimson": _t(
+        base_top="#2a0d1a", base_bottom="#14060d", bg0="#12050b", bg1="#210b15",
+        bg2="#2c101d", bg3="#391526", bg4="#471b30", line="#35121f", line2="#4e1c2f",
+        text="#fbe9f0", text2="#dba9bd", text3="#9a6a7e",
+        accent="#ff6b8f", ok="#8fd46b", warn="#ffc65a", danger="#ff5a5a"),
+    "Warped": _t(
+        base_top="#0b2422", base_bottom="#051312", bg0="#041110", bg1="#0a1f1d",
+        bg2="#0f2a27", bg3="#153633", bg4="#1b433f", line="#122f2c", line2="#1f4642",
+        text="#e7f8f5", text2="#a6cfc8", text3="#678f89",
+        accent="#4fe3c8", ok="#7fe39a", warn="#f2c14e", danger="#f0616d"),
+    # (10/10) retro, tech, paper and a few more
+    "Synthwave": _t(
+        base_top="#1a0830", base_bottom="#07020f", bg0="#08030f", bg1="#150a26",
+        bg2="#1e1033", bg3="#291643", bg4="#351d55", line="#25143c", line2="#3b2160",
+        text="#fbeefe", text2="#d2b4e4", text3="#8f71a6",
+        accent="#ff4fa0", ok="#4ff0c0", warn="#ffd34d", danger="#ff5a6e"),
+    "Blueprint": _t(
+        base_top="#0d3a73", base_bottom="#082248", bg0="#071d3d", bg1="#0c2c57",
+        bg2="#113566", bg3="#174176", bg4="#1e4d88", line="#16396a", line2="#2a5590",
+        text="#eef5ff", text2="#b4cbe8", text3="#7b97bd",
+        accent="#ffd84d", ok="#6fe0a0", warn="#ffc04d", danger="#ff7070"),
+    "Parchment": _t(
+        base_top="#f1e7d0", base_bottom="#e3d4b3", bg0="#d6c6a2", bg1="#fbf6ea",
+        bg2="#fffdf7", bg3="#f3ead6", bg4="#e6d9bb", line="#e5d8bb", line2="#cdbb92",
+        text="#2a2116", text2="#5e4f38", text3="#968566",
+        accent="#8a3b1e", ok="#3c8a4f", warn="#a8701c", danger="#b8322e"),
+    "Redstone": _t(
+        base_top="#2a0707", base_bottom="#0e0202", bg0="#0f0303", bg1="#1c0606",
+        bg2="#260a0a", bg3="#320e0e", bg4="#3f1414", line="#2e0c0c", line2="#4a1717",
+        text="#fdeceb", text2="#dcaaa6", text3="#9a6762",
+        accent="#ff3b2f", ok="#8fd46b", warn="#ffc65a", danger="#ff7a5a"),
+    "Honeycomb": _t(
+        base_top="#2a1702", base_bottom="#120900", bg0="#110900", bg1="#1e1104",
+        bg2="#291806", bg3="#35200a", bg4="#42290e", line="#311d07", line2="#4a2f0f",
+        text="#fff4dd", text2="#e3c896", text3="#a08656",
+        accent="#ffc23a", ok="#9ad46b", warn="#ffd36b", danger="#ff6a5a"),
+    "Sculk": _t(
+        base_top="#08141a", base_bottom="#020507", bg0="#020609", bg1="#071118",
+        bg2="#0b1922", bg3="#10232e", bg4="#162d3a", line="#0e1f28", line2="#1a3442",
+        text="#e4f9fb", text2="#9fcbd2", text3="#5f8a92",
+        accent="#29dfe8", ok="#4fe0a2", warn="#f2c05a", danger="#ff6b7a"),
+    "Topographic": _t(
+        base_top="#f7ecd0", base_bottom="#ecd7a8", bg0="#ddc795", bg1="#fffaee",
+        bg2="#ffffff", bg3="#f8efd9", bg4="#ecdcb6", line="#ecdfbe", line2="#d5c094",
+        text="#2a2214", text2="#5f5035", text3="#978664",
+        accent="#2f7d6d", ok="#2f9a64", warn="#b7791f", danger="#c8423a"),
+    "Lavender Dusk": _t(
+        base_top="#2a0f2e", base_bottom="#0b0410", bg0="#0b0510", bg1="#190c1e",
+        bg2="#221229", bg3="#2d1836", bg4="#391f44", line="#2a1531", line2="#41244b",
+        text="#f8edfb", text2="#d0b4da", text3="#8e7299",
+        accent="#c792ff", ok="#6fe0a8", warn="#f4c65c", danger="#ff6f95"),
+    "Glacier": _t(
+        base_top="#0a1f2a", base_bottom="#030b10", bg0="#040c11", bg1="#0a1820",
+        bg2="#0f212b", bg3="#152b37", bg4="#1c3644", line="#132631", line2="#22404f",
+        text="#ecf8fc", text2="#a9cbd8", text3="#6a8d9b",
+        accent="#8fe3ff", ok="#5fdca0", warn="#f2c05a", danger="#ff6b7a"),
     "Graphite": _t(
         base_top="#23252a", base_bottom="#141518", bg0="#121316", bg1="#1b1c20",
         bg2="#232529", bg3="#2d3035", bg4="#383b42", line="#2a2c31", line2="#3b3e45",
@@ -236,6 +308,47 @@ EXTRAS = {
     "Ember": dict(desc="Embers rising over a dark forge", accent2="#ffc24d", panel=0.82,
                   backdrop=dict(kind="aurora", seed=13, sky=["#050101", "#2a0906"],
                                 curtains=["#ff5a1f", "#ffae3d", "#c2263a"])),
+    "Oak": dict(desc="Oak planks", accent2="#f3c98a", panel=0.84,
+                backdrop=dict(kind="planks", seed=3, base=["#5a3c20", "#a87a48"], seam="#24160b")),
+    "Dark Oak": dict(desc="Dark oak planks", accent2="#e3b783", panel=0.84,
+                     backdrop=dict(kind="planks", seed=5, base=["#21150b", "#4d3420"],
+                                   seam="#0d0804")),
+    "Cherry": dict(desc="Cherry planks — light", accent2="#e5809e", panel=0.86,
+                   backdrop=dict(kind="planks", seed=7, base=["#d99a8e", "#f4d2c8"],
+                                 seam="#9c5a52", light=True)),
+    "Crimson": dict(desc="Crimson stem planks (Nether)", accent2="#ff9fb8", panel=0.84,
+                    backdrop=dict(kind="planks", seed=9, base=["#4a1a30", "#8a3558"],
+                                  seam="#1c0812")),
+    "Warped": dict(desc="Warped stem planks (Nether)", accent2="#9ff5e3", panel=0.84,
+                   backdrop=dict(kind="planks", seed=11, base=["#173f3c", "#2f8279"],
+                                 seam="#081a19")),
+    "Synthwave": dict(desc="Retro 80s sunset over a neon grid", accent2="#38e8ff", panel=0.80,
+                      backdrop=dict(kind="synthwave", seed=1)),
+    "Blueprint": dict(desc="Technical blueprint paper", accent2="#fff0a0", panel=0.84,
+                      backdrop=dict(kind="blueprint", seed=2)),
+    "Parchment": dict(desc="Old parchment, ink accent — light", accent2="#c0662e", panel=0.86,
+                      backdrop=dict(kind="paper", seed=3)),
+    "Redstone": dict(desc="Redstone circuits", accent2="#ffb0a0", panel=0.84,
+                     backdrop=dict(kind="circuit", seed=6, base=["#160404", "#2a0707"],
+                                   trace="#ff3b2f", pad="#ffb0a0")),
+    "Honeycomb": dict(desc="Bee nest honeycomb", accent2="#ffe08a", panel=0.84,
+                      backdrop=dict(kind="hexagons", seed=5)),
+    "Sculk": dict(desc="The deep dark: sculk veins", accent2="#9ff8ff", panel=0.84,
+                  backdrop=dict(kind="stone", seed=44, dark="#03080c", light="#0d1c24",
+                                specks=["#020507", "#1d3440"], cell=70, accent_specks="#29dfe8",
+                                crack="#0b6f78")),
+    "Topographic": dict(desc="Contour map on sand — light", accent2="#5fb3a0", panel=0.86,
+                        backdrop=dict(kind="glow", seed=51, base=["#f6e7c4", "#e8cf9c"],
+                                      blobs=[["#ffd98a", 0.8, 0.1, 0.4], ["#f2b86a", 0.1, 0.9, 0.4]],
+                                      light=True, grain=3, ridges=["#c79a5a", 0.35, 420])),
+    "Lavender Dusk": dict(desc="Violet dusk and drifting petals", accent2="#ff9fd0", panel=0.82,
+                          backdrop=dict(kind="glow", seed=53, base=["#2a0f2e", "#0b0410"],
+                                        blobs=[["#c43b6b", 0.25, 0.2, 0.4], ["#6b2a9e", 0.8, 0.7, 0.4]],
+                                        petals=["#9a6bd8", 110], crisp=True, stars=1400)),
+    "Glacier": dict(desc="Dark glacier ice with white veins", accent2="#d6f6ff", panel=0.84,
+                    backdrop=dict(kind="marble", seed=61, base=["#03121a", "#0f3344"],
+                                  veins=["#9fdcf0", "#f2fbff"], secondary="#1f5266", vein_amt=0.6,
+                                  scale=0.9, angle=0.9)),
     "Jungle": dict(desc="Deep jungle canopy and falling leaves", accent2="#d8f58a", panel=0.84,
                    backdrop=dict(kind="glow", seed=37, base=["#0f2a14", "#030a05"],
                                  blobs=[["#3f8f2a", 0.2, 0.05, 0.45], ["#1f6b3a", 0.85, 0.3, 0.4],
@@ -445,14 +558,41 @@ def _assets() -> dict:
 
 
 # ── Stylesheet ───────────────────────────────────────────────────────────────
+# Frame of the textured themes (08/10): "bands" = translucent bars (before),
+# "veil" = the whole backdrop under an even veil, "glass" = a lighter veil and
+# hairlines, "clear" = the pure backdrop, the chrome items on small pills.
+FRAME_STYLES = ("veil", "glass", "clear", "bands")
+FRAME_VEIL = {"veil": 0.42, "glass": 0.22}
+
+
+FRAME_OVERRIDE = None          # the Appearance window's live preview
+
+
+def frame_style() -> str:
+    if FRAME_OVERRIDE in FRAME_STYLES:
+        return FRAME_OVERRIDE
+    v = os.environ.get("SSA_FRAME")
+    if not v:
+        try:
+            from PySide6.QtCore import QSettings
+            v = str(QSettings("SSA", "SimpleSeedAnalyser").value("theme/frame", "") or "")
+        except Exception:
+            v = ""
+    return v if v in FRAME_STYLES else "veil"
+
+
 def stylesheet() -> str:
     mono = _pick(MONO_FAMILIES)
     A = _assets()
     root_bg = f"qlineargradient(x1:0, y1:0, x2:0.35, y2:1, stop:0 {BASE_TOP}, stop:1 {BASE_BOTTOM})"
     root_img = ""
+    frame = frame_style()
     if BACKDROP:
         from .backdrops import backdrop_path
-        bp = backdrop_path(BACKDROP)
+        spec = dict(BACKDROP)
+        if frame in FRAME_VEIL:
+            spec["veil"] = [BG1, FRAME_VEIL[frame]]
+        bp = backdrop_path(spec)
         if bp:
             root_img = f'border-image: url("{bp}") 0 0 0 0 stretch stretch;'
     acc_grad = (f"qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {ACCENT}, stop:1 {ACCENT2})"
@@ -461,8 +601,24 @@ def stylesheet() -> str:
     # the nav rail / status bar sat right on the textured backdrop (strata,
     # marble…): their muted text vanished on it (Mesa « Theme », 01/10). A
     # translucent panel tint under them keeps the backdrop visible but readable.
-    chrome_bg = _rgba(BG1, 0.72) if BACKDROP else "transparent"
+    chrome_bg = _rgba(BG1, 0.72) if (BACKDROP and frame == "bands") else "transparent"
     nav_text = TEXT2 if BACKDROP else TEXT3
+    extra = ""
+    if BACKDROP and frame == "clear":
+        # pure backdrop: no band; the chrome's own items carry a small pill
+        pill = _rgba(BG1, 0.62)
+        extra = f"""
+QToolButton#NavButton {{ background: {pill}; }}
+#StatusBar QLabel {{ background: {pill}; border-radius: 9px; padding: 1px 9px; }}
+#TopBar QLabel#FieldLabel {{ background: {pill}; border-radius: 6px; padding: 0px 5px; }}
+#TopBar QLabel#AppName {{ background: {pill}; border-radius: 8px; padding: 2px 8px; }}
+"""
+    elif BACKDROP and frame == "glass":
+        extra = f"""
+#TopBar {{ border-bottom: 1px solid {_rgba(ACCENT, 0.28)}; }}
+#NavRail {{ border-right: 1px solid {_rgba(ACCENT, 0.28)}; }}
+#StatusBar {{ border-top: 1px solid {_rgba(ACCENT, 0.28)}; }}
+"""
     return f"""
 * {{ outline: 0; }}
 QWidget {{ color: {TEXT}; background: transparent; selection-background-color: {ACCENT}; selection-color: white; }}
@@ -502,7 +658,7 @@ QPushButton {{
 }}
 QPushButton:hover {{ background: {BG3}; border-color: {HOVER_LINE}; }}
 QPushButton:pressed {{ background: {BG4}; }}
-QPushButton:disabled {{ color: {TEXT3}; background: {BG1}; border-color: {LINE}; }}
+QPushButton:disabled {{ color: {TEXT3}; background: transparent; border: 1px dashed {LINE2}; }}
 QPushButton[kind="primary"] {{ background: {acc_grad}; border-color: {ACCENT}; color: {on_acc}; font-weight: 600; }}
 QPushButton[kind="primary"]:hover {{ background: {ACCENT_H}; border-color: {ACCENT_H}; }}
 QPushButton[kind="primary"]:pressed {{ background: {ACCENT_P}; }}
@@ -532,6 +688,14 @@ QPushButton[seg="first"] {{ border-top-left-radius: {RADIUS}px; border-bottom-le
 QPushButton[seg="last"] {{ border-top-right-radius: {RADIUS}px; border-bottom-right-radius: {RADIUS}px; }}
 QPushButton[seg="only"] {{ border-radius: {RADIUS}px; }}
 QPushButton[seg]:checked {{ background: {ACCENT_SOFT}; color: {TEXT}; border-color: {ACCENT_LINE}; }}
+/* (08/10) a control greyed ON PURPOSE looks it: dashed outline, faint text —
+   hover it for the reason */
+QPushButton[seg]:disabled {{ background: transparent; color: {_rgba(TEXT3, 0.7)}; border: 1px dashed {LINE2}; }}
+QPushButton[seg]:checked:disabled {{ background: {_rgba(ACCENT, 0.08)}; color: {TEXT3}; border: 1px dashed {ACCENT_LINE}; }}
+QToolButton:disabled {{ border: 1px dashed {LINE}; }}
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QTimeEdit:disabled, QComboBox:disabled {{
+    color: {TEXT3}; background: transparent; border: 1px dashed {LINE2}; }}
+QCheckBox::indicator:disabled {{ border: 1px dashed {LINE2}; background: transparent; }}
 
 /* ---------- inputs ---------- */
 QLineEdit, QSpinBox, QDoubleSpinBox, QTimeEdit, QComboBox {{
@@ -580,6 +744,11 @@ QTableView::item:selected, QTreeView::item:selected, QListView::item:selected, Q
 
 /* ---------- misc ---------- */
 QFrame#Card {{ background: {BG2}; border: 1px solid {LINE}; border-radius: 8px; }}
+QPushButton#BiomeChip {{ background: {BG3}; border: 1px solid {LINE}; border-radius: 11px;
+                         padding: 3px 10px 3px 7px; min-height: 16px; color: {TEXT2}; }}
+QPushButton#BiomeChip:hover {{ border-color: {HOVER_LINE}; color: {TEXT}; }}
+QPushButton#BiomeChip:checked {{ background: {ACCENT_SOFT}; border-color: {ACCENT}; color: {TEXT}; font-weight: 600; }}
+QPushButton#BiomeChip:disabled {{ background: transparent; border: 1px dashed {LINE}; color: {_rgba(TEXT3, 0.6)}; }}
 QFrame#HLine {{ background: {LINE}; max-height: 1px; min-height: 1px; }}
 QLabel#Chip {{ border-radius: 10px; padding: 2px 9px; font-size: 8pt; font-weight: 600; }}
 QLabel#Chip[state="ok"] {{ background: {_rgba(OK, 0.14)}; color: {OK}; }}
@@ -606,13 +775,14 @@ QTreeView::branch {{ background: transparent; }}
 QTreeView::branch:selected {{ background: transparent; }}
 QTreeView::branch:has-children:closed {{ image: url({A["right"]}); }}
 QTreeView::branch:has-children:open {{ image: url({A["down"]}); }}
-QPushButton[kind="danger"]:disabled, QPushButton[kind="ghost"]:disabled {{ color: {TEXT3}; border-color: transparent; background: transparent; }}
+QPushButton[kind="danger"]:disabled, QPushButton[kind="ghost"]:disabled {{ color: {TEXT3}; border: 1px dashed {LINE}; background: transparent; }}
 QTableView#Results {{ background: transparent; border: 0; }}
 QProgressBar {{ background: {BG3}; border: 0; border-radius: 3px; }}
 QProgressBar::chunk {{ background: {ACCENT}; border-radius: 3px; }}
 QTreeView::indicator, QTreeWidget::indicator {{ width: 14px; height: 14px; border-radius: 4px; border: 1px solid {LINE2}; background: {BG2}; }}
 QTreeView::indicator:checked, QTreeWidget::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; image: url("{A['check']}"); }}
 QMenu::item:disabled {{ color: {TEXT3}; }}
+{extra}
 """
 
 

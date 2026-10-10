@@ -18,6 +18,7 @@ changed meanwhile.
 from __future__ import annotations
 
 import concurrent.futures.process  # noqa: F401  (registers its atexit hook early, main thread)
+import math
 import os
 import threading
 from collections import OrderedDict
@@ -173,7 +174,9 @@ def noise_lut(noise: str, palette: str) -> np.ndarray:
     lut = _LUTS.get(key)
     if lut is None:
         en = npal.editor_noise(noise)
-        if palette in npal.CUSTOM_PALETTES:                    # per-noise custom gradient
+        if palette == "Grayscale" and en == "Height":
+            lut = npal.grayscale_height_lut()                  # = cubiomes-viewer (08/10)
+        elif palette in npal.CUSTOM_PALETTES:                  # per-noise custom gradient
             lut = npal.lut_from_stops(npal.CUSTOM_PALETTES[palette].get(en, []), en)
         else:
             lut = npal.warp_lut(npal.builtin_lut(palette, en), en)
@@ -329,6 +332,12 @@ class MapEngine(QObject):
 
     def _on_skipped(self, key):
         self.pending.discard(key)
+        # (08/10) a job skipped because a frame in between (zoom animation) did
+        # not want it, while the LAST frame does: nothing repainted, so it was
+        # never asked again — the map stayed on the blurry coarser tile until
+        # the mouse moved. Ask for a repaint: the next frame requests it again.
+        if key in self.wanted or key in getattr(self, "_frame_wanted", ()):
+            self.tileReady.emit()
 
     def _on_failed(self, key):
         self.pending.discard(key)
@@ -468,8 +477,24 @@ class MapEngine(QObject):
             elif noise == "Approx height":
                 arr = self._height_tile(wk, scale, tx, tz)
                 vmin, vmax = HEIGHT_RANGE
+            elif int(wk[1]) in (19, 20):                        # Exact Y 1.16 (10/10 bis)
+                # the exact 1.16.1 terrain (chunks rebuilt): every block at 1:1
+                # (MapView._tile_scale allows 1:1 for this layer), 32 samples a
+                # side further out (one chunk each)
+                n = TILE if scale == 1 else 32
+                step = max(1, (TILE * scale) // n)
+                import feature116 as f116
+                small = f116.surface_grid(wk[1], wk[0], tx * TILE * scale, tz * TILE * scale,
+                                          n + 1, n + 1, step, bool(caves)).astype(np.float32)
+                arr = small[:TILE, :TILE] if n == TILE else _bilinear_up(small, n, TILE)
+                vmin, vmax = HEIGHT_RANGE
             else:                                               # Exact Y
-                n = min(EXACT_GRID, TILE)
+                # 1:1 tiles: every block (08/10). The terrain is generated per
+                # chunk, so one sample per block costs about what one per 4 blocks
+                # did (measured: 1.35 s vs 1.28 s per tile) — zoomed in, the map
+                # showed 4-block bilinear blur. Coarser scales keep 64 samples per
+                # side (each sample there is in its own chunk: 4× the time for 2×).
+                n = TILE if scale == 1 else min(EXACT_GRID, TILE)
                 step = max(1, (TILE * scale) // n)
                 small = _exact_grid(wk, tx * TILE * scale, tz * TILE * scale, n + 1, step,
                                     bool(caves)).astype(np.float32)
@@ -478,13 +503,30 @@ class MapEngine(QObject):
             pos = (np.asarray(arr, np.float32) - vmin) / max(vmax - vmin, 1e-6)
             u = npal.u_from_pos(pos, npal.editor_noise(noise))       # extended axis
             raw = np.clip(np.rint(np.asarray(u) * 255.0), 0, 255).astype(np.uint8)
+            if noise in ("Approx height", "Exact Y"):
+                # the sinkhole level (y ≤ −64, red in Grayscale like cubiomes-viewer)
+                # gets its own colour indices: exact threshold on every palette
+                sk = npal.sink_index()
+                a_ = np.asarray(arr)
+                raw = np.where(a_ <= npal.SINK_Y, np.minimum(raw, sk),
+                               np.maximum(raw, sk + 1)).astype(np.uint8)
             self.bus.noise.emit(rkey, raw)
         return job
 
     def _height_tile(self, wk, scale, tx, tz):
         hm = _thread_height(wk)
-        MAX_STRIDE, OVL = 32, 8
-        stride = min(MAX_STRIDE, max(1, scale // 4))
+        if scale == 1 and int(wk[1]) < cw.MC_VERSIONS["Java 1.18"]:
+            # (10/10 bis) zoomed in before 1.18: the 1:4 heights are blended
+            # between the cell corners (bilinear, like the game blends its
+            # noise) instead of 4-block squares
+            n = TILE // 4
+            g, _ = hm.gen_height_grid(tx * n, tz * n, n + 1, n + 1, step=1)
+            return _bilinear_up(np.asarray(g, np.float32), n, TILE).astype(np.float32)
+        # (10/10 bis) one sample per pixel at every scale: the stride used to be
+        # capped at 32, so a 1:256 tile computed 528² samples (10 s) and a
+        # 1:16 / 1:64 one 2-3 s — zoomed out, the height map seemed stuck
+        OVL = 8
+        stride = max(1, scale // 4)
         n_samp = (TILE * scale) // (stride * 4)
         gx4, gz4 = tx * TILE * scale // 4, tz * TILE * scale // 4
         gen_n = n_samp + 2 * OVL
@@ -547,6 +589,70 @@ class MapEngine(QObject):
                         pass
                 self.bus.structures.emit(key, pts)
             self.pool.start(_Job(job), 2)
+        return None
+
+    # ── (10/10) 1.16 dungeons / lava lakes, per 512-block block ──────────────
+    FEAT_BLOCK = 256         # (10/10 bis) exact terrain: ~1 s of one core per block
+
+    def features116(self, kind: str, bx: int, bz: int, fetch=True):
+        """(feats, {(ox, oz): lava columns}) of a FEAT_BLOCK block, or None while
+        computed. The structure-seed view (Alt+S) shows what the 48 bits give
+        (attempts, lakes of both indices); the normal view the features that
+        really generate (exact 1.16.1 terrain, feature116.features_exact: one
+        pass for both kinds, on the dedicated f116 pool, one block per worker)."""
+        sv = self.seed_view
+        key = (self.epoch, "f116", kind, bx, bz) + (("seed",) if sv else ())
+        v = self.structs.get(key)
+        if v is not None or not fetch:
+            return v
+        if key in self.struct_pending:
+            return None
+        seed, mc, _large = self.world.key
+        B = self.FEAT_BLOCK
+        if sv:
+            self.struct_pending.add(key)
+
+            def job(key=key):
+                import feature116 as f116
+                try:
+                    fs = f116.features(mc, seed, kind, bx * B, bz * B, bx * B + B - 1, bz * B + B - 1,
+                                       exact=False)
+                    cols = {}
+                    if kind == "lava_lake":
+                        for f in fs:
+                            if not f.surface:
+                                cols[(f.ox, f.oz)] = f116.lake_columns(seed, f)
+                    else:                    # attempts above the approximate ground
+                        keep = set(f116.below_ground(mc, seed, fs))
+                        cols = {"above": frozenset(f for f in fs if f not in keep)}
+                except Exception:
+                    fs, cols = [], {}
+                self.bus.structures.emit(key, (fs, cols))
+            self.pool.start(_Job(job), 2)
+            return None
+        kd = (self.epoch, "f116", "dungeon", bx, bz)
+        kl = (self.epoch, "f116", "lava_lake", bx, bz)
+        self.struct_pending.add(kd)
+        self.struct_pending.add(kl)
+        if not hasattr(self, "f116_pool"):
+            self.f116_pool = QThreadPool()
+            self.f116_pool.setMaxThreadCount(max(2, (os.cpu_count() or 4) - 2))
+        cx_, cz_ = getattr(self, "f116_centre", (0, 0))
+        prio = max(0, 50 - int(math.hypot(bx * B + B / 2 - cx_, bz * B + B / 2 - cz_) / B))
+
+        def jobx(kd=kd, kl=kl):
+            import feature116 as f116
+            if kd[0] != self.epoch:          # another seed / version since: dropped
+                return
+            try:
+                dun, lak = f116.features_exact(mc, seed, bx * B, bz * B, bx * B + B - 1, bz * B + B - 1,
+                                               threads=1)
+                cols = {(f.ox, f.oz): f116.lake_columns(seed, f) for f in lak}
+            except Exception:
+                dun, lak, cols = (), (), {}
+            self.bus.structures.emit(kd, (list(dun), {}))
+            self.bus.structures.emit(kl, (list(lak), cols))
+        self.f116_pool.start(_Job(jobx), prio)
         return None
 
     def with_basement(self, bx: int, bz: int):

@@ -32,7 +32,7 @@ IMPORTED_TYPES = {
 # types that take dependent conditions (children) meaningfully
 CONTAINERS = {"spiral", "logic_or", "logic_not", "scale_to_nether", "scale_to_overworld"}
 NO_AREA = {"scale_to_nether", "scale_to_overworld", "logic_or", "logic_not", "crunchiness"}
-NO_INSTANCES = {"spiral", "scale_to_nether", "scale_to_overworld", "crunchiness", "logic_or",
+NO_INSTANCES = {"spawn_feature116", "spiral", "scale_to_nether", "scale_to_overworld", "crunchiness", "logic_or",
                 "logic_not", "first_stronghold", "spawn", "climate_minmax", "climate_center",
                 "climate_noise", "climate_extreme", "noise_sample", "biome_filter",
                 "biome_sample", "height", "precise_y"}
@@ -127,6 +127,14 @@ def area_text(c: dict) -> str:
             zone = f"({x1}, {z1}) → ({x2}, {z2})"
     if t in ("height", "precise_y"):
         zone += f" · Y {p.get('y_min', '?')}…{p.get('y_max', '?')}"
+    if t in ("dungeon", "lava_lake"):              # (10/10) Y only when narrowed
+        lo, hi = int(p.get("y_min", 0) or 0), int(p.get("y_max", 255) if p.get("y_max") is not None else 255)
+        if lo > 0 or hi < 255:
+            zone += f" · Y {lo}…{hi}"
+        if t == "lava_lake" and p.get("variant") in ("underground", "surface"):
+            zone += f" · {p['variant']}"
+        if c.get("dy_on"):                         # (10/10 ter) height link to the parent
+            zone += f" · ΔY ≤ {int(c.get('dy_max', 0) or 0)}"
     inst = c.get("instances", 1)
     if t not in NO_INSTANCES:
         if inst == 0:
@@ -160,6 +168,59 @@ def new_condition(t: str) -> dict:
         c.update(area_mode=0, radial=0, rmax=0, x1=0, z1=0, x2=0, z2=0, square_side=0)
     if info.get("requires_at"):
         c["at_x"], c["at_z"] = 0, 0
+    return c
+
+
+_GEOM_KEYS = ("area_mode", "radial", "rmax", "square_side", "x1", "z1", "x2", "z2")
+
+
+def convert_condition(old: dict, t: str) -> dict:
+    """"Change type" (08/10): a fresh condition of type t that keeps everything
+    of `old` that means the same thing for t — label, enabled, the area (when
+    both types have one), the instances / ignore-the-parent's-instance options,
+    the "at" centre, and every parameter both types have with a value t accepts
+    (same kind; a choice among t's options). Before: only the area, and not even
+    that (the test looked at a key the new condition never has) → a structure
+    changed into another one lost its precise radius."""
+    c = new_condition(t)
+    for k in ("label", "enabled"):
+        if k in old:
+            c[k] = copy.deepcopy(old[k])
+    ot = old.get("type", "")
+    if t not in NO_AREA and ot not in NO_AREA and not TYPE_INFO.get(t, {}).get("no_area") \
+            and not TYPE_INFO.get(ot, {}).get("no_area"):
+        for k in _GEOM_KEYS:
+            if k in old:
+                c[k] = copy.deepcopy(old[k])
+        if "at_x" in c and "at_x" in old:
+            c["at_x"], c["at_z"] = old.get("at_x", 0), old.get("at_z", 0)
+    if t not in NO_INSTANCES and ot not in NO_INSTANCES and "instances" in old:
+        c["instances"] = old["instances"]
+    if "ignore_ref" in old:
+        c["ignore_ref"] = bool(old["ignore_ref"])
+    if t in ("dungeon", "lava_lake") and "dy_on" in old:     # (10/10 ter)
+        c["dy_on"], c["dy_max"] = bool(old["dy_on"]), int(old.get("dy_max", 8) or 8)
+    specs = TYPE_INFO.get(t, {}).get("params", {})
+    op = old.get("params") or {}
+    for k, v in op.items():
+        if k not in c["params"]:
+            continue
+        d = c["params"][k]
+        spec = specs.get(k, {})
+        opts = spec.get("options")
+        if opts is not None and v not in opts:
+            continue
+        if d is None or v is None:
+            if d is None:
+                c["params"][k] = copy.deepcopy(v)
+            continue
+        if isinstance(d, bool) != isinstance(v, bool):
+            continue
+        num = (int, float)
+        if isinstance(d, num) and isinstance(v, num):
+            c["params"][k] = type(d)(v) if not isinstance(d, bool) else bool(v)
+        elif type(d) is type(v):
+            c["params"][k] = copy.deepcopy(v)
     return c
 
 
@@ -352,12 +413,18 @@ class SessionModel(QObject):
         self._touch("Edit a condition")
 
     def remove(self, uids):
-        drop = set()
-        for u in uids:
-            drop.add(u)
-            drop.update(self.subtree(u))
+        """Removes exactly these conditions (08/10). The conditions linked to a
+        removed one stay, relative to the origin (0, 0) — before, the whole
+        subtree went with it. Returns the number of conditions re-rooted."""
+        drop = {u for u in uids if self.get(u) is not None}
+        moved = 0
+        for c in self.conds:
+            if c["_uid"] not in drop and c.get("_parent", 0) in drop:
+                c["_parent"] = 0
+                moved += 1
         self.conds = [c for c in self.conds if c["_uid"] not in drop]
         self._touch(f"Remove {len(drop)} condition{'s' if len(drop) != 1 else ''}")
+        return moved
 
     def set_enabled(self, uid, on):
         c = self.get(uid)

@@ -134,6 +134,8 @@ class TypePicker(QWidget):
                            "height", "precise_y"], "climate_center"),
               ("Algorithm helpers", ["spiral", "logic_or", "logic_not", "scale_to_nether",
                                      "scale_to_overworld"], "spiral"),
+              ("Presets", ["spawn116_preset", "mansion_spawn116_preset", "dungeon_spawn116_preset",
+                          "lavalake_spawn116_preset"], "spawn"),
               ("Others", None, "slime")]
 
     @classmethod
@@ -255,88 +257,164 @@ class TypePicker(QWidget):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+def _round_swatch(color, size=12):
+    from PySide6.QtGui import QPainter
+    pm = QPixmap(size, size); pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm); p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p.setPen(QColor(0, 0, 0, 90)); p.setBrush(QColor(color))
+    p.drawEllipse(1, 1, size - 2, size - 2); p.end()
+    return QIcon(pm)
+
+
 class BiomePicker(QDialog):
+    """Biome chooser (08/10 redesign): one card per family (Ocean, Jungle…)
+    with its own All / None and a selected count, biomes as coloured chips that
+    toggle on click, a search that keeps the families, a running total.
+    single=True: one biome, a click selects it, a double-click confirms."""
+
     def __init__(self, selected, single=False, mc=28, parent=None):
         super().__init__(parent)
         from biome_catalog import BIOME_MIN_MC, OVERWORLD_BIOMES_ORDERED, biome_swatch_hex
+        from .widgets import FlowLayout
         self.setWindowTitle("Choose a biome" if single else "Choose biomes")
-        self.resize(360, 560)
+        self.resize(760, 640)
         self.single = single
-        v = QVBoxLayout(self); v.setContentsMargins(14, 14, 14, 12); v.setSpacing(8)
-        self.search = QLineEdit(); self.search.setPlaceholderText("Search…")
-        self.search.textChanged.connect(self._filter)
-        v.addWidget(self.search)
-        self.list = QListWidget()
         sel = set(selected if isinstance(selected, (list, tuple, set)) else [selected])
-        group = ""
+        v = QVBoxLayout(self); v.setContentsMargins(18, 16, 18, 14); v.setSpacing(10)
+        top = QHBoxLayout(); top.setSpacing(10)
+        t = QLabel("Choose a biome" if single else "Choose biomes"); t.setObjectName("PanelTitle")
+        top.addWidget(t)
+        self.count = QLabel(); self.count.setObjectName("Chip"); self.count.setProperty("state", "off")
+        top.addWidget(self.count)
+        if not single:          # (08/10) every biome at once, beside the total
+            for text, on, tip in (("All", True, "Select every biome (the ones shown by the search)"),
+                                  ("None", False, "Clear the selection (the ones shown by the search)")):
+                b = QPushButton(text); b.setProperty("kind", "ghost"); b.setToolTip(tip)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.clicked.connect(lambda _=False, o=on: self._set(
+                    [c[0] for c in self.chips if not c[0].isHidden()], o))
+                top.addWidget(b)
+        top.addStretch(1)
+        self.search = QLineEdit(); self.search.setPlaceholderText("Search a biome or a family…")
+        self.search.setClearButtonEnabled(True); self.search.setMinimumWidth(260)
+        self.search.textChanged.connect(self._filter)
+        top.addWidget(self.search)
+        v.addLayout(top)
+        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget(); grid = QGridLayout(inner); grid.setContentsMargins(0, 0, 6, 0)
+        grid.setHorizontalSpacing(10); grid.setVerticalSpacing(10)
+        self.chips = []                     # (button, bid, search key, card)
+        self.cards = []                     # (card, title label, chips)
+        groups, cur = [], None
         for bid, name in OVERWORLD_BIOMES_ORDERED:
             if bid is None:
-                group = name
-                it = QListWidgetItem(name.upper())
-                it.setFlags(Qt.ItemFlag.NoItemFlags)
-                it.setData(Qt.ItemDataRole.UserRole, None)
-                f = it.font(); f.setBold(True); f.setPointSizeF(f.pointSizeF() * 0.85); it.setFont(f)
-                self.list.addItem(it)
+                cur = (name, []); groups.append(cur)
                 continue
-            it = QListWidgetItem(_swatch(biome_swatch_hex(bid), 14), name)
-            it.setData(Qt.ItemDataRole.UserRole, bid)
-            it.setData(Qt.ItemDataRole.UserRole + 1, (name + " " + group).lower())
-            ok = mc >= BIOME_MIN_MC.get(bid, 0)
-            flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            if cur is None:
+                cur = ("Biomes", []); groups.append(cur)
+            cur[1].append((bid, name))
+        from PySide6.QtWidgets import QButtonGroup
+        self._excl = QButtonGroup(self) if single else None
+        if self._excl is not None:
+            self._excl.setExclusive(True)
+        for gi, (gname, items) in enumerate(groups):
+            card = QFrame(); card.setObjectName("Card")
+            cv = QVBoxLayout(card); cv.setContentsMargins(12, 10, 12, 10); cv.setSpacing(8)
+            head = QHBoxLayout(); head.setSpacing(6)
+            title = QLabel(gname.upper()); title.setObjectName("SectionTitle")
+            head.addWidget(title); head.addStretch(1)
+            cnt = QLabel(); cnt.setObjectName("Muted")
+            head.addWidget(cnt)
+            mine = []
             if not single:
-                flags |= Qt.ItemFlag.ItemIsUserCheckable
-            if not ok:
-                flags = Qt.ItemFlag.NoItemFlags
-                it.setToolTip(f"Needs a newer version (from MC id {BIOME_MIN_MC[bid]})")
-            it.setFlags(flags)
-            if not single:
-                it.setCheckState(Qt.CheckState.Checked if bid in sel else Qt.CheckState.Unchecked)
-            self.list.addItem(it)
-            if single and bid in sel:
-                self.list.setCurrentItem(it)
-        if single:
-            self.list.itemDoubleClicked.connect(lambda _i: self.accept())
-        v.addWidget(self.list, 1)
+                for text, on in (("All", True), ("None", False)):
+                    b = QPushButton(text); b.setProperty("kind", "ghost")
+                    b.setStyleSheet("padding: 1px 8px; min-height: 14px; font-size: 8pt;")
+                    b.setCursor(Qt.CursorShape.PointingHandCursor)
+                    b.clicked.connect(lambda _=False, m=mine, o=on: self._set(m, o))
+                    head.addWidget(b)
+            cv.addLayout(head)
+            flow = FlowLayout(h_spacing=6, v_spacing=6)
+            for bid, name in items:
+                b = QPushButton(_round_swatch(biome_swatch_hex(bid), 12), " " + name)
+                b.setObjectName("BiomeChip"); b.setCheckable(True)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                ok = mc >= BIOME_MIN_MC.get(bid, 0)
+                if not ok:
+                    b.setEnabled(False)
+                    b.setToolTip(f"{name}\nUnavailable: not generated in this Minecraft version.")
+                b.setChecked(bid in sel and ok)
+                if single:
+                    self._excl.addButton(b)
+                    b.installEventFilter(self)
+                b.toggled.connect(lambda _on: self._refresh())
+                flow.addWidget(b)
+                mine.append(b)
+                self.chips.append((b, bid, (name + " " + gname).lower(), card))
+            cv.addLayout(flow)
+            self.cards.append((card, cnt, mine))
+            grid.addWidget(card, gi // 2, gi % 2)
+        grid.setRowStretch(grid.rowCount(), 1)
+        sc.setWidget(inner)
+        v.addWidget(sc, 1)
         row = QHBoxLayout()
-        if not single:
-            for text, on in (("All", True), ("None", False)):
-                b = QPushButton(text); b.setProperty("kind", "ghost")
-                b.clicked.connect(lambda _=False, o=on: self._all(o))
-                row.addWidget(b)
         row.addStretch(1)
         c = QPushButton("Cancel"); c.clicked.connect(self.reject); row.addWidget(c)
         ok = QPushButton("OK"); ok.setProperty("kind", "primary"); ok.clicked.connect(self.accept)
         row.addWidget(ok)
         v.addLayout(row)
+        self._refresh()
+
+    def eventFilter(self, obj, ev):                  # single: double-click = OK
+        from PySide6.QtCore import QEvent
+        if ev.type() == QEvent.Type.MouseButtonDblClick and self.single:
+            obj.setChecked(True)
+            self.accept()
+            return True
+        return False
+
+    def _set(self, buttons, on):
+        for b in buttons:
+            if b.isEnabled() and not b.isHidden():
+                b.blockSignals(True); b.setChecked(on); b.blockSignals(False)
+        self._refresh()
+
+    def _refresh(self):
+        n = 0
+        for card, cnt, mine in self.cards:
+            k = sum(1 for b in mine if b.isChecked())
+            n += k
+            avail = sum(1 for b in mine if b.isEnabled())
+            cnt.setText(f"{k} / {avail}" if not self.single else "")
+        if self.single:
+            cur = self.value()
+            from biome_catalog import biome_display_name
+            self.count.setText(biome_display_name(int(cur)) if cur is not None else "none")
+        else:
+            self.count.setText(f"{n} selected")
 
     def _filter(self, text):
         q = text.strip().lower()
-        for i in range(self.list.count()):
-            it = self.list.item(i)
-            key = it.data(Qt.ItemDataRole.UserRole + 1)
-            it.setHidden(bool(q) and (key is None or q not in key))
-
-    def _all(self, on):
-        for i in range(self.list.count()):
-            it = self.list.item(i)
-            if it.data(Qt.ItemDataRole.UserRole) is not None and not it.isHidden() \
-                    and it.flags() & Qt.ItemFlag.ItemIsUserCheckable:
-                it.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+        for card, _cnt, mine in self.cards:
+            vis = 0
+            for b in mine:
+                key = next(c[2] for c in self.chips if c[0] is b)
+                show = not q or q in key
+                b.setVisible(show)
+                vis += show
+            card.setVisible(vis > 0)
 
     def value(self):
         if self.single:
-            it = self.list.currentItem()
-            return it.data(Qt.ItemDataRole.UserRole) if it else None
-        out = []
-        for i in range(self.list.count()):
-            it = self.list.item(i)
-            if it.data(Qt.ItemDataRole.UserRole) is not None and \
-                    it.checkState() == Qt.CheckState.Checked:
-                out.append(int(it.data(Qt.ItemDataRole.UserRole)))
-        return out
+            b = next((c for c in self.chips if c[0].isChecked()), None)
+            return b[1] if b else None
+        return [int(bid) for b, bid, _k, _c in self.chips if b.isChecked()]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+STEP_MAX = 1 << 30          # spiral step (08/10: noise tiling, 131 072 and more)
+
+
 class ConditionForm(QWidget):
     saved = Signal(dict)
     cancelled = Signal()
@@ -348,6 +426,9 @@ class ConditionForm(QWidget):
         super().__init__(parent)
         self.cond = None
         self.parent_label = None
+        self.parent_choices = None         # [(uid, label)] for "Related to" (08/10)
+        self.parent_uid = 0
+        self.parent_lookup = None          # uid -> condition dict (10/10 ter: height link)
         self.mc = 28
         self._building = False
         # live preview while typing, debounced (no redraw per key stroke)
@@ -385,19 +466,27 @@ class ConditionForm(QWidget):
         v.addLayout(foot)
 
     # ── building ────────────────────────────────────────────────────────────
-    def edit(self, cond, parent_label=None, mc=28, is_new=False):
-        """Show the form for `cond` (engine-format dict)."""
+    def edit(self, cond, parent_label=None, mc=28, is_new=False, parent_choices=None,
+             parent_uid=0):
+        """Show the form for `cond` (engine-format dict). parent_choices: the
+        conditions it may be related to, [(uid, label)] — a "Related to" field
+        then lets the parent be changed (08/10)."""
         if is_new:
             self.plan_gpu = False
         self.cond = copy.deepcopy(cond)
         self.parent_label = parent_label
+        self.parent_choices = parent_choices
+        self.parent_uid = int(parent_uid or 0)
         self.mc = mc
         self.is_new = is_new
+        if is_new and self._same_type_parent():
+            self.cond["ignore_ref"] = True
         self._build()
         self._emit_preview()
 
     def _build(self):
         self._building = True
+        self._range_bars = []
         c = self.cond
         t = c.get("type", "")
         info = TYPE_INFO.get(t, {})
@@ -427,6 +516,19 @@ class ConditionForm(QWidget):
         self.w["enabled"] = QCheckBox("Enabled"); self.w["enabled"].setChecked(c.get("enabled", True))
         self.w["enabled"].toggled.connect(self._changed)
         lay.addWidget(self.w["enabled"])
+        if self.parent_choices is not None:
+            from PySide6.QtWidgets import QComboBox as _QCB
+            pc = _QCB()
+            pc.addItem("World origin (0, 0)", 0)
+            for u, lab in self.parent_choices:
+                pc.addItem(lab, int(u))
+            i = pc.findData(self.parent_uid)
+            pc.setCurrentIndex(i if i >= 0 else 0)
+            pc.setToolTip("The condition this one is placed around (its area is centred on\n"
+                          "where that condition is satisfied), or the world origin.")
+            pc.currentIndexChanged.connect(self._parent_changed)
+            self.w["parent"] = pc
+            lay.addLayout(_field("Related to", pc))
         if info.get("desc"):
             lay.addWidget(body(info["desc"], muted=True, small=True))
         if info.get("disabled"):               # e.g. abandoned camp (temporarily hidden)
@@ -460,6 +562,14 @@ class ConditionForm(QWidget):
                 lay.addWidget(self._ca_hint)
         lay.addStretch(1)
         self.scroll.setWidget(w)
+        # "Outside range" ↔ the range bar shows the kept part outside (08/10)
+        inv = self.pw.get("invert")
+        if inv is not None and self._range_bars and inv[0] == "bool":
+            def _inv(on):
+                for rs in self._range_bars:
+                    rs.set_inverted(on)
+            inv[1].toggled.connect(_inv)
+            _inv(inv[1].isChecked())
         self._building = False
         self._sync_enable()
 
@@ -527,10 +637,14 @@ class ConditionForm(QWidget):
                                  "Minimum number of instances inside the area.\n"
                                  "0 = exclusion: NO instance may be inside the area."))
             self.w["instances"].valueChanged.connect(self._changed)
+        self._build_dy(lay, c)
         if t in STRUCTURE_KEYS and self.parent_label:
             self.w["ignore_ref"] = QCheckBox("Ignore the reference structure itself")
-            self.w["ignore_ref"].setToolTip("An instance exactly at the parent's position is not "
-                                            "counted (useful for 'another village near this one').")
+            self.w["ignore_ref"].setToolTip(
+                "The parent's own instance is not counted: ticked, it asks for ANOTHER one\n"
+                "('another village near this village'). Unticked, a condition linked to one\n"
+                "of its own type is met by the parent itself (Cubiomes Viewer's default).\n"
+                "Ticked by default when the parent is of the same type.")
             self.w["ignore_ref"].setChecked(bool(c.get("ignore_ref")))
             self.w["ignore_ref"].toggled.connect(self._changed)
             lay.addWidget(self.w["ignore_ref"])
@@ -551,6 +665,50 @@ class ConditionForm(QWidget):
                 self.w[k].valueChanged.connect(self._changed)
             self.w["sampling"].currentTextChanged.connect(self._changed)
         self._area_mode_changed(self.w["area"].value(), emit=False)
+
+    def _same_type_parent(self):
+        """(10/10) Linked to a condition of its OWN type ("village near a
+        village"): as in Cubiomes Viewer the parent instance itself would count,
+        so one village was enough — 'Ignore the reference structure' is then
+        ticked by default, which asks for ANOTHER one."""
+        par = self._parent_cond()
+        t = self.cond.get("type")
+        return bool(par is not None and t in STRUCTURE_KEYS and par.get("type") == t)
+
+    def _parent_cond(self):
+        if not self.parent_uid or self.parent_lookup is None:
+            return None
+        try:
+            return self.parent_lookup(self.parent_uid)
+        except Exception:
+            return None
+
+    def _build_dy(self, lay, c):
+        """(10/10 ter) Height link: a 1.16 dungeon / lava lake placed around a
+        parent that has a Y (dungeon spawner, top lava layer, stronghold end
+        portal) may also be limited in height: |its Y − the parent's Y| ≤ N."""
+        from custom_search import Y_CHILD_TYPES, y_tracking
+        par = self._parent_cond()
+        if c["type"] not in Y_CHILD_TYPES or par is None or not y_tracking(par):
+            return
+        what = {"dungeon": "its spawner", "lava_lake": "its top lava layer"}.get(par.get("type"),
+                                                                                  "its end portal")
+        row = QWidget(); hl = QHBoxLayout(row); hl.setContentsMargins(0, 0, 0, 0); hl.setSpacing(8)
+        cb = QCheckBox("Height to the parent ≤")
+        cb.setChecked(bool(c.get("dy_on")))
+        sp = _spin(0, 255, int(c.get("dy_max", 8) or 8), 1, " blocks")
+        sp.setEnabled(cb.isChecked())
+        mine = "dungeons" if c["type"] == "dungeon" else "lava lakes"
+        tip = (f"The parent has a Y ({what}). Ticked: only the {mine} whose Y\n"
+               "is at most this many blocks above or below it count — on top of the\n"
+               "distance above (the horizontal one).")
+        cb.setToolTip(tip); sp.setToolTip(tip)
+        cb.toggled.connect(sp.setEnabled)
+        cb.toggled.connect(self._changed)
+        sp.valueChanged.connect(self._changed)
+        hl.addWidget(cb); hl.addWidget(sp, 1)
+        lay.addWidget(row)
+        self.w["dy_on"], self.w["dy_max"] = cb, sp
 
     def _area_mode_changed(self, mode, emit=True):
         for k, row in self._rows.items():
@@ -781,6 +939,8 @@ class ConditionForm(QWidget):
             val = p.get(key, spec.get("default"))
             if typ == "bool":
                 wd = QCheckBox(label); wd.setChecked(bool(val)); wd.toggled.connect(self._changed)
+                if spec.get("tip"):
+                    wd.setToolTip(spec["tip"])
                 lay.addWidget(wd)
                 if key == "use_gpu" and getattr(self, "plan_gpu", False) and not val:
                     lay.addWidget(body("Engine plan applied: this condition runs as a GPU "
@@ -852,27 +1012,49 @@ class ConditionForm(QWidget):
                 # clamped: an imported cubiomes-viewer « Approx height » has no
                 # bound = ±1e30, which made the spin box raise → the editor
                 # could not open (01/10)
-                def _y(v, d):
+                # (10/10) the spec's own bounds (0 … 255 for the 1.16 features)
+                ymn, ymx = int(spec.get("min", -64)), int(spec.get("max", 320))
+
+                def _y(v, d, ymn=ymn, ymx=ymx):
                     try:
                         v = float(v)
                     except (TypeError, ValueError):
                         return d
-                    return int(max(-64.0, min(320.0, v))) if v == v else d
-                lo = _y(p.get("y_min"), spec.get("min", -64))
-                hi = _y(p.get("y_max"), spec.get("max", 320))
-                box = QWidget(); bl = QHBoxLayout(box); bl.setContentsMargins(0, 0, 0, 0)
-                a = _spin(-64, 320, lo, 1); b = _spin(-64, 320, hi, 1)
+                    return int(max(float(ymn), min(float(ymx), v))) if v == v else d
+                lo = _y(p.get("y_min"), ymn)
+                hi = _y(p.get("y_max"), ymx)
+                # (08/10) a two-handle bar over the two fields, like
+                # cubiomes-viewer; "Outside range" paints the kept part outside
+                from .widgets import RangeSlider
+                box = QWidget(); bv = QVBoxLayout(box); bv.setContentsMargins(0, 0, 0, 0)
+                bv.setSpacing(2)
+                rs = RangeSlider(ymn, ymx, lo, hi)
+                bl = QHBoxLayout(); bl.setContentsMargins(0, 0, 0, 0)
+                a = _spin(ymn, ymx, lo, 1); b = _spin(ymn, ymx, hi, 1)
+
+                def _from_bar(l, h, a=a, b=b):
+                    for e, v in ((a, l), (b, h)):
+                        e.blockSignals(True); e.setValue(v); e.blockSignals(False)
+                    self._changed()
+
+                def _from_fields(_v=None, a=a, b=b, rs=rs):
+                    rs.set_values(a.value(), b.value())
+                    self._changed()
+                rs.rangeChanged.connect(_from_bar)
                 for e in (a, b):
-                    e.valueChanged.connect(self._changed)
+                    e.valueChanged.connect(_from_fields)
                 bl.addWidget(a); bl.addWidget(body("to", muted=True, wrap=False)); bl.addWidget(b)
+                bv.addWidget(rs); bv.addLayout(bl)
                 wd = (a, b)
-                lay.addLayout(_field(label, box))
+                self._range_bars = getattr(self, "_range_bars", []) + [rs]
+                lay.addLayout(_field(label, box, "Drag the two handles or type the bounds "
+                                                 f"({ymn} … {ymx})."))
             elif typ == "spiral_step":
                 # any step in blocks (sessions use 437, 1 500 …): the old fixed list
                 # fell back to 1 for those and saving wrote step 1 (01/10)
                 try:
                     blocks = int(val if val is not None else 16)
-                    blocks = 512 if blocks < 1 else min(65535, blocks)   # 0 = 512 in cubiomes-viewer
+                    blocks = 512 if blocks < 1 else min(STEP_MAX, blocks)   # 0 = 512 in cubiomes-viewer
                 except (TypeError, ValueError):
                     blocks = 16
                 unit = p.get("step_unit", "blocks")
@@ -885,9 +1067,9 @@ class ConditionForm(QWidget):
                     b = keep if keep is not None else sp.property("blocks")
                     sp.blockSignals(True)
                     if u == "chunks":
-                        sp.setRange(1, 4095); sp.setValue(max(1, round(b / 16)))
+                        sp.setRange(1, STEP_MAX // 16); sp.setValue(max(1, round(b / 16)))
                     else:
-                        sp.setRange(1, 65535); sp.setValue(b)
+                        sp.setRange(1, STEP_MAX); sp.setValue(b)
                     sp.blockSignals(False)
                 sp.setProperty("blocks", blocks)
                 _apply_unit(unit, keep=blocks)
@@ -904,7 +1086,10 @@ class ConditionForm(QWidget):
                 wd = (sp, seg)
                 lay.addLayout(_field(label, box, "Distance between two tested positions. "
                                                  "1 chunk = 16 blocks; saved in blocks, "
-                                                 "like cubiomes-viewer."))
+                                                 "like cubiomes-viewer (which stores at most "
+                                                 "65 535).\nUp to 2^30 blocks: e.g. 131 072 = the "
+                                                 "period of the A octaves of weirdness "
+                                                 "(noise tiling)."))
             elif typ == "slider_with_entry":
                 wd = DecimalSpin(3)
                 wd.setRange(spec.get("min", 0.0), spec.get("max", 1.0))
@@ -1076,6 +1261,11 @@ class ConditionForm(QWidget):
             c["instances"] = self.w["instances"].value()
         if "ignore_ref" in self.w:
             c["ignore_ref"] = self.w["ignore_ref"].isChecked()
+        if "dy_on" in self.w:                               # (10/10 ter) height link
+            c["dy_on"] = self.w["dy_on"].isChecked()
+            c["dy_max"] = int(self.w["dy_max"].value())
+        elif c.get("dy_on") and self.parent_lookup is not None:   # the parent has no Y any more
+            c["dy_on"] = False
         params = dict(c.get("params", {}))                 # unknown keys are kept
         for key, (typ, wd, spec) in getattr(self, "pw", {}).items():
             if typ == "bool":
@@ -1147,6 +1337,26 @@ class ConditionForm(QWidget):
         if t == "crunchiness" and not any((params.get("octaves") or {}).values()):
             raise ValueError("Tick at least one octave.")
         return c
+
+    def _parent_changed(self, _i):
+        """Another parent: keep what was typed, rebuild (texts and options that
+        depend on having a parent, e.g. Exact Y's offset)."""
+        pc = self.w.get("parent")
+        if pc is None or self._building:
+            return
+        try:
+            self.cond = self.value()
+        except ValueError:
+            pass
+        self.parent_uid = int(pc.currentData() or 0)
+        self.parent_label = pc.currentText() if self.parent_uid else None
+        if self._same_type_parent():
+            self.cond["ignore_ref"] = True
+        QTimer.singleShot(0, self._rebuild_keep)
+
+    def _rebuild_keep(self):
+        self._build()
+        self._emit_preview()
 
     # ── signals ─────────────────────────────────────────────────────────────
     def _changed(self, *_):

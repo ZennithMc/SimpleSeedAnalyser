@@ -108,7 +108,8 @@ _SSA_TO_F: Dict[str, int] = {
 }
 
 # Conditions SSA-only : sauvegardées en #SSA: <json>, ignorées par cubiomes
-_SSA_ONLY = {"crunchiness", "mountain_ring", "mushroom_island", "cherry_ring",
+_SSA_ONLY = {"crunchiness", "mountain_ring", "mushroom_island", "cherry_ring", "dungeon", "lava_lake",
+             "spawn_feature116",
              "climate_center"}   # coarse flood fill: no cubiomes-viewer equivalent (01/10)
 
 _SCALE_TO_F_CLEAN = {1: F_BIOME, 4: F_BIOME_4, 16: F_BIOME_16,
@@ -389,7 +390,9 @@ def _encode_condition(cond: dict, save_idx: int) -> str:
             flags |= FLG_IN_RANGE
 
     elif t == "spiral":
-        step = int(params.get("step", 0)) & 0xFFFF
+        # cubiomes-viewer stores 16 bits: a bigger step (SSA, noise tiling) is
+        # written as its maximum there — SSA reads its own value back (#SSAx)
+        step = max(0, min(0xFFFF, int(params.get("step", 0))))
 
     elif t == "stronghold":
         count = instances

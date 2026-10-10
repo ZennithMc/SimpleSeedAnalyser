@@ -52,6 +52,7 @@
 #include "generator.h"
 #include "biomenoise.h"
 #include "noise.h"
+#include "terrain116.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -97,12 +98,16 @@
 #define CTYPE_CRUNCHINESS         19
 #define CTYPE_NOISE_SAMPLE        20
 #define CTYPE_CLIMATE_AREA        21   /* Locate climate center: coarse flood fill (01/10) */
+#define CTYPE_SPAWN_FEATURE       22   /* (09/10) 1.16 fallback spawn: dungeon / lava lake */
+#define CTYPE_FEATURE116          23   /* (10/10) 1.16 dungeons / lava lakes in an area */
 
 #define VARIANT_NONE          0
 #define VARIANT_ABANDONED     1
 #define VARIANT_NOT_ABANDONED 2
 #define VARIANT_BASEMENT      3
 #define VARIANT_NO_BASEMENT   4
+#define VARIANT_UNDERGROUND   5     /* (10/10) lava lake below sea level */
+#define VARIANT_SURFACE       6     /* (10/10) lava lake at sea level or above */
 
 #define SSA_MODE_INC    0
 #define SSA_MODE_FAM48  1
@@ -187,6 +192,11 @@ typedef struct {
      * (count == 1) — dependent conditions are tested around EACH sampled
      * position (OR) instead of the centre of the samples. */
     int32_t  yield_samples;
+
+    /* (10/10 ter) height link to the parent: when the parent has a Y (a 1.16
+     * dungeon / lava lake, …), only the instances with |Y - parent Y| <=
+     * dy_max - 1 are kept (0 = no height link) */
+    int32_t  dy_max;
 } SsaCond;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -211,6 +221,8 @@ typedef struct {
 typedef struct {
     int     valid;
     int32_t x, z;
+    int     has_y;              /* (10/10 ter) the position has a Y (dungeon spawner, lava…) */
+    int32_t y;
 } SsaPos;
 
 struct ChildOrderCache_s;   /* defined below; one per search (see build_child_order) */
@@ -261,6 +273,8 @@ typedef struct {
     int          sample_n;
     /* per-condition profiler of the search (NULL outside the engine) */
     struct SsaProf_s *prof;
+    /* ssa_explain_seed: positions only from the evaluation that succeeded */
+    int          explain;
 } SsaEnv;
 
 /* ── Profiler (27/09) ─────────────────────────────────────────────────────
@@ -471,15 +485,643 @@ static inline void env_set_dim(SsaEnv *e, int dim) {
 
 static inline void env_push(SsaEnv *e, int idx, int32_t x, int32_t z) {
     if (idx >= 0 && idx <= MAX_CONDS) {
-        e->positions[idx].valid = 1;
-        e->positions[idx].x = x;
-        e->positions[idx].z = z;
+        SsaPos *p = &e->positions[idx];
+        /* the same place again (a parent re-pushed at its own position)
+           keeps its Y; another place has none */
+        if (!(p->valid && p->x == x && p->z == z)) p->has_y = 0;
+        p->valid = 1;
+        p->x = x;
+        p->z = z;
     }
+}
+
+static inline void env_push_y(SsaEnv *e, int idx, int32_t x, int32_t y, int32_t z) {
+    if (idx >= 0 && idx <= MAX_CONDS) {
+        SsaPos *p = &e->positions[idx];
+        p->valid = 1; p->x = x; p->z = z; p->has_y = 1; p->y = y;
+    }
+}
+
+/* the height link of condition c: 1 = feature f's Y is allowed (no link,
+ * no parent Y, or |Y - parent Y| <= dy_max) */
+static inline int dy_ok(const SsaEnv *e, const SsaCond *c, int32_t y)
+{
+    if (c->dy_max <= 0) return 1;                 /* dy_max = the limit + 1 (0: no link) */
+    int pi = c->parent_idx;
+    if (pi < 0 || pi > MAX_CONDS) return 1;
+    const SsaPos *p = &e->positions[pi];
+    if (!p->valid || !p->has_y) return 1;
+    int32_t d = y - p->y;
+    return (d < 0 ? -d : d) <= c->dy_max - 1;
+}
+
+/* (10/10) "Ignore the reference": is this 1.16 feature the parent's own
+ * instance? With a parent Y (dungeon spawner, top lava layer) the Y must match
+ * too — another dungeon in the same column (stacked) is not the parent. */
+static inline int f116_is_ref(const SsaEnv *e, const SsaCond *c, int32_t x, int32_t y,
+                              int32_t z, int32_t at_x, int32_t at_z)
+{
+    if (x != at_x || z != at_z) return 0;
+    int pi = c->parent_idx;
+    if (!e || pi < 0 || pi > MAX_CONDS) return 1;
+    const SsaPos *p = &e->positions[pi];
+    if (!p->valid || !p->has_y) return 1;
+    return y == p->y;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * isSlimeChunk — pure arithmetic (matches finders.h isSlimeChunk inline)
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* ── (09/10) 1.16.1 features at the fallback spawn point ────────────────────
+ * When no spawn is found, the joining player stays at (8.5, 65, 8.5): feet in
+ * block (8, 65, 8), head in (8, 66, 8). These predict, from the 48 low bits
+ * only (population seeds), whether a dungeon or a lava lake of 1.16.1 covers
+ * that point — the real Minecraft check (tools/checker/SpawnWorker.java)
+ * decides afterwards (terrain, caves, validity).
+ *   dungeon:   chunk (0, 0), UNDERGROUND_STRUCTURES (3), feature index 3:
+ *              8 attempts x = nextInt(16), z = nextInt(16), y = nextInt(256),
+ *              then MonsterRoomFeature draws its half sizes (2 × nextInt(2))
+ *              and stops when the place is not valid (earlier attempts are
+ *              assumed invalid). Room interior y..y+3, |dx|,|dz| <= 2 always.
+ *              Checked in Minecraft 1.16.1 (seed 139: 5th attempt, (11,22,10)).
+ *   lava lake: chunks (-1..0, -1..0), LAKES (1), feature index 1:
+ *              LavaLakeDecorator (nextInt(8) == 0, x, z, y = nextInt(nextInt
+ *              (248) + 8), y >= 63 → nextInt(10) == 0) then LakeFeature's
+ *              shape (4-7 ellipsoids in 16×8×16 from y - 4, lava below its
+ *              layer 4). Checked in Minecraft 1.16.1 (seeds 9 and 20: 101/101
+ *              and 91/91 predicted lava blocks are lava).
+ * The lake doubles must match Java bit for bit: no FMA contraction here. */
+static uint64_t sf_pop_seed(uint64_t ws, int32_t bx, int32_t bz)
+{
+    uint64_t r;
+    setSeed(&r, ws);
+    uint64_t a = nextLong(&r) | 1, b = nextLong(&r) | 1;
+    return ((uint64_t)(int64_t)bx * a + (uint64_t)(int64_t)bz * b) ^ ws;
+}
+
+__attribute__((unused)) static int sf_dungeon_hit(uint64_t ws)
+{
+    uint64_t r;
+    setSeed(&r, sf_pop_seed(ws, 0, 0) + 3 + 10000 * 3);
+    for (int i = 0; i < 8; i++) {
+        int x = nextInt(&r, 16), z = nextInt(&r, 16), y = nextInt(&r, 256);
+        nextInt(&r, 2); nextInt(&r, 2);
+        if (abs(x - 8) <= 2 && abs(z - 8) <= 2 && y >= 62 && y <= 66) return 1;
+    }
+    return 0;
+}
+
+__attribute__((optimize("fp-contract=off")))
+__attribute__((unused)) static int sf_lava_lake_hit(uint64_t ws)
+{
+    for (int cz = -1; cz <= 0; cz++)
+    for (int cx = -1; cx <= 0; cx++) {
+        uint64_t r;
+        setSeed(&r, sf_pop_seed(ws, cx * 16, cz * 16) + 1 + 10000 * 1);
+        if (nextInt(&r, 8) != 0) continue;
+        int x = nextInt(&r, 16) + cx * 16, z = nextInt(&r, 16) + cz * 16;
+        int y = nextInt(&r, nextInt(&r, 248) + 8);
+        if (!(y < 63 || nextInt(&r, 10) == 0)) continue;
+        /* lava layers y-3..y-1 must reach 65 or 66, (8, 8) inside the box */
+        int lx = 8 - x, lz = 8 - z;
+        if (lx < 1 || lx > 14 || lz < 1 || lz > 14 || y < 66 || y > 69) continue;
+        int n = nextInt(&r, 4) + 4, hit = 0;
+        for (int i = 0; i < n; i++) {
+            double d = nextDouble(&r) * 6.0 + 3.0, e = nextDouble(&r) * 4.0 + 2.0;
+            double f = nextDouble(&r) * 6.0 + 3.0;
+            double g = nextDouble(&r) * (16.0 - d - 2.0) + 1.0 + d / 2.0;
+            double h = nextDouble(&r) * (8.0 - e - 4.0) + 2.0 + e / 2.0;
+            double k = nextDouble(&r) * (16.0 - f - 2.0) + 1.0 + f / 2.0;
+            for (int py = 65; py <= 66 && !hit; py++) {
+                int c = py - (y - 4);              /* the shape's layer */
+                if (c < 1 || c > 3) continue;      /* lava below layer 4 */
+                double u = (lx - g) / (d / 2.0), v = (c - h) / (e / 2.0), w = (lz - k) / (f / 2.0);
+                double q = u * u + v * v;
+                q = q + w * w;
+                if (q < 1.0) hit = 1;
+            }
+        }
+        if (hit) return 1;
+    }
+    return 0;
+}
+
+/* ── (10/10) 1.16 dungeons and lava lakes, anywhere ────────────────────────
+ * Same RNG as above (checked in Minecraft 1.16.1), per chunk:
+ *   dungeon:   the 8 attempts of the chunk (x, y, z = the spawner, half sizes
+ *              2..3 drawn before the validity test). Each attempt only becomes
+ *              a dungeon next to a cave (1..5 openings, solid floor / ceiling):
+ *              these are the places the game TRIES; a valid earlier attempt
+ *              would shift the later ones (it draws much more).
+ *   lava lake: at most one per chunk. Feature index 0 in deserts (no water
+ *              lake there), 1 elsewhere — checked in Minecraft on desert,
+ *              ocean, badlands and plains chunks. 48 bits alone: both indices
+ *              (a superset); with the biome of the chunk (the 1:4 cell
+ *              (cx*4+2, cz*4+2), as ChunkGenerator.generateFeatures): exact.
+ *              Box x..x+15, z..z+15, y-4..y+3; lava in layers 1..3 → y-3..y-1.
+ *              Decorator y >= 63 (1 in 10): a SURFACE lake, it drops to the
+ *              ground first (terrain): its Y is unknown here.
+ * SsaFeat.y = spawner / top lava layer; lake x, z = centre of its box. */
+typedef struct {
+    int32_t x, y, z;
+    int32_t kind;          /* 0 dungeon, 1 lava lake */
+    int32_t sx, sz;        /* dungeon half sizes (interior) / lake box 16 */
+    int32_t flags;         /* dungeon: attempt index; lake: 1 surface, 2 desert index */
+    int32_t ox, oy, oz;    /* lake: box origin (decorator x, y - 4, z) */
+} SsaFeat;
+
+static int f116_is_desert(int b) { return b == desert || b == desert_hills || b == desert_lakes; }
+
+/* lake of chunk (cx, cz) with feature index idx: 1 + fills f (and leaves r
+ * positioned for the shape), 0 if none */
+static int f116_lake_at(uint64_t ws, int32_t cx, int32_t cz, int idx, SsaFeat *f, uint64_t *rng)
+{
+    uint64_t r;
+    setSeed(&r, sf_pop_seed(ws, cx * 16, cz * 16) + idx + 10000 * 1);
+    if (nextInt(&r, 8) != 0) return 0;
+    int x = nextInt(&r, 16) + cx * 16, z = nextInt(&r, 16) + cz * 16;
+    int y = nextInt(&r, nextInt(&r, 248) + 8);
+    if (!(y < 63 || nextInt(&r, 10) == 0)) return 0;
+    if (y <= 4) return 0;
+    f->kind = 1; f->x = x + 8; f->z = z + 8; f->y = y - 1;
+    f->sx = f->sz = 16; f->flags = (y >= 63 ? 1 : 0) | (idx == 0 ? 2 : 0);
+    f->ox = x; f->oy = y - 4; f->oz = z;
+    if (rng) *rng = r;
+    return 1;
+}
+
+/* the 16×16×8 shape of a lake (LakeFeature 1.16.1), from the positioned rng */
+__attribute__((optimize("fp-contract=off")))
+static void f116_lake_shape(uint64_t r, uint8_t *s /* [2048] */)
+{
+    memset(s, 0, 2048);
+    int n = nextInt(&r, 4) + 4;
+    for (int i = 0; i < n; i++) {
+        double d = nextDouble(&r) * 6.0 + 3.0, e = nextDouble(&r) * 4.0 + 2.0;
+        double f = nextDouble(&r) * 6.0 + 3.0;
+        double g = nextDouble(&r) * (16.0 - d - 2.0) + 1.0 + d / 2.0;
+        double h = nextDouble(&r) * (8.0 - e - 4.0) + 2.0 + e / 2.0;
+        double k = nextDouble(&r) * (16.0 - f - 2.0) + 1.0 + f / 2.0;
+        for (int a = 1; a < 15; a++) for (int b = 1; b < 15; b++) for (int c = 1; c < 7; c++) {
+            double u = (a - g) / (d / 2.0), v = (c - h) / (e / 2.0), w = (b - k) / (f / 2.0);
+            double q = u * u + v * v;
+            q = q + w * w;
+            if (q < 1.0) s[(a * 16 + b) * 8 + c] = 1;
+        }
+    }
+}
+
+/* features of chunk (cx, cz): g = NULL → 48 bits only (lakes: both indices,
+ * a superset), else the chunk's biome picks the lake index (exact) */
+static int f116_chunk(uint64_t ws, int kind, int32_t cx, int32_t cz, const Generator *g, SsaFeat *out)
+{
+    int n = 0;
+    if (kind == 0) {
+        /* (10/10) feature index of monster_room in UNDERGROUND_STRUCTURES, read
+         * in the 1.16.1 biome registry: 2 structures (mineshaft, buried
+         * treasure) + the fossil before it in desert (2) and swamp (6) only */
+        int i0 = 2, i1 = 3;
+        if (g) {
+            int b = t116_biome4(g, cx * 4 + 2, cz * 4 + 2);
+            i0 = i1 = (b == desert || b == swamp) ? 3 : 2;
+        }
+        for (int idx = i0; idx <= i1; idx++) {
+            uint64_t r;
+            setSeed(&r, sf_pop_seed(ws, cx * 16, cz * 16) + idx + 10000 * 3);
+            for (int i = 0; i < 8; i++) {
+                int x = nextInt(&r, 16), z = nextInt(&r, 16), y = nextInt(&r, 256);
+                int j = nextInt(&r, 2) + 2, k = nextInt(&r, 2) + 2;
+                SsaFeat *f = &out[n++];
+                f->kind = 0; f->x = cx * 16 + x; f->y = y; f->z = cz * 16 + z;
+                f->sx = j; f->sz = k; f->flags = i | (idx == 3 ? 8 : 0);
+                f->ox = f->x; f->oy = y; f->oz = f->z;
+            }
+        }
+        return n;
+    }
+    if (g) {
+        int b = t116_biome4(g, cx * 4 + 2, cz * 4 + 2);
+        if (f116_lake_at(ws, cx, cz, f116_is_desert(b) ? 0 : 1, &out[n], NULL)) n++;
+        return n;
+    }
+    for (int idx = 0; idx < 2; idx++)
+        if (f116_lake_at(ws, cx, cz, idx, &out[n], NULL)) n++;
+    return n;
+}
+
+static inline int f116_version_ok(int mc) { return mc == MC_1_16_1 || mc == MC_1_16_5; }
+
+/* (10/10) approximate terrain height (cubiomes mapApproxHeight, 1:4 cell):
+ * on 1.16 within a few blocks of the real ground (ocean: its floor). A
+ * dungeon needs a solid floor and ceiling: an attempt more than F116_ABOVE
+ * blocks above that ground is in the air / water — dropped when the
+ * condition asks for "below the ground" (variant_filter 5 on a dungeon). */
+#define F116_ABOVE 10
+typedef struct { const Generator *g; const SurfaceNoise *sn; } F116Ground;
+
+static int f116_below_ground(const F116Ground *gr, const SsaFeat *f)
+{
+    if (!gr || !gr->g || !gr->sn) return 1;              /* unknown: kept (superset) */
+    float y;
+    if (mapApproxHeight(&y, NULL, gr->g, gr->sn, f->x >> 2, f->z >> 2, 1, 1)) return 1;
+    return f->y <= (int)y + F116_ABOVE;
+}
+
+/* does a feature pass the Y range / lake kind of condition c? */
+static int f116_keep(const SsaCond *c, const SsaFeat *f)
+{
+    if (f->kind == 1) {
+        int surf = f->flags & 1;
+        if (c->variant_filter == VARIANT_UNDERGROUND && surf) return 0;
+        if (c->variant_filter == VARIANT_SURFACE && !surf) return 0;
+        if (surf) return c->height_ymin <= -1e8f && c->height_ymax >= 1e8f;   /* Y unknown */
+    } else if (f->y < 1 || f->y > 251) {
+        return 0;                  /* floor (y - 1) or ceiling (y + 4) outside the world */
+    }
+    return f->y >= c->height_ymin && f->y <= c->height_ymax;
+}
+
+/* ── (10/10 bis) the EXACT 1.16 features: terrain116.c rebuilds the terrain
+ * (noise, surface, carvers — checked block for block against Minecraft 1.16.1)
+ * and populates the chunk up to its dungeons: water lake, lava lake,
+ * mineshafts (mineshaft116.c), then the 8 dungeon attempts in order. Only what
+ * really generates comes out: dungeons that exist, lava lakes with their real
+ * (dropped) Y. Per thread: one T116 + a cache of built chunks. */
+static __thread T116 *F116X_T = NULL;
+static __thread T116Cache *F116X_C = NULL;
+
+static const T116 *f116x_ctx(int mc, uint64_t seed, T116Cache **cache)
+{
+    if (!F116X_T) {
+        F116X_T = (T116 *)malloc(sizeof(T116));
+        F116X_C = t116_cache_new(160);
+        if (!F116X_T || !F116X_C) return NULL;
+        F116X_T->seed = ~seed; F116X_T->mc = -1;
+    }
+    if (F116X_T->seed != seed || F116X_T->mc != mc) t116_init(F116X_T, mc, seed);
+    *cache = F116X_C;
+    return F116X_T;
+}
+
+/* a village / pillager outpost start within 6 chunks: its pieces may block a
+ * lake (LakeFeature's village test) and its "beard" reshapes the terrain —
+ * neither is modelled: the features there get flag 32 (uncertain). The
+ * viability of the starts of the last regions is kept per thread. */
+static __thread struct { uint64_t seed; int mc, st, rx, rz, ok; Pos p; } F116V[16];
+static inline int floordiv32(int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
+
+static int f116x_near_village(const T116 *t, int32_t cx, int32_t cz)
+{
+    static const int ST[2] = {Village, Outpost};
+    for (int k = 0; k < 2; k++) {
+        StructureConfig sc;
+        if (!getStructureConfig(ST[k], t->mc, &sc)) continue;
+        int rs = sc.regionSize;
+        int rx0 = floordiv32(cx - 6, rs), rx1 = floordiv32(cx + 6, rs);
+        int rz0 = floordiv32(cz - 6, rs), rz1 = floordiv32(cz + 6, rs);
+        for (int rz = rz0; rz <= rz1; rz++)
+            for (int rx = rx0; rx <= rx1; rx++) {
+                int slot = ((rx * 7 + rz * 13 + k * 5) & 15), ok;
+                Pos p;
+                if (F116V[slot].seed == t->seed && F116V[slot].mc == t->mc && F116V[slot].st == ST[k] &&
+                    F116V[slot].rx == rx && F116V[slot].rz == rz) {
+                    ok = F116V[slot].ok; p = F116V[slot].p;
+                } else {
+                    ok = getStructurePos(ST[k], t->mc, t->seed, rx, rz, &p) &&
+                         isViableStructurePos(ST[k], (Generator *)&t->g, p.x, p.z, 0);
+                    F116V[slot].seed = t->seed; F116V[slot].mc = t->mc; F116V[slot].st = ST[k];
+                    F116V[slot].rx = rx; F116V[slot].rz = rz; F116V[slot].ok = ok; F116V[slot].p = p;
+                }
+                if (ok && abs((p.x >> 4) - cx) <= 6 && abs((p.z >> 4) - cz) <= 6) return 1;
+            }
+    }
+    return 0;
+}
+
+/* the real features of chunk (cx, cz) of one kind, as SsaFeat (dungeon: the
+ * spawner; lava lake: y = its real top lava layer, flags as f116_lake_at) */
+static int f116x_chunk(int mc, uint64_t seed, int kind, int32_t cx, int32_t cz, SsaFeat *out, int cap)
+{
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, seed, &cache);
+    if (!t) return 0;
+    T116Feat fe[16];
+    /* lava lakes only: the lakes step alone (no mineshafts / dungeons); the
+       dungeons only where the pre-filter (exact superset, no terrain) says
+       there can be one */
+    int want = kind == 1 ? 1 : 3;
+    if (kind != 1 && !t116_dungeons_maybe(t, cx, cz)) {
+        if (kind == 0) return 0;
+        SsaFeat lk[2];
+        if (f116_chunk(seed, 1, cx, cz, &t->g, lk) == 0) return 0;   /* no lava lake either */
+        want = 1;
+    }
+    int m = t116_populate_ex(t, cache, cx, cz, fe, 16, NULL, want);
+    int n = 0, unc = -1;
+    for (int i = 0; i < m && i < 16 && n < cap; i++) {
+        const T116Feat *e = &fe[i];
+        if (!e->ok) continue;
+        if (unc < 0) unc = f116x_near_village(t, cx, cz) ? 32 : 0;
+        SsaFeat *f = &out[n];
+        if ((kind == 0 || kind == 2) && e->kind == 0) {
+            f->kind = 0; f->x = e->x; f->y = e->y; f->z = e->z;
+            f->sx = e->sx; f->sz = e->sz; f->flags = e->attempt | 16 | unc;      /* 16: exact, 32: uncertain */
+            f->ox = e->x; f->oy = e->y; f->oz = e->z;
+            n++;
+        } else if ((kind == 1 || kind == 2) && e->kind == 1) {
+            f->kind = 1; f->x = e->x + 8; f->z = e->z + 8; f->y = e->oy + 3;
+            f->sx = f->sz = 16;
+            f->flags = (e->y >= 63 ? 1 : 0) | (f116_is_desert(t116_biome4(&t->g, cx * 4 + 2, cz * 4 + 2)) ? 2 : 0) | 16 | unc;
+            f->ox = e->ox; f->oy = e->oy; f->oz = e->oz;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* f116_keep for exact features: lakes have their real Y (surface ones too) */
+static int f116_keep_x(const SsaCond *c, const SsaFeat *f)
+{
+    if (f->kind == 1) {
+        int surf = f->flags & 1;
+        if (c->variant_filter == VARIANT_UNDERGROUND && surf) return 0;
+        if (c->variant_filter == VARIANT_SURFACE && !surf) return 0;
+    }
+    return f->y >= c->height_ymin && f->y <= c->height_ymax;
+}
+
+/* all the kept features of condition c in the box / radius (x1..z2, rmax_sq
+ * around at); g as f116_chunk; returns their number (all counted, at most
+ * cap stored) */
+/* xmc != 0 (a full seed, g given): only the features that really generate
+ * (f116x_chunk), for the chunks where a 48-bit candidate passes the area */
+static int f116_collect_x(uint64_t ws, const SsaCond *c, const Generator *g,
+                        int32_t x1, int32_t z1, int32_t x2, int32_t z2,
+                        int64_t rmax_sq, int32_t at_x, int32_t at_z,
+                        SsaFeat *out, int cap, int stop_at, const F116Ground *gr, int xmc,
+                        const SsaEnv *env)
+{
+    int kind = c->struct_type == 1 ? 1 : 0, n = 0;
+    /* a lake's centre is 8..23 blocks from its chunk corner */
+    int32_t cx1 = (kind ? x1 - 23 : x1) >> 4, cz1 = (kind ? z1 - 23 : z1) >> 4;
+    int32_t cx2 = x2 >> 4, cz2 = z2 >> 4;
+    SsaFeat buf[16];
+    for (int32_t cz = cz1; cz <= cz2; cz++)
+        for (int32_t cx = cx1; cx <= cx2; cx++) {
+            int m = f116_chunk(ws, kind, cx, cz, g, buf);
+            if (xmc && g && kind == 0) {
+                /* (10/10) a dungeon that generates shifts the chunk's later
+                 * attempts (it draws much more): only the FIRST dungeon of a
+                 * chunk is at a 48-bit candidate, the next ones can be anywhere
+                 * in it → the chunk is skipped only when it misses the area */
+                int32_t bx = cx * 16, bz = cz * 16, hit;
+                if (rmax_sq) {
+                    int32_t nx = at_x < bx ? bx : at_x > bx + 15 ? bx + 15 : at_x;
+                    int32_t nz = at_z < bz ? bz : at_z > bz + 15 ? bz + 15 : at_z;
+                    int64_t dx = nx - at_x, dz = nz - at_z;
+                    hit = dx*dx + dz*dz < rmax_sq;
+                } else hit = !(bx + 15 < x1 || bx > x2 || bz + 15 < z1 || bz > z2);
+                m = hit ? f116x_chunk(xmc, ws, kind, cx, cz, buf, 16) : 0;
+            } else if (xmc && g && m > 0) {
+                int any = 0;                    /* a candidate in the area? */
+                for (int i = 0; i < m && !any; i++) {
+                    const SsaFeat *f = &buf[i];
+                    if (rmax_sq) {
+                        int64_t dx = f->x - at_x, dz = f->z - at_z;
+                        if (dx*dx + dz*dz >= rmax_sq) continue;
+                    } else if (f->x < x1 || f->x > x2 || f->z < z1 || f->z > z2) continue;
+                    if (kind == 0 && !f116_keep(c, f)) continue;    /* a dungeon keeps its Y */
+                    any = 1;
+                }
+                m = any ? f116x_chunk(xmc, ws, kind, cx, cz, buf, 16) : 0;
+            }
+            for (int i = 0; i < m; i++) {
+                const SsaFeat *f = &buf[i];
+                if (rmax_sq) {
+                    int64_t dx = f->x - at_x, dz = f->z - at_z;
+                    if (dx*dx + dz*dz >= rmax_sq) continue;
+                } else if (f->x < x1 || f->x > x2 || f->z < z1 || f->z > z2) continue;
+                if (c->skip_ref && f116_is_ref(env, c, f->x, f->y, f->z, at_x, at_z)) continue;
+                if (xmc && g) {
+                    if (!f116_keep_x(c, f)) continue;
+                    if (env && !dy_ok(env, c, f->y)) continue;     /* height link (10/10 ter) */
+                } else {
+                    if (!f116_keep(c, f)) continue;
+                    if (kind == 0 && c->variant_filter == VARIANT_UNDERGROUND && !f116_below_ground(gr, f))
+                        continue;
+                }
+                if (n < cap) out[n] = *f;
+                n++;
+                if (stop_at && n >= stop_at) return n;
+            }
+        }
+    return n;
+}
+
+static int f116_collect(uint64_t ws, const SsaCond *c, const Generator *g,
+                        int32_t x1, int32_t z1, int32_t x2, int32_t z2,
+                        int64_t rmax_sq, int32_t at_x, int32_t at_z,
+                        SsaFeat *out, int cap, int stop_at, const F116Ground *gr)
+{
+    return f116_collect_x(ws, c, g, x1, z1, x2, z2, rmax_sq, at_x, at_z, out, cap, stop_at, gr, 0, NULL);
+}
+
+/* map / explain: the features of a box (no filter but the version) */
+EXPORT int ssa_features116(int mc, int64_t seed, int kind, int x1, int z1, int x2, int z2,
+                           int exact_biome, SsaFeat *out, int cap)
+{
+    if (!f116_version_ok(mc)) return 0;
+    Generator g;
+    if (exact_biome) { setupGenerator(&g, mc, 0); applySeed(&g, DIM_OVERWORLD, (uint64_t)seed); }
+    SsaCond c;
+    memset(&c, 0, sizeof c);
+    c.struct_type = kind; c.height_ymin = -1e9f; c.height_ymax = 1e9f;
+    return f116_collect((uint64_t)seed, &c, exact_biome ? &g : NULL,
+                        x1, z1, x2, z2, 0, 0, 0, out, cap, 0, NULL);
+}
+
+/* map / explain (10/10 bis): the features that REALLY generate in a box —
+ * exact terrain + population (dungeons that exist, lava lakes with their real
+ * Y). Chunks are processed in parallel (each thread its own terrain cache). */
+EXPORT int ssa_features116x(int mc, int64_t seed, int kind, int x1, int z1, int x2, int z2,
+                            SsaFeat *out, int cap, int nthreads)
+{
+    /* kind 0 dungeons, 1 lava lakes, 2 both; nthreads 1: on the calling thread
+       only (the map runs one block per worker), 0: every core */
+    if (!f116_version_ok(mc)) return 0;
+    int32_t cx1 = (kind ? x1 - 23 : x1) >> 4, cz1 = (kind ? z1 - 23 : z1) >> 4;
+    int32_t cx2 = x2 >> 4, cz2 = z2 >> 4;
+    int64_t w = (int64_t)cx2 - cx1 + 1, h = (int64_t)cz2 - cz1 + 1;
+    if (w <= 0 || h <= 0 || w * h > 1000000) return 0;
+    int total = 0;
+    /* 8×8-chunk tiles, one per task: a tile's 10×10 terrain chunks stay in
+       the thread's cache (neighbours shared) */
+    const int T = 8;
+    int64_t tw = (w + T - 1) / T, th = (h + T - 1) / T;
+    #pragma omp parallel for schedule(dynamic, 1) if(nthreads != 1)
+    for (int64_t k = 0; k < tw * th; k++) {
+        int32_t tx = (int32_t)(k % tw) * T, tz = (int32_t)(k / tw) * T;
+        for (int32_t dz = 0; dz < T && tz + dz < h; dz++)
+        for (int32_t dx = 0; dx < T && tx + dx < w; dx++) {
+            int32_t cx = cx1 + tx + dx, cz = cz1 + tz + dz;
+            SsaFeat buf[16];
+            int m = f116x_chunk(mc, (uint64_t)seed, kind, cx, cz, buf, 16);
+            for (int i = 0; i < m; i++) {
+                const SsaFeat *f = &buf[i];
+                if (f->x < x1 || f->x > x2 || f->z < z1 || f->z > z2) continue;   /* lakes: by their centre */
+                int slot;
+                #pragma omp atomic capture
+                slot = total++;
+                if (slot < cap) out[slot] = *f;
+            }
+        }
+    }
+    return total;
+}
+
+/* the blocks of a chunk after its population up to its dungeons (map /
+ * debug): out[65536] T116_* codes, (y*16+z)*16+x */
+EXPORT int ssa_chunk116(int mc, int64_t seed, int cx, int cz, uint8_t *out)
+{
+    if (!f116_version_ok(mc)) return 0;
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, (uint64_t)seed, &cache);
+    if (!t) return 0;
+    static __thread T116Chunk *r = NULL;
+    if (!r) r = (T116Chunk *)malloc(sizeof(T116Chunk));
+    if (!r) return 0;
+    T116Feat fe[16];
+    if (t116_populate(t, cache, cx, cz, fe, 16, r) < 0) return 0;
+    memcpy(out, r->b, 65536);
+    return 1;
+}
+
+/* map: approximate ground Y (1:4 cells) at n points, 1.16 */
+EXPORT int ssa_ground116(int mc, int64_t seed, const int32_t *xs, const int32_t *zs, int n, int32_t *out)
+{
+    if (!f116_version_ok(mc)) return 0;
+    Generator g; SurfaceNoise sn;
+    setupGenerator(&g, mc, 0); applySeed(&g, DIM_OVERWORLD, (uint64_t)seed);
+    initSurfaceNoise(&sn, DIM_OVERWORLD, (uint64_t)seed);
+    for (int i = 0; i < n; i++) {
+        float y = 0;
+        mapApproxHeight(&y, NULL, &g, &sn, xs[i] >> 2, zs[i] >> 2, 1, 1);
+        out[i] = (int32_t)y;
+    }
+    return n;
+}
+
+/* map: the lava columns (16×16, bit = any lava layer) and the lava cells of
+ * the lake whose box origin is (ox, oz) — idx from SsaFeat.flags & 2 */
+EXPORT int ssa_lake116_shape(int64_t seed, int ox, int oz, int desert_idx, uint8_t *cells /* [2048] or NULL */,
+                             uint8_t *cols /* [256] or NULL */)
+{
+    int32_t cx = ox >> 4, cz = oz >> 4;
+    SsaFeat f; uint64_t r;
+    if (!f116_lake_at((uint64_t)seed, cx, cz, desert_idx ? 0 : 1, &f, &r)) return 0;
+    if (f.ox != ox || f.oz != oz) return 0;
+    uint8_t s[2048];
+    f116_lake_shape(r, s);
+    int n = 0;
+    if (cols) memset(cols, 0, 256);
+    for (int a = 0; a < 16; a++) for (int b = 0; b < 16; b++) for (int c2 = 1; c2 < 4; c2++)
+        if (s[(a * 16 + b) * 8 + c2]) { n++; if (cols) cols[a * 16 + b] = 1; }
+    if (cells) memcpy(cells, s, 2048);
+    return n;
+}
+
+EXPORT int ssa_sizeof_feat116(void) { return (int)sizeof(SsaFeat); }
+
+/* the fallback point (8, 65..66, 8) in the lava of a lake — g as f116_chunk
+ * (NULL: both indices, 48 bits; before 10/10 index 1 only, wrong in deserts) */
+static int sf_lava_lake_hit2(uint64_t ws, const Generator *g)
+{
+    for (int cz = -1; cz <= 0; cz++)
+    for (int cx = -1; cx <= 0; cx++)
+    for (int idx = 0; idx < 2; idx++) {
+        if (g) {
+            int b = t116_biome4(g, cx * 4 + 2, cz * 4 + 2);
+            if (idx != (f116_is_desert(b) ? 0 : 1)) continue;
+        }
+        SsaFeat f; uint64_t r;
+        if (!f116_lake_at(ws, cx, cz, idx, &f, &r)) continue;
+        int lx = 8 - f.ox, lz = 8 - f.oz;
+        if (lx < 1 || lx > 14 || lz < 1 || lz > 14) continue;
+        int c65 = 65 - f.oy, c66 = 66 - f.oy;
+        if (!((c65 >= 1 && c65 <= 3) || (c66 >= 1 && c66 <= 3))) continue;
+        uint8_t sh[2048];
+        f116_lake_shape(r, sh);
+        if ((c65 >= 1 && c65 <= 3 && sh[(lx * 16 + lz) * 8 + c65]) ||
+            (c66 >= 1 && c66 <= 3 && sh[(lx * 16 + lz) * 8 + c66])) return 1;
+    }
+    return 0;
+}
+#define sf_lava_lake_hit48(ws) sf_lava_lake_hit2((ws), NULL)
+
+/* the fallback point in a dungeon attempt of chunk (0, 0) — g as f116_chunk
+ * (before 10/10: index 3 only, which is right in desert / swamp chunks only;
+ * the badlands of the fallback seeds use index 2) */
+static int sf_dungeon_hit2(uint64_t ws, const Generator *g)
+{
+    SsaFeat fb[16];
+    int n = f116_chunk(ws, 0, 0, 0, g, fb);
+    for (int i = 0; i < n; i++)
+        if (abs(fb[i].x - 8) <= 2 && abs(fb[i].z - 8) <= 2 && fb[i].y >= 62 && fb[i].y <= 66) return 1;
+    return 0;
+}
+
+/* (10/10 bis) the same with the exact terrain: a dungeon that really generates
+ * (its spawner as sf_dungeon_hit2 asks), a lava lake that really generates and
+ * has lava at (8, 65 or 66, 8) after its drop. */
+static int sf_dungeon_hitx(int mc, uint64_t ws)
+{
+    SsaFeat fb[16];
+    int n = f116x_chunk(mc, ws, 0, 0, 0, fb, 16);
+    for (int i = 0; i < n; i++)
+        if (abs(fb[i].x - 8) <= 2 && abs(fb[i].z - 8) <= 2 && fb[i].y >= 62 && fb[i].y <= 66) return 1;
+    return 0;
+}
+
+static int sf_lava_lake_hitx(int mc, uint64_t ws)
+{
+    for (int cz = -1; cz <= 0; cz++)
+        for (int cx = -1; cx <= 0; cx++) {
+            SsaFeat fb[4];
+            int n = f116x_chunk(mc, ws, 1, cx, cz, fb, 4);
+            for (int i = 0; i < n; i++) {
+                const SsaFeat *f = &fb[i];
+                int lx = 8 - f->ox, lz = 8 - f->oz;
+                if (lx < 1 || lx > 14 || lz < 1 || lz > 14) continue;
+                uint8_t sh[2048];
+                if (ssa_lake116_shape((int64_t)ws, f->ox, f->oz, (f->flags & 2) ? 1 : 0, sh, NULL) <= 0) continue;
+                for (int py = 65; py <= 66; py++) {
+                    int c2 = py - f->oy;
+                    if (c2 >= 1 && c2 <= 3 && sh[(lx * 16 + lz) * 8 + c2]) return 1;
+                }
+            }
+        }
+    return 0;
+}
+
+/* (10/10 bis) Exact Y map, 1.16: the highest solid block (water / lava are
+ * not solid: the sea floor) of each sample, caves = with the carvers (status
+ * 7) or without (status 5). out[j*w + i] at (x0 + i*step, z0 + j*step). */
+EXPORT int ssa_surface116(int mc, int64_t seed, int x0, int z0, int w, int h, int step, int caves, int32_t *out)
+{
+    if (!f116_version_ok(mc) || w <= 0 || h <= 0) return 0;
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, (uint64_t)seed, &cache);
+    if (!t) return 0;
+    int st = caves ? 7 : 5;
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++) {
+            int x = x0 + i * step, z = z0 + j * step;
+            const T116Chunk *c = t116_cache_chunk(t, cache, x >> 4, z >> 4, st);
+            out[j * w + i] = c ? t116_top_solid(c, x, z) : 0;
+        }
+    return w * h;
+}
+
 static inline int is_slime_chunk(uint64_t seed, int32_t cx, int32_t cz) {
     /* cubiomes' own isSlimeChunk. The local copy computed
      * (int32)(cz*cz) * 0x4307a7 in 32 bits (int32 × uint32) instead of 64:
@@ -797,10 +1439,12 @@ static int spiral_next(SpiralIter *s, int32_t *px, int32_t *pz) {
         int inz=(s->rz>=s->rz1&&s->rz<=s->rz2);
         if (!inx&&!inz) { s->done=1; return 0; }
         int inside=0;
-        int32_t bx=s->rx*s->step, bz=s->rz*s->step;
+        /* 64-bit (08/10): steps up to 2^30 (noise tiling) — rx*step of a cell
+         * just outside the range overflowed 32 bits */
+        int64_t bx=(int64_t)s->rx*s->step, bz=(int64_t)s->rz*s->step;
         if (inx&&inz) {
             if (s->rmax_sq) {
-                int64_t ddx=(int64_t)(bx-s->at_x), ddz=(int64_t)(bz-s->at_z);
+                int64_t ddx=bx-s->at_x, ddz=bz-s->at_z;
                 inside=(ddx*ddx+ddz*ddz<s->rmax_sq);
             } else {
                 inside=(bx>=s->ax&&bx<=s->ax2&&bz>=s->az&&bz<=s->az2);
@@ -812,7 +1456,35 @@ static int spiral_next(SpiralIter *s, int32_t *px, int32_t *pz) {
             int tmp=s->dx; s->dx=-s->dz; s->dz=tmp;
             if (s->dz==0) s->dl++;
         }
-        if (inside) { *px=bx; *pz=bz; return 1; }
+        if (inside) { *px=(int32_t)bx; *pz=(int32_t)bz; return 1; }
+    }
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Abandoned village: can it be one? (08/10)
+ * getVariant draws, from chunkGenerateRnd (48 bits of the seed only), the
+ * rotation then the start piece out of the biome's pool; the last entries of
+ * each pool are the abandoned ones. Without the biome (64-bit), the village can
+ * be abandoned only if the draw lands in the abandoned entries of at least one
+ * pool → a lossless 48-bit pre-filter (~2-6 % of the villages pass), checked
+ * before the biome. Same RNG calls as getVariant (cubiomes finders.c).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static int village_maybe_abandoned(int mc, uint64_t seed, int x, int z)
+{
+    uint64_t rng = chunkGenerateRnd(seed, x >> 4, z >> 4);
+    if (mc <= MC_1_9) return 0;
+    if (mc <= MC_1_13) {
+        skipNextN(&rng, mc == MC_1_13 ? 10 : 11);
+        return nextInt(&rng, 50) == 0;
+    }
+    (void) nextInt(&rng, 4);                       /* rotation */
+    /* plains (meadow), desert, savanna, taiga, snowy: pool size, first abandoned */
+    static const int pool[5] = { 204, 250, 459, 100, 306 };
+    static const int aban[5] = { 200, 245, 450,  98, 300 };
+    for (int k = 0; k < 5; k++) {
+        uint64_t r = rng;
+        if (nextInt(&r, pool[k]) >= aban[k]) return 1;
     }
     return 0;
 }
@@ -958,6 +1630,9 @@ static int struct_collect(SsaEnv *env, const SsaCond *c, int cond_idx,
                 inside = (p.x >= x1 && p.x <= x2 && p.z >= z1 && p.z <= z2);
             }
             if (!inside) continue;
+            if (stype == Village && c->variant_filter == VARIANT_ABANDONED &&
+                !village_maybe_abandoned(env->mc, env->seed, p.x, p.z))
+                continue;                          /* cheap, before the biome */
             int biome_id = isViableStructurePos(stype, &env->g, p.x, p.z, 0);
             if (!biome_id) continue;
             if (stype == End_City) {
@@ -1289,6 +1964,49 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
         if (exclude) { env_push(env, cond_idx, cx_def, cz_def); return 1; }
         if (hits < min_count) return 0;
         env_push(env, cond_idx, (int32_t)(xsum/hits), (int32_t)(zsum/hits));
+        return 1; }
+
+    case CTYPE_SPAWN_FEATURE: {                  /* (09/10) struct_type = kind */
+        int ok;
+        if (c->struct_type == 1) { env_set_dim(env, DIM_OVERWORLD); ok = sf_lava_lake_hit2(env->seed, &env->g); }
+        else { env_set_dim(env, DIM_OVERWORLD); ok = sf_dungeon_hit2(env->seed, &env->g); }
+        /* (10/10 bis) and it really generates (exact terrain) */
+        if (ok && f116_version_ok(env->mc))
+            ok = c->struct_type == 1 ? sf_lava_lake_hitx(env->mc, env->seed) : sf_dungeon_hitx(env->mc, env->seed);
+        if (c->exclude) ok = !ok;
+        if (!ok) return 0;
+        env_push(env, cond_idx, 8, 8);
+        return 1; }
+
+    case CTYPE_FEATURE116: {                     /* (10/10) dungeons / lava lakes */
+        int min_count = c->min_count <= 0 ? 1 : c->min_count;
+        int exclude = c->exclude;
+        if (!f116_version_ok(env->mc)) {
+            if (exclude) { env_push(env, cond_idx, cx_def, cz_def); return 1; }
+            return 0;
+        }
+        F116Ground gr = {NULL, NULL};
+        env_set_dim(env, DIM_OVERWORLD);           /* the chunk's biome picks the index */
+        const Generator *g = &env->g;
+        if (c->struct_type == 0 && c->variant_filter == VARIANT_UNDERGROUND) {
+            if (!env->sn_ow_ready) { initSurfaceNoise(&env->sn_ow, DIM_OVERWORLD, env->seed); env->sn_ow_ready = 1; }
+            gr.g = &env->g; gr.sn = &env->sn_ow;
+        }
+        SsaFeat fb[64];
+        int n = f116_collect_x(env->seed, c, g, x1, z1, x2, z2, rmax_sq, at_x, at_z,
+                               fb, 64, exclude ? 1 : min_count, &gr, env->mc, env);   /* exact (10/10 bis) */
+        if (exclude) {
+            if (n > 0) return 0;
+            env_push(env, cond_idx, cx_def, cz_def);
+            return 1;
+        }
+        if (n < min_count) return 0;
+        int m = n < 64 ? n : 64;
+        int64_t xs = 0, zs = 0, ys = 0;
+        for (int i = 0; i < m; i++) { xs += fb[i].x; zs += fb[i].z; ys += fb[i].y; }
+        /* (10/10 ter) its Y goes with its position (the children's height link) */
+        if (min_count == 1) env_push_y(env, cond_idx, fb[0].x, fb[0].y, fb[0].z);
+        else env_push_y(env, cond_idx, (int32_t)(xs / m), (int32_t)(ys / m), (int32_t)(zs / m));
         return 1; }
 
     case CTYPE_SLIME: {
@@ -1802,10 +2520,39 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
  * ═══════════════════════════════════════════════════════════════════════════ */
 static int eval_node_impl(SsaEnv *env, const SsaCond *conds, int n_conds,
                            CondCache *caches, int cond_1idx, int32_t at_x, int32_t at_z);
+static int eval_node_impl0(SsaEnv *env, const SsaCond *conds, int n_conds,
+                           CondCache *caches, int cond_1idx, int32_t at_x, int32_t at_z);
+
+/* explain (08/10): a node evaluated again (next spiral cell, next structure
+ * instance...) or failing must not leave the positions of an EARLIER attempt
+ * in its subtree: the UI centred the map on such a stale position (results
+ * "teleporting" to the wrong place). The search never reads them. */
+static void explain_clear_subtree(SsaEnv *env, int idx, int depth)
+{
+    if (idx <= 0 || idx > MAX_CONDS || depth > MAX_CONDS) return;
+    env->positions[idx].valid = 0;
+    if (!env->co || idx >= KIDS_MAXN) return;
+    int nk = env->co->n_kids[idx];
+    for (int k = 0; k < nk && k < MAX_CONDS; k++)
+        explain_clear_subtree(env, env->co->kids[idx][k], depth + 1);
+}
 
 static int eval_node(SsaEnv *env, const SsaCond *conds, int n_conds,
                       CondCache *caches,
                       int cond_1idx, int32_t at_x, int32_t at_z)
+{
+    if (env->explain) {
+        explain_clear_subtree(env, cond_1idx, 0);
+        int r0 = eval_node_impl0(env, conds, n_conds, caches, cond_1idx, at_x, at_z);
+        if (!r0) explain_clear_subtree(env, cond_1idx, 0);
+        return r0;
+    }
+    return eval_node_impl0(env, conds, n_conds, caches, cond_1idx, at_x, at_z);
+}
+
+static int eval_node_impl0(SsaEnv *env, const SsaCond *conds, int n_conds,
+                           CondCache *caches,
+                           int cond_1idx, int32_t at_x, int32_t at_z)
 {
     SsaProf *pf = env->prof;
     int i = cond_1idx - 1;
@@ -1919,7 +2666,7 @@ static int eval_node_impl(SsaEnv *env, const SsaCond *conds, int n_conds,
 
     /* slime / mineshaft / biome centre / stronghold with dependent
      * conditions: cubiomes-viewer BR_CLUST semantics (see clust_node) */
-    if (c->ctype == CTYPE_SLIME || c->ctype == CTYPE_MINESHAFT
+    if (c->ctype == CTYPE_SLIME || c->ctype == CTYPE_MINESHAFT || c->ctype == CTYPE_FEATURE116
         || c->ctype == CTYPE_BIOME_CENTER || c->ctype == CTYPE_STRONGHOLD) {
         const int *kids; int nk;
         int kids_fb[MAX_CONDS];
@@ -2206,7 +2953,7 @@ static int clust_node(SsaEnv *env, const SsaCond *conds, int n_conds, CondCache 
                       const SsaCond *c, int cond_1idx, int32_t at_x, int32_t at_z,
                       const int *kids, int nk)
 {
-    if (!(c->ctype == CTYPE_SLIME || c->ctype == CTYPE_MINESHAFT
+    if (!(c->ctype == CTYPE_SLIME || c->ctype == CTYPE_MINESHAFT || c->ctype == CTYPE_FEATURE116
           || c->ctype == CTYPE_BIOME_CENTER || c->ctype == CTYPE_STRONGHOLD))
         return -1;
     int32_t x1, z1, x2, z2; int64_t rmax_sq = 0;
@@ -2225,6 +2972,8 @@ static int clust_node(SsaEnv *env, const SsaCond *conds, int n_conds, CondCache 
     int64_t xt = 0, zt = 0;             /* sums for the average mode */
     int avg_ok = 0; int32_t ax = 0, az = 0;
     int branch = (count == 1);
+    int32_t *inst_y = NULL;             /* (10/10 ter) instances with a Y (1.16 features) */
+    int64_t yt = 0;
 
     if (c->ctype == CTYPE_SLIME) {
         int32_t cx1 = x1 >> 4, cz1 = z1 >> 4, cx2 = x2 >> 4, cz2 = z2 >> 4;
@@ -2241,6 +2990,32 @@ static int clust_node(SsaEnv *env, const SsaCond *conds, int n_conds, CondCache 
             }
         if (count == 0) { avg_ok = (n == 0); ax = (x1 + x2) >> 1; az = (z1 + z2) >> 1; }
         else if (n >= count && n > 0) { avg_ok = 1; ax = (int32_t)((xt << 4) / n) + 8; az = (int32_t)((zt << 4) / n) + 8; }
+    } else if (c->ctype == CTYPE_FEATURE116) {   /* (10/10) */
+        if (f116_version_ok(env->mc)) {
+            F116Ground gr = {NULL, NULL};
+            env_set_dim(env, DIM_OVERWORLD);
+            const Generator *g = &env->g;
+            if (c->struct_type == 0 && c->variant_filter == VARIANT_UNDERGROUND) {
+                if (!env->sn_ow_ready) { initSurfaceNoise(&env->sn_ow, DIM_OVERWORLD, env->seed); env->sn_ow_ready = 1; }
+                gr.g = &env->g; gr.sn = &env->sn_ow;
+            }
+            SsaFeat *fb = (SsaFeat *)malloc(sizeof(SsaFeat) * CLUST_MAX);
+            if (fb) {
+                int m = f116_collect_x(env->seed, c, g, x1, z1, x2, z2, rmax_sq, at_x, at_z,
+                                       fb, CLUST_MAX, 0, &gr, env->mc, env);
+                if (m > CLUST_MAX) m = CLUST_MAX;
+                inst_y = (int32_t *)malloc(sizeof(int32_t) * CLUST_MAX);
+                for (int i = 0; i < m; i++) {
+                    if (inst_y) inst_y[n] = fb[i].y;
+                    yt += fb[i].y;
+                    inst[n].x = fb[i].x; inst[n].z = fb[i].z; n++;
+                    xt += fb[i].x; zt += fb[i].z;
+                }
+                free(fb);
+            }
+        }
+        if (count == 0) { avg_ok = (n == 0); ax = (x1 + x2) >> 1; az = (z1 + z2) >> 1; }
+        else if (n >= count && n > 0) { avg_ok = 1; ax = (int32_t)(xt / n); az = (int32_t)(zt / n); }
     } else if (c->ctype == CTYPE_MINESHAFT) {
         int m = getMineshafts(env->mc, env->seed, x1 >> 4, z1 >> 4, x2 >> 4, z2 >> 4, inst, CLUST_MAX);
         if (m > CLUST_MAX) m = CLUST_MAX;
@@ -2317,7 +3092,8 @@ static int clust_node(SsaEnv *env, const SsaCond *conds, int n_conds, CondCache 
     if (branch) {
         if (n > CLUST_MAX) n = CLUST_MAX;
         for (int k = 0; k < n && !res; k++) {
-            env_push(env, cond_1idx, inst[k].x, inst[k].z);
+            if (inst_y) env_push_y(env, cond_1idx, inst[k].x, inst_y[k], inst[k].z);
+            else env_push(env, cond_1idx, inst[k].x, inst[k].z);
             int ok = 1;
             for (int i = 0; i < nk && ok; i++)
                 if (!eval_node(env, conds, n_conds, caches, kids[i], inst[k].x, inst[k].z))
@@ -2325,12 +3101,14 @@ static int clust_node(SsaEnv *env, const SsaCond *conds, int n_conds, CondCache 
             if (ok) res = 1;
         }
     } else if (avg_ok) {
-        env_push(env, cond_1idx, ax, az);
+        if (inst_y && n > 0) env_push_y(env, cond_1idx, ax, (int32_t)(yt / n), az);
+        else env_push(env, cond_1idx, ax, az);
         res = 1;
         for (int i = 0; i < nk && res; i++)
             if (!eval_node(env, conds, n_conds, caches, kids[i], ax, az))
                 res = 0;
     }
+    free(inst_y);
     free(inst);
     return res;
 }
@@ -2681,6 +3459,9 @@ static int test_structure_pos_only(SsaEnv *env, const SsaCond *c,
                 inside = (p.x >= x1 && p.x <= x2 && p.z >= z1 && p.z <= z2);
             }
             if (!inside) continue;
+            if (stype == Village && c->variant_filter == VARIANT_ABANDONED &&
+                !village_maybe_abandoned(env->mc, env->seed, p.x, p.z))
+                continue;                          /* 48-bit: never abandoned */
             hits++;
             if (hits >= min_count) return exclude ? 0 : 1;
         }
@@ -2708,6 +3489,28 @@ static int ssa_test_seed_pos_only(SsaEnv *env, const SsaCond *conds,
             if (!test_structure_pos_only(env, &conds[i],
                                           &caches[conds[i].cond_idx - 1],
                                           0, 0))
+                return 0;
+        }
+        else if (ctype == CTYPE_FEATURE116 && !conds[i].exclude && conds[i].struct_type == 1) {
+            /* (10/10) 48 bits only: lakes of both indices (a superset). Not the
+             * dungeons: one that generates shifts the later attempts of its
+             * chunk, so the 48-bit attempts are no superset of them. */
+            const SsaCond *c = &conds[i];
+            if (!f116_version_ok(env->mc)) return 0;
+            int32_t x1, z1, x2, z2; int64_t rmax_sq = 0;
+            if (c->rmax > 0) {
+                int32_t rb = c->rmax - 1;
+                x1 = -rb; z1 = -rb; x2 = rb; z2 = rb; rmax_sq = (int64_t)rb*rb + 1;
+            } else { x1 = c->x1; z1 = c->z1; x2 = c->x2; z2 = c->z2; }
+            SsaFeat fb[64];
+            int need = c->min_count <= 0 ? 1 : c->min_count;
+            if (f116_collect(env->seed, c, NULL, x1, z1, x2, z2, rmax_sq, 0, 0, fb, 64, need, NULL) < need)
+                return 0;
+        }
+        else if (ctype == CTYPE_SPAWN_FEATURE && !conds[i].exclude) {
+            /* (10/10) the fallback-point feature only depends on the 48 bits
+             * (before: never tested here → every family expanded) */
+            if (!(conds[i].struct_type == 1 ? sf_lava_lake_hit48(env->seed) : sf_dungeon_hit2(env->seed, NULL)))
                 return 0;
         }
         /* Other condition types: conservatively "maybe ok" → no skip */
@@ -2752,7 +3555,9 @@ static int ctype_is_dep48(int ctype) {
     return (ctype == CTYPE_STRUCTURE_OW ||
             ctype == CTYPE_STRUCTURE_NETHER ||
             ctype == CTYPE_STRUCTURE_END ||
-            ctype == CTYPE_SLIME);
+            ctype == CTYPE_SLIME ||
+            ctype == CTYPE_SPAWN_FEATURE ||
+            ctype == CTYPE_FEATURE116);
 }
 
 /* Compte les conditions top-level dep48 (structures/slime) et dep64 (le reste).
@@ -2837,6 +3642,8 @@ static int cond_cost_heuristic(const SsaCond *c) {
     double v;
     switch (c->ctype) {
         case CTYPE_SLIME:           v = 1; break;
+        case CTYPE_SPAWN_FEATURE:   v = 300; break;   /* 48 bits first, then the exact terrain (10/10 bis) */
+        case CTYPE_FEATURE116:      v = 50 + 1500 * area_cells(c, 16); break;    /* exact terrain: ~1.5 ms a chunk (10/10 bis) */
         case CTYPE_LOGIC_OR:        v = 0.2; break;
         case CTYPE_LOGIC_NOT:       v = 0.2; break;
         case CTYPE_SCALE_TO_NETHER: v = 0.2; break;
@@ -3010,6 +3817,7 @@ typedef struct {
      * no lazy optim (correctness over speed).
      */
     int              pos_only_eligible;
+    int              one_per_family;    /* 08/10: Hide sister seeds (BLOCKS) */
 
     /* Pre-sorted top-level eval order (cheapest first). Index into `conds`. */
     int              toplevel_order[MAX_CONDS];
@@ -3238,6 +4046,7 @@ static void worker_run(EngineState *st) {
                         st->found_count++;
                         if (st->max_found > 0 && st->found_count >= st->max_found) *st->stop_flag = 1;
                         MUTEX_UNLOCK(st->result_mutex);
+                        if (st->one_per_family) break;     /* the rest of the family is skipped */
                     }
                 }
             }
@@ -3443,6 +4252,10 @@ EXPORT SsaEngine *ssa_engine_create(
      */
     int large_biomes = large & 1;
     int requested_mode = (large >> 8) & 0xFF;
+    /* bits 16-23 (08/10): 1 = one seed per 48-bit family (Hide sister seeds),
+     * 2 = structure seed only (48-bit structure positions, no biome) */
+    int eng_flags = (large >> 16) & 0xFF;
+    st->one_per_family = (eng_flags & 1) ? 1 : 0;
     /* Update env's large flag */
     st->large = large_biomes;
     st->pos_only_eligible = conditions_eligible_for_2pass(conds, n_conds);
@@ -3497,7 +4310,11 @@ EXPORT SsaEngine *ssa_engine_create(
     int n_dep48 = 0, n_dep64 = 0;
     classify_session(conds, n_conds, &n_dep48, &n_dep64);
 
-    if (requested_mode == SSA_MODE_FAM48) {
+    if (requested_mode == SSA_MODE_FAM48 && (eng_flags & 2) && n_dep48 > 0) {
+        /* "Structure seed only": a 48-bit value whose top-level structure
+         * POSITIONS pass is a result, whatever the biomes (one per family) */
+        st->search_mode = SSA_MODE_FAM48;
+    } else if (requested_mode == SSA_MODE_FAM48) {
         if (n_dep48 > 0 && n_dep64 == 0) {
             /* Structures seules. La POSITION ne dépend que des 48 bits, mais la
              * VIABILITÉ (biome) dépend des 64 bits : émettre un simple low
@@ -3694,6 +4511,9 @@ EXPORT int ssa_engine_drain_matches(SsaEngine *eng,
 }
 
 EXPORT size_t ssa_sizeof_ssacond(void) { return sizeof(SsaCond); }
+/* the statistics' clock (08/10): Python measures checks done outside the engine
+ * (Exact Y post-filter) in the same unit */
+EXPORT uint64_t ssa_ticks_now(void) { return SSA_TICKS(); }
 
 EXPORT int ssa_ctype_spiral(void)             { return CTYPE_SPIRAL; }
 EXPORT int ssa_ctype_scale_to_nether(void)    { return CTYPE_SCALE_TO_NETHER; }
@@ -3738,6 +4558,8 @@ EXPORT int ssa_ctype_structure_nether(void)   { return CTYPE_STRUCTURE_NETHER; }
 EXPORT int ssa_ctype_structure_end(void)      { return CTYPE_STRUCTURE_END; }
 EXPORT int ssa_ctype_mineshaft(void)          { return CTYPE_MINESHAFT; }
 EXPORT int ssa_ctype_slime(void)              { return CTYPE_SLIME; }
+EXPORT int ssa_ctype_spawn_feature(void)      { return CTYPE_SPAWN_FEATURE; }
+EXPORT int ssa_ctype_feature116(void)         { return CTYPE_FEATURE116; }
 EXPORT int ssa_ctype_spawn(void)              { return CTYPE_SPAWN; }
 EXPORT int ssa_ctype_biome_filter(void)       { return CTYPE_BIOME_FILTER; }
 EXPORT int ssa_ctype_biome_sample(void)       { return CTYPE_BIOME_SAMPLE; }
@@ -3908,6 +4730,51 @@ static int64_t test_seeds_batch_impl(
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
+ * ssa_test_lows48 — the 48-bit structure-position pre-filter of the BLOCKS
+ * worker, for a LIST of 48-bit values (08/10: "48-bit family" on a seed list
+ * expands every listed seed to its 65 536 sister seeds; the lows whose
+ * structure positions already fail skip their 65 536 full tests). Writes the
+ * lows that may match into out_lows; returns their count. Conservative: a
+ * low is kept unless a top-level structure POSITION fails (as the worker).
+ * ─────────────────────────────────────────────────────────────────────────── */
+EXPORT int64_t ssa_test_lows48(
+        const SsaCond *conds, int n_conds, int mc, int large,
+        const int64_t *in_lows, int64_t n_in,
+        int64_t *out_lows, int64_t out_cap) {
+    if (n_conds <= 0 || n_conds > MAX_CONDS || n_in <= 0) return 0;
+    ChildOrderCache *co = child_order_new(conds, n_conds);
+    if (!co) return 0;
+    SsaEnv env;
+    memset(&env, 0, sizeof(env));
+    env.co = co;
+    env.mc = mc; env.large = large;
+    env.current_dim = -2;
+    env.gbn_seed = ~0ULL; env.gbn_nmax = -999;
+    for (int i = 0; i < NP_MAX; i++)
+        for (int s = 0; s < CLIM_NSLOT; s++) {
+            env.climate_cache_nmax[i][s] = -2;
+            env.climate_cache_seed[i][s] = 0xdeadbeefcafebabeULL; env.clazy[i].valid = 0;
+        }
+    setupGenerator(&env.g, mc, large ? LARGE_BIOMES : 0);
+    CondCache caches[MAX_CONDS];
+    memset(caches, 0, sizeof(caches));
+    int64_t kept = 0;
+    for (int64_t i = 0; i < n_in; i++) {
+        uint64_t low = (uint64_t)in_lows[i] & 0xFFFFFFFFFFFFULL;
+        env.seed = low;
+        env.sn_ow_ready = 0;
+        env.sn_end_ready = 0;
+        env.current_dim = -2;
+        if (ssa_test_seed_pos_only(&env, conds, n_conds, caches)) {
+            if (kept < out_cap) out_lows[kept] = (int64_t)low;
+            kept++;
+        }
+    }
+    free(co);
+    return kept;
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
  * ssa_explain_seed — WHERE does one seed match? (27/09)
  *
  * Evaluates the tree exactly like the search (same engine, so the same answer
@@ -3934,9 +4801,31 @@ EXPORT int ssa_explain_seed(
  * bit for bit (Monte-Carlo noise samples: the C draws the same random
  * sample order as cubiomes-viewer). Returns 1 if the condition passes and
  * writes the position it hands to its children in out_xz[0..1]. */
+static int eval_single_impl(const SsaCond *conds, int mc, int large, int64_t seed,
+                            int32_t at_x, int32_t at_z, int has_y, int32_t at_y, int32_t *out_xz,
+                            int32_t *samples_xz, int samples_cap, int *n_samples, int32_t *out_y);
+
 EXPORT int ssa_eval_single(const SsaCond *conds, int mc, int large, int64_t seed,
                            int32_t at_x, int32_t at_z, int32_t *out_xz,
                            int32_t *samples_xz, int samples_cap, int *n_samples)
+{
+    return eval_single_impl(conds, mc, large, seed, at_x, at_z, 0, 0, out_xz, samples_xz,
+                            samples_cap, n_samples, NULL);
+}
+
+/* (10/10 ter) the same with the parent's Y (height link) and the condition's
+ * own Y back: out_y[0] = has a Y, out_y[1] = its Y */
+EXPORT int ssa_eval_single_y(const SsaCond *conds, int mc, int large, int64_t seed,
+                             int32_t at_x, int32_t at_z, int has_y, int32_t at_y,
+                             int32_t *out_xz, int32_t *out_y)
+{
+    return eval_single_impl(conds, mc, large, seed, at_x, at_z, has_y, at_y, out_xz,
+                            NULL, 0, NULL, out_y);
+}
+
+static int eval_single_impl(const SsaCond *conds, int mc, int large, int64_t seed,
+                            int32_t at_x, int32_t at_z, int has_y, int32_t at_y, int32_t *out_xz,
+                            int32_t *samples_xz, int samples_cap, int *n_samples, int32_t *out_y)
 {
     if (!conds) return 0;
     ChildOrderCache *co = child_order_new(conds, 1);
@@ -3955,7 +4844,8 @@ EXPORT int ssa_eval_single(const SsaCond *conds, int mc, int large, int64_t seed
     setupGenerator(&env.g, mc, large ? LARGE_BIOMES : 0);
     env.seed = (uint64_t)seed;
     env_reset_positions_n(&env, 1);
-    env_push(&env, 0, at_x, at_z);
+    if (has_y) env_push_y(&env, 0, at_x, at_y, at_z);
+    else env_push(&env, 0, at_x, at_z);
     CondCache caches[1];
     memset(caches, 0, sizeof(caches));
     /* « yield individual samples »: the accepted sample positions, in the
@@ -3977,6 +4867,10 @@ EXPORT int ssa_eval_single(const SsaCond *conds, int mc, int large, int64_t seed
     if (ok && out_xz) {
         if (env.positions[1].valid) { out_xz[0] = env.positions[1].x; out_xz[1] = env.positions[1].z; }
         else { out_xz[0] = at_x; out_xz[1] = at_z; }
+    }
+    if (out_y) {
+        out_y[0] = ok && env.positions[1].valid && env.positions[1].has_y;
+        out_y[1] = out_y[0] ? env.positions[1].y : 0;
     }
     free(co);
     return ok ? 1 : 0;
@@ -4011,6 +4905,7 @@ static int explain_impl(const SsaCond *conds, int n_conds, int mc, int large, in
     setupGenerator(&env->g, mc, large ? LARGE_BIOMES : 0);
     env->seed = (uint64_t)seed;
     env->sn_ow_ready = 0; env->sn_end_ready = 0;
+    env->explain = 1;
     for (int k = 0; k < n_conds; k++) { out_valid[k] = 0; out_xz[2*k] = out_xz[2*k+1] = 0; }
     SsaProf *pf = NULL;
     if (out_reached && out_passed) {
@@ -4055,15 +4950,46 @@ static int explain_impl(const SsaCond *conds, int n_conds, int mc, int large, in
  *
  * Renvoie le nombre de seeds 64-bit retenues (peut dépasser out_cap).
  * ─────────────────────────────────────────────────────────────────────────── */
+static int64_t expand_lows_impl(
+        const SsaCond *conds, int n_conds, int mc, int large,
+        const int64_t *in_lows, int64_t n_lows,
+        int64_t *out_seeds, int64_t out_cap, int n_threads,
+        volatile int *stop_flag, int64_t *prof_out);
+
 EXPORT int64_t ssa_expand_lows(
         const SsaCond *conds, int n_conds, int mc, int large,
         const int64_t *in_lows, int64_t n_lows,
         int64_t *out_seeds, int64_t out_cap, int n_threads,
         volatile int *stop_flag) {
+    return expand_lows_impl(conds, n_conds, mc, large, in_lows, n_lows,
+                            out_seeds, out_cap, n_threads, stop_flag, NULL);
+}
+
+/* (10/10) same, counted into prof_out (layout of ssa_test_seeds_batch_prof):
+ * the GPU structure pipeline (Blocks mode) had no statistics at all. */
+EXPORT int64_t ssa_expand_lows_prof(
+        const SsaCond *conds, int n_conds, int mc, int large,
+        const int64_t *in_lows, int64_t n_lows,
+        int64_t *out_seeds, int64_t out_cap, int n_threads,
+        volatile int *stop_flag, int64_t *prof_out) {
+    return expand_lows_impl(conds, n_conds, mc, large, in_lows, n_lows,
+                            out_seeds, out_cap, n_threads, stop_flag, prof_out);
+}
+
+static int64_t expand_lows_impl(
+        const SsaCond *conds, int n_conds, int mc, int large,
+        const int64_t *in_lows, int64_t n_lows,
+        int64_t *out_seeds, int64_t out_cap, int n_threads,
+        volatile int *stop_flag, int64_t *prof_out) {
     if (n_conds <= 0 || n_conds > MAX_CONDS || n_lows <= 0) return 0;
+    /* bit 16 of `large` (08/10): one seed per 48-bit family ("Hide sister
+     * seeds"): a family stops at its first match */
+    int one_per_family = (large >> 16) & 1;
+    large &= 1;
 #ifdef _OPENMP
     if (n_threads > 0) omp_set_num_threads(n_threads);
 #endif
+    volatile uint8_t *fam_done = one_per_family ? (volatile uint8_t *)calloc((size_t)n_lows, 1) : NULL;
 
     ChildOrderCache *co = child_order_new(conds, n_conds);
     if (!co) return 0;
@@ -4116,6 +5042,8 @@ EXPORT int64_t ssa_expand_lows(
                 env.climate_cache_seed[i][s] = 0xdeadbeefcafebabeULL; env.clazy[i].valid = 0;
             }
         setupGenerator(&env.g, mc, flags);
+        SsaProf *pf = prof_out ? (SsaProf *)calloc(1, sizeof(SsaProf)) : NULL;
+        env.prof = pf;
 
         CondCache caches[MAX_CONDS];
         memset(caches, 0, sizeof(caches));
@@ -4132,6 +5060,7 @@ EXPORT int64_t ssa_expand_lows(
             if (stop_flag && *stop_flag) continue;
             int64_t li = w >> 16;            /* indice du low */
             int64_t h  = w & 0xFFFFLL;        /* variante de bits hauts */
+            if (fam_done && fam_done[li]) continue;
             uint64_t low = (uint64_t)in_lows[li] & 0xFFFFFFFFFFFFULL;
             uint64_t full = ((uint64_t)h << 48) | low;
             env.seed = full;
@@ -4139,8 +5068,13 @@ EXPORT int64_t ssa_expand_lows(
             env.current_dim = -2;
             applySeed(&env.g, DIM_OVERWORLD, full);
             env.current_dim = DIM_OVERWORLD;
-            if (ssa_test_seed_sorted(&env, conds, n_conds, caches,
-                                      toplevel_order, n_toplevel)) {
+            prof_seed_begin(pf);
+            uint64_t pt0 = (pf && pf->timing) ? SSA_TICKS() : 0;
+            int ok_seed = ssa_test_seed_sorted(&env, conds, n_conds, caches,
+                                               toplevel_order, n_toplevel);
+            if (pf && pf->timing) pf->total_ticks += SSA_TICKS() - pt0;
+            if (ok_seed) {
+                if (fam_done) fam_done[li] = 1;
                 if (local_hits && local_n < local_cap) {
                     local_hits[local_n++] = (int64_t)full;
                 } else if (local_hits) {
@@ -4162,8 +5096,21 @@ EXPORT int64_t ssa_expand_lows(
             }
         }
         if (local_hits) free(local_hits);
+        if (pf) {
+            int n = n_conds < MAX_CONDS ? n_conds : MAX_CONDS;
+            for (int i = 0; i < n; i++) {
+                __atomic_fetch_add(&prof_out[5 * i],     pf->reached[i],   __ATOMIC_RELAXED);
+                __atomic_fetch_add(&prof_out[5 * i + 1], pf->passed[i],    __ATOMIC_RELAXED);
+                __atomic_fetch_add(&prof_out[5 * i + 2], (int64_t)pf->ticks[i], __ATOMIC_RELAXED);
+                __atomic_fetch_add(&prof_out[5 * i + 3], pf->checks[i],    __ATOMIC_RELAXED);
+                __atomic_fetch_add(&prof_out[5 * i + 4], pf->checks_ok[i], __ATOMIC_RELAXED);
+            }
+            __atomic_fetch_add(&prof_out[5 * n], (int64_t)pf->total_ticks, __ATOMIC_RELAXED);
+            free(pf);
+        }
     }
 
+    if (fam_done) free((void *)fam_done);
     free(co);
     return kept;
 }

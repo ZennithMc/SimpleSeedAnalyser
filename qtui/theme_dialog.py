@@ -132,6 +132,23 @@ class ThemeDialog(QDialog):
         t = QLabel("Appearance"); t.setObjectName("PageTitle"); v.addWidget(t)
         v.addWidget(body("Click a theme to preview it on the whole application — Apply keeps it.",
                          muted=True))
+        # frame of the textured themes (08/10): previewed live, kept by Apply
+        from .widgets import Segmented
+        self._frame0 = theme.frame_style()
+        fr = QHBoxLayout(); fr.setSpacing(8)
+        fr.addWidget(body("Textured themes — frame:", wrap=False))
+        self._frame_names = {"Veil": "veil", "Glass": "glass", "Clear": "clear",
+                             "Bands": "bands"}
+        inv = {v: k for k, v in self._frame_names.items()}
+        self.frame = Segmented(list(self._frame_names), inv.get(self._frame0, "Veil"))
+        self.frame.setToolTip(
+            "Veil: the whole backdrop under an even veil (no dark bands, no holes).\n"
+            "Glass: a lighter veil, thin lines between the regions.\n"
+            "Clear: the backdrop as it is; the side and top items on small pills.\n"
+            "Bands: translucent dark bars (as before).")
+        self.frame.changed.connect(self._frame_changed)
+        fr.addWidget(self.frame); fr.addStretch(1)
+        v.addLayout(fr)
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         inner = QWidget(); iv = QVBoxLayout(inner); iv.setContentsMargins(0, 4, 8, 4); iv.setSpacing(10)
@@ -139,10 +156,14 @@ class ThemeDialog(QDialog):
         self.cards = {}
         groups = (("Plain & metal", ["Slate", "Midnight", "Daylight", "Graphite", "Copper"]),
                   ("Marble", ["Obsidian Gold", "Carrara", "Emerald", "Lapis", "Rose Quartz",
-                              "Arctic"]),
+                              "Arctic", "Glacier"]),
                   ("Minecraft", ["Deepslate", "Nether", "The End", "Mesa", "Amethyst",
-                                 "Prismarine", "Jungle"]),
-                  ("Sky & nature", ["Aurora", "Nebula", "Sunset Dune", "Abyss", "Sakura", "Ember"]))
+                                 "Prismarine", "Jungle", "Sculk", "Redstone", "Honeycomb"]),
+                  ("Sky & nature", ["Aurora", "Nebula", "Sunset Dune", "Abyss", "Sakura", "Ember",
+                                    "Lavender Dusk"]),
+                  ("Wood", ["Oak", "Dark Oak", "Cherry", "Crimson", "Warped"]),
+                  ("Retro & paper", ["Synthwave", "Blueprint", "Parchment",
+                                     "Topographic"]))
         listed = {n for _g, ns in groups for n in ns}
         extra = [n for n in theme.BUILTIN if n not in listed]
         if extra:
@@ -240,6 +261,14 @@ class ThemeDialog(QDialog):
             for c in self.cards.values():
                 c.update()
 
+    def _frame_changed(self, label):
+        theme.FRAME_OVERRIDE = self._frame_names.get(label, "bands")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            theme.apply(self.app, self.current, self._tokens(self.current))
+        finally:
+            QApplication.restoreOverrideCursor()
+
     def _pick(self, key):
         toks = dict(self._tokens(self.current))
         col = QColorDialog.getColor(QColor(toks[key]), self, f"{key}")
@@ -264,9 +293,14 @@ class ThemeDialog(QDialog):
         if name in theme.EDITABLE and name in self.edits:
             theme.save_user_theme(name, self.edits[name])
         theme.remember_theme(name)
+        if theme.FRAME_OVERRIDE:
+            from PySide6.QtCore import QSettings
+            QSettings("SSA", "SimpleSeedAnalyser").setValue("theme/frame", theme.FRAME_OVERRIDE)
+        theme.FRAME_OVERRIDE = None
         theme.apply(self.app, name)
         super().accept()
 
     def reject(self):
+        theme.FRAME_OVERRIDE = None
         theme.apply(self.app, *self.original)
         super().reject()

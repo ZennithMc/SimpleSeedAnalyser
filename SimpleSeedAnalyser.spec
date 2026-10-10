@@ -81,7 +81,8 @@ hiddenimports = (
         "gaider_layouts", "terrain", "biome_gpu", "checker_client", "seedlist_io",
         "cubiomes_session", "cubiomes_session_writer", "condition_types",
         "biome_catalog", "noise_palettes", "colormaps", "draw_engine",
-        "topy_family", "topy_gpu", "lake_portals", "mc_checker", "session_confirm",
+        "topy_family", "topy_gpu", "lake_portals", "mc_checker", "session_confirm", "spawn_check",
+        "feature116", "qtui.feature_confirm",
         # Qt: the stylesheet uses url(*.svg) → qsvg image-format plugin → Qt6Svg
         "PySide6.QtSvg",
         # map_engine noise resize

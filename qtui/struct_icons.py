@@ -55,6 +55,10 @@ SPEC = {
     "end_gateway":      ("End gateway",       "#6fd3c9"),
     "mineshaft":        ("Mineshaft",         "#8b6a3c"),
     "desert_well":      ("Desert well",       "#d6bd78"),
+    "dungeon":          ("Dungeon (1.16)",    "#5f6b75"),
+    "dungeon_ok":       ("Dungeon (in Minecraft)", "#3f8f62"),
+    "lava_lake":        ("Lava lake (1.16)",  "#d9531e"),
+    "lava_lake_surface": ("Surface lava lake", "#e88a3a"),
     # ── non-structure conditions ──
     "biome_filter":     ("Overworld at scale", "#58a64a"),
     "biome_sample":     ("Biome samples",      "#58a64a"),
@@ -289,6 +293,22 @@ def _glyph(k: str, p: QPainter, ink: QColor, bg: QColor):
         stroke(2.2)
         path = QPainterPath(); path.moveTo(5, 9); path.quadTo(12, 3.5, 19, 9); p.drawPath(path)
         p.drawLine(QPointF(12, 6.4), QPointF(12, 19.5))
+    elif k in ("dungeon", "dungeon_ok"):             # spawner cage (10/10)
+        p.drawRoundedRect(QRectF(5.5, 5.5, 13, 13), 1.6, 1.6)
+        cut(lambda: p.drawRect(QRectF(7.2, 7.2, 9.6, 9.6)))
+        for x in (9.2, 11.4, 13.6):                  # bars
+            p.drawRect(QRectF(x, 7.2, 1.2, 9.6))
+        p.drawRect(QRectF(7.2, 11.4, 9.6, 1.2))
+        p.setBrush(QColor("#ff8a3a") if k == "dungeon" else QColor("#7dffb0"))
+        p.drawEllipse(QPointF(12, 12), 1.9, 1.9)     # the flame inside
+    elif k in ("lava_lake", "lava_lake_surface"):    # lava pool with a drop
+        path = QPainterPath(); path.moveTo(12, 3.5)
+        path.cubicTo(15.5, 8, 17, 10.5, 17, 12.6); path.cubicTo(17, 15.5, 14.8, 17.4, 12, 17.4)
+        path.cubicTo(9.2, 17.4, 7, 15.5, 7, 12.6); path.cubicTo(7, 10.5, 8.5, 8, 12, 3.5)
+        p.setBrush(QColor("#ffd23a")); p.drawPath(path)
+        p.setBrush(fill)
+        p.drawRoundedRect(QRectF(4, 17.2, 16, 3.2), 1.6, 1.6)
+        cut(lambda: p.drawEllipse(QPointF(10.6, 12.8), 1.3, 1.6))
     elif k == "desert_well":                         # well
         p.drawRect(QRectF(6, 13, 12, 5.5))
         p.drawPolygon(_poly((5, 8.5), (12, 4.5), (19, 8.5)))

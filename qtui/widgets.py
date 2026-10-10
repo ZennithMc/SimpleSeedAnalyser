@@ -17,6 +17,94 @@ def hline() -> QFrame:
     return f
 
 
+def explain_disabled(w, enabled: bool, reason: str = "") -> None:
+    """Enable / disable `w`; while disabled its tooltip ends with WHY (08/10:
+    a greyed control looked like a bug). The normal tooltip is kept apart."""
+    base = w.property("_tip0")
+    if base is None or w.isEnabled() and not w.property("_tip_reason"):
+        base = w.toolTip() if not w.property("_tip_reason") else base
+        w.setProperty("_tip0", base or "")
+    w.setEnabled(bool(enabled))
+    if enabled or not reason:
+        w.setProperty("_tip_reason", "")
+        w.setToolTip(base or "")
+    else:
+        w.setProperty("_tip_reason", reason)
+        w.setToolTip(((base + "\n\n") if base else "") + "Unavailable: " + reason)
+
+
+from PySide6.QtWidgets import QLayout as _QLayout
+
+
+class FlowLayout(_QLayout):
+    """Items left to right, wrapping to the next line (Qt's flow layout
+    example). Used for the biome chips (08/10)."""
+
+    def __init__(self, parent=None, h_spacing=6, v_spacing=6):
+        super().__init__(parent)
+        self._items = []
+        self._h, self._v = h_spacing, v_spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        from PySide6.QtCore import QRect
+        return self._do(QRect(0, 0, w, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        from PySide6.QtCore import QSize
+        s = QSize()
+        for it in self._items:
+            s = s.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return s + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do(self, rect, test):
+        from PySide6.QtCore import QPoint, QRect
+        m = self.contentsMargins()
+        r = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line = r.x(), r.y(), 0
+        for it in self._items:
+            w = it.widget()
+            if w is not None and w.isHidden():
+                continue
+            hint = it.sizeHint()
+            nx = x + hint.width() + self._h
+            if nx - self._h > r.right() + 1 and line > 0:
+                x = r.x(); y = y + line + self._v
+                nx = x + hint.width() + self._h
+                line = 0
+            if not test:
+                it.setGeometry(QRect(QPoint(x, y), hint))
+            x = nx
+            line = max(line, hint.height())
+        return y + line - rect.y() + m.bottom()
+
+
 def body(text: str, muted=False, wrap=True, small=False) -> QLabel:
     lab = QLabel(text)
     lab.setObjectName("Muted" if muted else "Body")
@@ -193,6 +281,7 @@ SHORTCUTS = [
         ("Alt+1 … Alt+9", "Climate noise: only that octave (0A, 0B, 1A… in the list order)"),
         ("Alt+Shift+1 … 9", "Climate noise: up to that octave"),
         ("Alt+0", "Climate noise: all octaves"),
+        ("Alt+O", "Climate noise: switch Up to ↔ Only (same octave)"),
         ("Alt+G", "Octave arrows on / off (climate noises)"),
         ("Alt+S", "Structure seed view: potential structure positions, biomes ignored"),
         ("Alt+Shift+G", "Octave arrows: Gradient ↔ Lattice"),
@@ -404,3 +493,111 @@ class AdaptiveButton(_QPB):
             _QPB.setText(self, "" if compact else self._full)
             if compact:
                 self.setToolTip(self._full.strip())
+
+
+# ── RangeSlider (08/10): two handles, like cubiomes-viewer's height filter ───
+class RangeSlider(QWidget):
+    """Min / max on one bar: drag a handle, or click the bar to move the nearest
+    one. `inverted` paints the kept part OUTSIDE the two handles (an "Outside
+    range" test). Integer values. rangeChanged(lo, hi)."""
+    rangeChanged = Signal(int, int)
+    R = 7                                         # handle radius (px)
+
+    def __init__(self, lo=-64, hi=320, vlo=None, vhi=None, parent=None):
+        super().__init__(parent)
+        self._min, self._max = int(lo), int(hi)
+        self._lo = self._min if vlo is None else int(vlo)
+        self._hi = self._max if vhi is None else int(vhi)
+        self._inv = False
+        self._drag = None
+        self.setMinimumHeight(26)
+        self.setMinimumWidth(120)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    # values
+    def values(self):
+        return self._lo, self._hi
+
+    def set_values(self, lo, hi, emit=False):
+        lo, hi = int(lo), int(hi)
+        lo = max(self._min, min(self._max, lo)); hi = max(self._min, min(self._max, hi))
+        if lo > hi:
+            lo, hi = hi, lo
+        if (lo, hi) == (self._lo, self._hi):
+            return
+        self._lo, self._hi = lo, hi
+        self.update()
+        if emit:
+            self.rangeChanged.emit(lo, hi)
+
+    def set_inverted(self, on):
+        self._inv = bool(on)
+        self.update()
+
+    # geometry
+    def _x(self, v):
+        w = max(1, self.width() - 2 * self.R - 2)
+        return self.R + 1 + (v - self._min) * w / max(1, self._max - self._min)
+
+    def _v(self, x):
+        w = max(1, self.width() - 2 * self.R - 2)
+        v = self._min + (x - self.R - 1) * (self._max - self._min) / w
+        return int(round(max(self._min, min(self._max, v))))
+
+    def paintEvent(self, _e):
+        from PySide6.QtCore import QPointF, QRectF
+        from PySide6.QtGui import QColor, QPainter, QPen
+        from . import theme as _th
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        cy = self.height() / 2
+        x0, x1 = self._x(self._min), self._x(self._max)
+        xl, xh = self._x(self._lo), self._x(self._hi)
+        track = QColor(_th.LINE2)
+        acc = QColor(_th.ACCENT)
+        if not self.isEnabled():
+            acc = QColor(_th.TEXT3)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track)
+        p.drawRoundedRect(QRectF(x0, cy - 2, x1 - x0, 4), 2, 2)
+        p.setBrush(acc)
+        if self._inv:
+            p.drawRoundedRect(QRectF(x0, cy - 2, max(0.0, xl - x0), 4), 2, 2)
+            p.drawRoundedRect(QRectF(xh, cy - 2, max(0.0, x1 - xh), 4), 2, 2)
+        else:
+            p.drawRoundedRect(QRectF(xl, cy - 2, max(0.0, xh - xl), 4), 2, 2)
+        for x in (xl, xh):
+            p.setPen(QPen(acc, 2))
+            p.setBrush(QColor(_th.BG1))
+            p.drawEllipse(QPointF(x, cy), self.R - 1, self.R - 1)
+        p.end()
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(e)
+        x = e.position().x()
+        dl, dh = abs(x - self._x(self._lo)), abs(x - self._x(self._hi))
+        if dl == dh:                              # stacked handles: by direction
+            self._drag = "lo" if x < self._x(self._lo) else "hi"
+        else:
+            self._drag = "lo" if dl < dh else "hi"
+        self._move(x)
+        e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._drag:
+            self._move(e.position().x())
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        self._drag = None
+        e.accept()
+
+    def _move(self, x):
+        v = self._v(x)
+        lo, hi = self._lo, self._hi
+        if self._drag == "lo":
+            lo = min(v, hi)
+        else:
+            hi = max(v, lo)
+        self.set_values(lo, hi, emit=True)

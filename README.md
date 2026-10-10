@@ -129,6 +129,7 @@ SimpleSeedAnalyser stands on the shoulders of the Minecraft seedfinding communit
 - **[Cubiomes](https://github.com/Cubitect/cubiomes)** by Cubitect (MIT) — the C library that powers biome generation, structure placement and noise sampling, compiled into SSA's engine. Terrain height uses the **[xpple fork](https://github.com/xpple/cubiomes)**.
 - **[Cubiomes Viewer](https://github.com/Cubitect/cubiomes-viewer)** by Cubitect — the reference seedfinder that inspired SSA's condition system, area modes and noise overlays, and whose `.session` files SSA can import. SSA's code is written from scratch.
 - **[12-eye](https://github.com/Gaider10/12-eye)** by Gaider10 — the stronghold piece simulator used to find exact portal rooms (CPU and GPU layout search).
+- **[seed-checker](https://github.com/jellejurre/seed-checker)** by jellejurre — runs the real Minecraft world generation to confirm results (broken portals, spawn checks). SSA ships a modified copy of its `SeedChunkGenerator.java` (`tools/checker/overrides`).
 - **[Qt / PySide6](https://www.qt.io)** (LGPL-3.0), **NumPy**, **Pillow**, **python-zstandard**, **PyInstaller**.
 - The **Minecraft seedfinding community** — for documenting the algorithms (LCG seeds, stronghold rings, biome noise) that make tools like SSA possible.
 - Minecraft is a trademark of **Mojang Studios / Microsoft**. SSA is an unofficial third-party tool, not affiliated with them.

@@ -440,6 +440,8 @@ def _compile_cubiomes() -> str:
         "noise_bridge.c", "height_bridge.c",
         "biome_filter_bridge.c",
         "session_engine.c",
+        "terrain116.c",         # exact 1.16 terrain + population (dungeons / lava lakes)
+        "mineshaft116.c",       # 1.16 mineshafts (for the dungeons)
         "gaider_fast.c",
         "drawing_bridge.c",
         "draw_engine.c",        # Draw search engine v2 (Qt Draw page)

@@ -92,8 +92,9 @@ class SearchRunner(QObject):
 
     def start(self, conditions, mc, start, threads, mode="inc", seed_list=None,
               rule=("never", 0), _resume=False, _count=None, job=None, engine_label=None,
-              gpu="as_set", plan=None, _engine_mode=None):
+              gpu="as_set", plan=None, _engine_mode=None, options=None):
         """conditions: engine-format list (already exported, deep-copied).
+        options: "48-bit family" options (hide_sisters, struct_only — 08/10).
         rule: ("never"|"seeds"|"results"|"time", value) — when to stop.
         A results / time limit PAUSES the search (it can be resumed, e.g. with
         a higher limit); a seeds limit ends it."""
@@ -117,7 +118,8 @@ class SearchRunner(QObject):
         self.auto_paused = None
         self.params = dict(conditions=conditions, mc=mc, threads=threads, mode=mode,
                            seed_list=seed_list, job=job, engine_label=engine_label,
-                           gpu=gpu, plan=plan, engine_mode=_engine_mode or mode)
+                           gpu=gpu, plan=plan, engine_mode=_engine_mode or mode,
+                           options=dict(options or {}))
         self._mode_err = None
         self.plan = None
         self._planning = None
@@ -204,7 +206,8 @@ class SearchRunner(QObject):
                    self.resume_point, threads or p["threads"], p["mode"], None, rule,
                    _resume=True, _count=count, _engine_mode=eng_mode,
                    gpu=gpu if gpu is not None else p.get("gpu", "as_set"),
-                   plan=plan if gpu is not None else p.get("plan"))
+                   plan=plan if gpu is not None else p.get("plan"),
+                   options=p.get("options"))
         return None
 
     # ── session files: keep / restore a paused search ──────────────────────
@@ -216,7 +219,8 @@ class SearchRunner(QObject):
         st = dict(state=self.state, base_start=int(getattr(self, "base_start", 0)),
                   mode=self.params.get("mode", "inc"), eff_mode=self.eff_mode,
                   done=int(self._done_before), elapsed=float(self._elapsed_before),
-                  found=int(self.found), rule=list(self.rule))
+                  found=int(self.found), rule=list(self.rule),
+                  options=dict(self.params.get("options") or {}))
         if self.state == "paused" and self.resume_point is not None:
             st["resume_point"] = int(self.resume_point)
         return st
@@ -229,7 +233,7 @@ class SearchRunner(QObject):
         mode = st.get("mode", "inc")
         self.params = dict(conditions=conditions, mc=mc, threads=threads, mode=mode,
                            seed_list=None, job=None, engine_label=None, gpu="as_set", plan=None,
-                           engine_mode=mode)
+                           engine_mode=mode, options=dict(st.get("options") or {}))
         self.base_start = int(st.get("base_start", 0))
         self.resume_point = int(st["resume_point"])
         self.eff_mode = st.get("eff_mode") or ("inc" if mode == "inc" else None)
@@ -343,7 +347,8 @@ class SearchRunner(QObject):
                                     p["threads"], self._stop, on_match, on_progress,
                                     search_mode=p["engine_mode"], on_mode=on_mode,
                                     seed_list=p["seed_list"], on_resume=on_resume,
-                                    on_profile=on_profile, max_found=cap)
+                                    on_profile=on_profile, max_found=cap,
+                                    options=p.get("options"))
         except Exception as e:                                 # reported, never swallowed
             import traceback
             traceback.print_exc()
@@ -387,11 +392,24 @@ class SearchRunner(QObject):
         ints = [m for m in modes if isinstance(m, int)]
         if gpu_status:
             self._gpu_note = str(gpu_status[-1][1])
+        base_pause = p["seed_list"] is None and p.get("job") is None
         if ints and ints[-1] == 3:          # the last mode: 3 then 0/1/2 = GPU fell back
-            self.can_pause = False
+            # 08/10: the hybrid GPU pipelines give a resume point (Incremental)
+            res = any(isinstance(m, tuple) and m and m[0] == "resumable" for m in modes)
+            self.can_pause = base_pause and res
             return ("GPU (CUDA) + C validation",
                     "The GPU pre-filters the seeds; every candidate is fully checked by the "
-                    "C engine. Results are exact.")
+                    "C engine. Results are exact."
+                    + ("" if res else "\nThis GPU pipeline cannot be paused (Stop only)."))
+        if ints and not self._planning:
+            self.can_pause = base_pause     # a GPU path that fell back to the C engine
+        if ints and p["seed_list"] is not None:
+            if ints[-1] == 1:
+                return ("Seed list · 48-bit families · C engine",
+                        "Every listed seed stands for its 48-bit family: its 65 536 sister "
+                        "seeds (same lower 48 bits) are all tested. Families whose "
+                        "structure positions fail are skipped at once.")
+            return "Seed list · C engine", "Tests exactly the seeds of the list."
         if ints:
             m = ints[-1]
             lab = f"C engine · {p['threads']} threads · {MODE_LABEL.get(m, '?')}"

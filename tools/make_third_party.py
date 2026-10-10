@@ -26,6 +26,11 @@ sec("12-eye / stronghold generator — Gaider10 (compiled into gaider_layouts)\n
     "https://github.com/Gaider10/12-eye",
     "Stronghold piece generator used to simulate portal rooms. Used with credit;\n"
     "licence to be confirmed with the author before a public release.")
+sec("seed-checker — jellejurre (Minecraft check, tools/checker)\n"
+    "https://github.com/jellejurre/seed-checker",
+    "Used to confirm results with the real Minecraft world generation. SSA ships a\n"
+    "modified copy of its SeedChunkGenerator.java (tools/checker/overrides); the\n"
+    "upstream repository does not state a licence. Used with credit.")
 sec("Qt 6 and PySide6 / Shiboken6 — The Qt Company (LGPL-3.0)\nhttps://www.qt.io  ·  https://pypi.org/project/PySide6/",
     "SimpleSeedAnalyser uses Qt 6 through PySide6 under the GNU Lesser General Public\n"
     "License v3. The Qt / PySide6 libraries are shipped unmodified as separate shared\n"

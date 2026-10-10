@@ -255,21 +255,13 @@ def _make_noise_luts() -> dict:
     # Semantic (palette MC classique) — déjà bonne, on la garde
     d["__height_semantic__"] = _lerp_lut(NOISE_DEFAULT_STOPS["Height"])
 
-    # Grayscale calibré Height : vraiment sombre sous l'eau, clair sur les pics
+    # Grayscale Height = cubiomes-viewer (08/10): grey = Y clamped to 0..255
+    # (core range -30..320); the red sinkholes (Y <= -64) are on the extended
+    # axis, see grayscale_height_lut()
     _h_gray = _np.zeros((256, 3), dtype=_np.uint8)
     for _i in range(256):
-        # Sous sea level (idx 0→67) : 20→100 (sombre)
-        # Sea level→beach (67→80) : 100→145 (moyen)
-        # Plaines→montagne (80→204) : 145→220 (clair)
-        # Peaks (204→255) : 220→255 (blanc)
-        if _i <= 67:
-            v = int(20 + (_i / 67) * 80)
-        elif _i <= 80:
-            v = int(100 + ((_i - 67) / 13) * 45)
-        elif _i <= 204:
-            v = int(145 + ((_i - 80) / 124) * 75)
-        else:
-            v = int(220 + ((_i - 204) / 51) * 35)
+        _y = -30.0 + _i / 255.0 * 350.0
+        v = int(max(0, min(255, round(_y))))
         _h_gray[_i] = [v, v, v]
     d["__height_Grayscale__"] = _h_gray
 
@@ -488,6 +480,29 @@ def u_from_pos(pos, noise):
     return float(u) if np.ndim(u) == 0 else u
 
 
+SINK_Y = -64        # cubiomes-viewer Grayscale: height ≤ −64 in red (sinkholes)
+
+
+def sink_index():
+    """Last colour index (0..255) of the Height channel whose level is ≤ SINK_Y."""
+    lo, hi = DISPLAY_RANGES["Height"]
+    u = u_from_pos((SINK_Y - lo) / (hi - lo), "Height")
+    return int(np.floor(u * 255.0 + 1e-9))
+
+
+def grayscale_height_lut():
+    """cubiomes-viewer's Grayscale height view (applyHeightShading, HV_GRAYSCALE):
+    grey = the height clamped to 0..255 (black at y ≤ 0, white from 255 up), and
+    pure red at y ≤ −64 — on SSA's extended colour axis (08/10)."""
+    lo, hi = DISPLAY_RANGES["Height"]
+    idx = np.arange(256, dtype=np.float64)
+    y = lo + pos_from_u(idx / 255.0, "Height") * (hi - lo)
+    g = np.clip(np.rint(y), 0, 255).astype(np.uint8)
+    lut = np.stack([g, g, g], axis=1)
+    lut[: sink_index() + 1] = (255, 0, 0)
+    return lut
+
+
 def pos_from_u(u, noise):
     _, _, pmin, pmax = axis(noise)
     u = np.asarray(u, dtype=np.float64)
@@ -703,13 +718,42 @@ _NOCTURNE_HEIGHT = [(-230, "#f2ffd8"), (-160, "#a4ff3c"), (-90, "#10b56c"),
                     (470, "#ff3db8"), (560, "#ffe4f5")]
 
 
+# (08/10) two more extended palettes, other halves of the colour wheel again:
+# "Reef": a sea-floor core (deep blue · teal · wet sand · dusty coral · plum),
+# extremes below −10 000 in bioluminescent aqua → mint → foam, above +10 000 in
+# hot coral → magenta → shell pink. "Spectral": a soft olive / stone core, the
+# extremes running through the spectrum — violet → blue → cyan below, yellow →
+# orange → red above (to ±25 000).
+_REEF_CLIMATE = [(-25000, "#f0fff9"), (-19000, "#7dffd6"), (-13500, "#18c7c1"),
+                 (-10000, "#0d2a3f"), (-6000, "#174d63"), (-2500, "#3f7f7a"),
+                 (0, "#e3d3b0"), (2500, "#c98f7a"), (6000, "#8e4f68"),
+                 (10000, "#3b1838"), (13500, "#ff5f6d"), (19000, "#ff3fb0"),
+                 (25000, "#ffe3ef")]
+_REEF_HEIGHT = [(-230, "#f0fff9"), (-160, "#7dffd6"), (-90, "#18c7c1"),
+                (-30, "#0d2a3f"), (25, "#174d63"), (62, "#3f7f7a"), (64, "#e3d3b0"),
+                (110, "#c98f7a"), (190, "#8e4f68"), (320, "#3b1838"), (390, "#ff5f6d"),
+                (470, "#ff3fb0"), (560, "#ffe3ef")]
+_SPECTRAL_CLIMATE = [(-25000, "#e9f9ff"), (-19000, "#38d8ff"), (-13500, "#3f5bff"),
+                     (-10000, "#2a1a5e"), (-6000, "#3c4a3a"), (-2500, "#6f7a5a"),
+                     (0, "#cfc9b0"), (2500, "#9d8f62"), (6000, "#5f5236"),
+                     (10000, "#3a2416"), (13500, "#ffd23a"), (19000, "#ff7b1c"),
+                     (25000, "#ff2a2a")]
+_SPECTRAL_HEIGHT = [(-230, "#e9f9ff"), (-160, "#38d8ff"), (-90, "#3f5bff"),
+                    (-30, "#2a1a5e"), (25, "#3c4a3a"), (62, "#6f7a5a"), (64, "#cfc9b0"),
+                    (110, "#9d8f62"), (190, "#5f5236"), (320, "#3a2416"), (390, "#ffd23a"),
+                    (470, "#ff7b1c"), (560, "#ff2a2a")]
+
+
 def _from(climate, height):
     return {n: _vstops(n, height if n == "Height" else climate) for n in EDITOR_NOISES}
 
 
 STOP_BUILTINS = {"Eclipse": _from(_ECLIPSE_CLIMATE, _ECLIPSE_HEIGHT),
-                 "Nocturne": _from(_NOCTURNE_CLIMATE, _NOCTURNE_HEIGHT)}
-_STOP_COLORS = {"Eclipse": "#ff8a4d", "Nocturne": "#b98cff"}
+                 "Nocturne": _from(_NOCTURNE_CLIMATE, _NOCTURNE_HEIGHT),
+                 "Reef": _from(_REEF_CLIMATE, _REEF_HEIGHT),
+                 "Spectral": _from(_SPECTRAL_CLIMATE, _SPECTRAL_HEIGHT)}
+_STOP_COLORS = {"Eclipse": "#ff8a4d", "Nocturne": "#b98cff", "Reef": "#3fe0c8",
+                "Spectral": "#ffc23a"}
 for _n, _p in STOP_BUILTINS.items():
     register_custom(_n, _p)
     BUILTIN_PALETTES.add(_n)

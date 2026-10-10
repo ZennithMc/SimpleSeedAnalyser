@@ -110,6 +110,7 @@
 #define MC_1_10 13
 #define MC_1_13 16
 #define MC_1_15 18
+#define MC_1_16_1 19
 #define MC_1_16 20
 #define MC_1_18 22
 
@@ -148,7 +149,7 @@ GPUDEV static int D_getCategory(int mc,int id){
     case modified_jungle_edge: case bamboo_jungle: case bamboo_jungle_hills: return jungle;
     case badlands: case eroded_badlands: case modified_wooded_badlands_plateau:
     case modified_badlands_plateau: return mesa;
-    case wooded_badlands_plateau: case badlands_plateau: return mc<=MC_1_15?mesa:badlands_plateau;
+    case wooded_badlands_plateau: case badlands_plateau: return mc<=MC_1_16_1?mesa:badlands_plateau;
     case mushroom_fields: case mushroom_field_shore: return mushroom_fields;
     case stone_shore: return stone_shore;
     case ocean: case frozen_ocean: case deep_ocean: case warm_ocean: case lukewarm_ocean:
@@ -167,7 +168,7 @@ GPUDEV static int D_getCategory(int mc,int id){
 }
 GPUDEV static int D_areSimilar(int mc,int a,int b){
     if(a==b)return 1;
-    if(mc<=MC_1_15){ if(a==wooded_badlands_plateau||a==badlands_plateau) return b==wooded_badlands_plateau||b==badlands_plateau; }
+    if(mc<=MC_1_16_1){ if(a==wooded_badlands_plateau||a==badlands_plateau) return b==wooded_badlands_plateau||b==badlands_plateau; }
     return D_getCategory(mc,a)==D_getCategory(mc,b);
 }
 GPUDEV static int D_isMesa(int id){ switch(id){case badlands:case eroded_badlands:case modified_wooded_badlands_plateau:case modified_badlands_plateau:case wooded_badlands_plateau:case badlands_plateau:return 1;default:return 0;} }

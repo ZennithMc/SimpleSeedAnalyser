@@ -18,7 +18,7 @@ import time
 import numpy as np
 
 W, H = 1600, 1000
-VERSION = 6
+VERSION = 7
 # sharp-edged backdrops (facets, leaves, petals) are rendered at a higher
 # resolution: stretched over a large window, 1600 px looked blurry
 HIRES = (2560, 1600)
@@ -200,7 +200,7 @@ def stone(rng, dark="#1c1d21", light="#34363c", specks=("#15161a", "#4a4d55"), c
 
 
 def glow(rng, base=("#140c08", "#23140c"), blobs=(("#ff7a2e", 0.25, 0.15, 0.45),),
-         grain=4, light=False, ridges=None, petals=None, leaves=None):
+         grain=4, light=False, ridges=None, petals=None, leaves=None, crisp=False, stars=0):
     """Smooth gradient with soft glowing blobs (sunset, sakura, copper…)."""
     h, w = H, W
     yy, xx = _yx(h, w)
@@ -208,6 +208,8 @@ def glow(rng, base=("#140c08", "#23140c"), blobs=(("#ff7a2e", 0.25, 0.15, 0.45),
     for col, bx, by, r in blobs:
         d = np.sqrt((xx - bx) ** 2 * (w / h) ** 2 + (yy - by) ** 2)
         img = img + _rgb(col) * (np.exp(-(d / r) ** 2) * (0.6 if not light else 0.35))[..., None]
+    if stars:                                       # crisp stars (dusk / night skies)
+        img = _stars(img, rng, int(stars * (W / 1600.0) ** 2), "#fff4ff", 0.06)
     if petals:                                      # soft falling petals
         col, n = petals
         c = _rgb(col)
@@ -223,7 +225,11 @@ def glow(rng, base=("#140c08", "#23140c"), blobs=(("#ff7a2e", 0.25, 0.15, 0.45),
             py, px = np.mgrid[y0:y1, x0:x1].astype(np.float32)
             dy, dx = py - cy, px - cx
             u = dx * np.cos(a) + dy * np.sin(a); v = -dx * np.sin(a) + dy * np.cos(a)
-            m = np.clip(1.4 - np.sqrt((u / rx) ** 2 + (v / ry) ** 2), 0, 1) * (0.35 + 0.4 * rng.random())
+            rr = np.sqrt((u / rx) ** 2 + (v / ry) ** 2)
+            if crisp:                               # sharp petal, ~1 px edge, a lighter tip
+                m = np.clip((1.0 - rr) * min(rx, ry) * 1.2, 0, 1) * (0.55 + 0.4 * rng.random())
+            else:
+                m = np.clip(1.4 - rr, 0, 1) * (0.35 + 0.4 * rng.random())
             img[y0:y1, x0:x1] = img[y0:y1, x0:x1] * (1 - m[..., None]) + c * m[..., None]
     if leaves:                                      # crisp leaves (pointed, midrib, shades)
         cols, n = leaves
@@ -327,8 +333,220 @@ def crystal(rng, dark="#1a0f2e", light="#5b3a8f", edge="#d7b8ff", n=90, glint="#
     return _vignette(img, 0.35)
 
 
+def planks(rng, base=("#6b4a2b", "#9b7346"), seam="#2a1a0e", rows=(70, 125), length=(380, 980),
+           grain=1.0, knots=7, light=False):
+    """Wooden planks (08/10): staggered boards of uneven length, each its own
+    tone, with long grain, growth rings bending around a few knots, dark seams
+    and a soft light from the top left."""
+    h, w = H, W
+    yy, xx = _yx(h, w)
+    py = np.arange(h, dtype=np.float32)
+    px = np.arange(w, dtype=np.float32)
+    # rows of boards
+    edges = [0]
+    while edges[-1] < h:
+        edges.append(edges[-1] + int(rng.integers(rows[0], rows[1])))
+    row = np.searchsorted(np.array(edges[1:]), py, side="right")          # (h,)
+    nrow = len(edges)
+    # boards along each row (staggered joints)
+    board = np.zeros((h, w), np.int32)
+    seam_m = np.zeros((h, w), np.float32)
+    bid = 0
+    tones = []
+    for r in range(nrow):
+        y0, y1 = edges[r], min(h, edges[r + 1] if r + 1 < len(edges) else h)
+        if y0 >= h:
+            break
+        x = -int(rng.integers(0, length[1]))
+        while x < w:
+            L = int(rng.integers(length[0], length[1]))
+            a, b = max(0, x), min(w, x + L)
+            if b > a:
+                board[y0:y1, a:b] = bid
+                seam_m[y0:y1, max(0, b - 2):b] = 1.0             # end joint
+                tones.append(rng.random())
+                bid += 1
+            x += L
+        seam_m[max(0, y1 - 2):y1, :] = 1.0                       # long seam
+    tones = np.array(tones + [0.5], np.float32)
+    t = tones[board]
+    # grain: long streaks + growth rings warped around knots
+    streak = _fbm(h, w, 3.0, 3, rng, 0.6, sx=60.0)
+    warp = (_fbm(h, w, 160, 3, rng, 0.5) - 0.5) * 40.0
+    yk = py[:, None] + warp + board.astype(np.float32) * 37.0
+    for _k in range(int(knots)):
+        kx, ky = rng.random() * w, rng.random() * h
+        rx, ry = 40 + rng.random() * 70, 10 + rng.random() * 16
+        d = np.sqrt(((px[None, :] - kx) / rx) ** 2 + ((py[:, None] - ky) / ry) ** 2)
+        yk = yk + 26.0 * np.exp(-d * d) * np.sign(py[:, None] - ky + 0.01)
+    rings = 0.5 + 0.5 * np.sin(yk * (0.42 * grain) + streak * 5.0)
+    shade = 0.32 + t * 0.5 + (rings - 0.5) * 0.22 * grain + (streak - 0.5) * 0.35
+    img = _mix(_rgb(base[0]), _rgb(base[1]), shade)
+    sm = np.clip(seam_m, 0, 1)[..., None]
+    img = img * (1 - sm) + _rgb(seam) * sm
+    # light from the top left, a slight bevel under each seam
+    img = img * (0.92 + 0.14 * (1 - yy) * (1 - 0.5 * xx))[..., None]
+    img = _grain(img, rng, 3 if light else 5)
+    return _vignette(img, 0.18 if light else 0.32)
+
+
+def synthwave(rng, sky=("#0b0420", "#3a0a4a", "#ff3d8a"), sun=("#ffd34d", "#ff3d8a"),
+              grid="#38e8ff", ground="#090216", horizon=0.56):
+    """(10/10) Retro 80s: gradient sky, striped setting sun, perspective neon
+    grid on a dark plane."""
+    h, w = H, W
+    yy, xx = _yx(h, w)
+    img = _grad([(0.0, sky[0]), (0.6, sky[1]), (1.0, sky[2])], yy / horizon)
+    img = _stars(img, rng, 500, "#ffe6ff", 0.03)
+    # sun: disc with horizontal cuts towards its base
+    cx, cy, r = 0.5, horizon - 0.05, 0.19
+    d = np.sqrt(((xx - cx) * w / h) ** 2 + (yy - cy) ** 2)
+    disc = np.clip((r - d) * h / 1.5, 0, 1)
+    u = (yy - (cy - r)) / (2 * r)
+    cuts = np.where(u > 0.3, (np.sin((u - 0.3) * 70.0) > -0.75 + 2.4 * (u - 0.3)), 1.0)
+    scol = _mix(_rgb(sun[0]), _rgb(sun[1]), u * 1.1)
+    m = (disc * cuts * (yy < horizon))[..., None]
+    img = img * (1 - m) + scol * m
+    halo = np.exp(-(d / (r * 1.8)) ** 2) * 0.35 * (yy < horizon)
+    img = img + _rgb(sun[1]) * halo[..., None]
+    # ground + perspective grid
+    gm = yy >= horizon
+    g = np.clip((yy - horizon) / (1 - horizon), 1e-3, 1)
+    img[gm] = _rgb(ground)
+    zc = 1.0 / g                                        # depth
+    xw = (xx - 0.5) * zc * 8.0
+    lx = np.abs(xw - np.round(xw))
+    lz = np.abs(zc * 2.0 - np.round(zc * 2.0))
+    aa = 0.9 / (h * (1 - horizon)) * zc * 2.0           # line width in depth units
+    line = np.maximum(np.clip(1 - lx / (0.03 * zc ** 0.5 + 1e-3), 0, 1),
+                      np.clip(1 - lz / np.maximum(aa * 1.5, 0.02), 0, 1))
+    fade = np.clip(g * 2.2, 0, 1)
+    gl = (line * fade * gm)[..., None]
+    img = img * (1 - gl * 0.85) + _rgb(grid) * gl * 0.85
+    img = img + _rgb(grid) * (np.exp(-((yy - horizon) / 0.012) ** 2) * 0.5)[..., None]
+    img = _grain(img, rng, 3)
+    return _vignette(img, 0.3)
+
+
+def blueprint(rng, base=("#0d3a73", "#0a2c58"), line="#cfe3ff", cell=40, major=5):
+    """(10/10) Blueprint paper: fine and major grid lines, faint drawings."""
+    h, w = H, W
+    yy, xx = _yx(h, w)
+    img = _mix(_rgb(base[0]), _rgb(base[1]), yy * 0.7 + 0.3 * _fbm(h, w, 400, 4, rng))
+    y, x = np.mgrid[0:h, 0:w].astype(np.float32)
+    fx, fy = np.abs((x / cell) - np.round(x / cell)) * cell, np.abs((y / cell) - np.round(y / cell)) * cell
+    Mx = np.abs((x / (cell * major)) - np.round(x / (cell * major))) * cell * major
+    My = np.abs((y / (cell * major)) - np.round(y / (cell * major))) * cell * major
+    fine = np.maximum(np.clip(1 - fx, 0, 1), np.clip(1 - fy, 0, 1)) * 0.16
+    big = np.maximum(np.clip(1.5 - Mx, 0, 1), np.clip(1.5 - My, 0, 1)) * 0.32
+    img = _mix(img, _rgb(line), np.maximum(fine, big))
+    # a few faint technical shapes: circles and rectangles
+    for _ in range(9):
+        cxp, cyp = rng.random() * w, rng.random() * h
+        R = 40 + rng.random() * 160
+        dd = np.abs(np.sqrt((x - cxp) ** 2 + (y - cyp) ** 2) - R)
+        img = _mix(img, _rgb(line), np.clip(1.3 - dd, 0, 1) * 0.30)
+    for _ in range(6):
+        x0, y0 = rng.random() * w, rng.random() * h
+        ww, hh = 80 + rng.random() * 300, 50 + rng.random() * 200
+        edge = ((np.abs(x - x0) < 1.0) | (np.abs(x - x0 - ww) < 1.0)) & (y > y0) & (y < y0 + hh)
+        edge |= ((np.abs(y - y0) < 1.0) | (np.abs(y - y0 - hh) < 1.0)) & (x > x0) & (x < x0 + ww)
+        img = _mix(img, _rgb(line), edge.astype(np.float32) * 0.28)
+    img = _grain(img, rng, 3)
+    return _vignette(img, 0.25)
+
+
+def paper(rng, base=("#f3ead6", "#e4d6b8"), fiber="#c9b48a", stain="#b89a64", light=True):
+    """(10/10) Old parchment: warm tone, fibres, soft stains, darker edges."""
+    h, w = H, W
+    yy, xx = _yx(h, w)
+    cloud = _fbm(h, w, 300, 6, rng, 0.55)
+    img = _mix(_rgb(base[0]), _rgb(base[1]), (cloud - 0.35) * 1.6)
+    fib = _fbm(h, w, 2.0, 3, rng, 0.6, sx=25.0)
+    img = _mix(img, _rgb(fiber), np.clip((fib - 0.7) * 2.5, 0, 1) * 0.18)
+    st = _fbm(h, w, 220, 5, rng, 0.5)
+    img = _mix(img, _rgb(stain), np.clip((st - 0.66) * 4.0, 0, 1) * 0.35)
+    d = np.minimum(np.minimum(xx, 1 - xx), np.minimum(yy, 1 - yy))
+    img = img * (0.86 + 0.14 * np.clip(d * 9, 0, 1))[..., None]
+    return _grain(img, rng, 5)
+
+
+def circuit(rng, base=("#03140b", "#062417"), trace="#2bd67b", pad="#a6ffcf", n=70, step=24):
+    """(10/10) Circuit board: right-angle traces on a grid, vias and pads."""
+    h, w = H, W
+    yy, xx = _yx(h, w)
+    img = _mix(_rgb(base[0]), _rgb(base[1]), 0.4 + 0.6 * _fbm(h, w, 380, 4, rng))
+    m = np.zeros((h, w), np.float32)
+    pads = np.zeros((h, w), np.float32)
+    gw, gh = w // step, h // step
+    for _ in range(int(n)):
+        gx, gy = int(rng.integers(1, gw - 1)), int(rng.integers(1, gh - 1))
+        seg = int(rng.integers(3, 9))
+        pts = [(gx, gy)]
+        dirn = int(rng.integers(4))
+        for _s in range(seg):
+            if rng.random() < 0.45:
+                dirn = (dirn + (1 if rng.random() < 0.5 else 3)) % 4
+            L = int(rng.integers(2, 9))
+            dx, dy = [(1, 0), (0, 1), (-1, 0), (0, -1)][dirn]
+            nx = min(max(1, pts[-1][0] + dx * L), gw - 2); ny = min(max(1, pts[-1][1] + dy * L), gh - 2)
+            pts.append((nx, ny))
+        th = 1 + int(rng.integers(0, 3))
+        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+            x0, x1 = sorted((ax * step, bx * step)); y0, y1 = sorted((ay * step, by * step))
+            m[max(0, y0 - th):y1 + th + 1, max(0, x0 - th):x1 + th + 1] = 1.0
+        for (px_, py_) in (pts[0], pts[-1]):
+            cxp, cyp = px_ * step, py_ * step
+            y0, y1, x0, x1 = max(0, cyp - 8), min(h, cyp + 9), max(0, cxp - 8), min(w, cxp + 9)
+            yy2, xx2 = np.mgrid[y0:y1, x0:x1]
+            r = np.sqrt((yy2 - cyp) ** 2 + (xx2 - cxp) ** 2)
+            pads[y0:y1, x0:x1] = np.maximum(pads[y0:y1, x0:x1], np.clip(6.5 - r, 0, 1) * (r > 2.5))
+    img = _mix(img, _rgb(trace) * 0.55, m * 0.75)
+    img = _mix(img, _rgb(pad), pads * 0.85)
+    img = _grain(img, rng, 4)
+    return _vignette(img, 0.32)
+
+
+def hexagons(rng, dark="#2a1702", light="#8a5410", edge="#ffc94a", size=46, fill=0.75):
+    """(10/10) Honeycomb: hexagonal cells, each its own amber tone, bright
+    rims, some cells empty (darker)."""
+    h, w = H, W
+    k = w / 1600.0                                   # hi-res render: same pattern, sharper
+    y, x = np.mgrid[0:h, 0:w].astype(np.float32)
+    s = float(size) * k
+    # axial hex coordinates (pointy top)
+    q = (np.sqrt(3) / 3 * x - y / 3) / s
+    r = (2.0 / 3 * y) / s
+    cx_, cz_ = q, r
+    cy_ = -cx_ - cz_
+    rx, ry, rz = np.round(cx_), np.round(cy_), np.round(cz_)
+    dx, dy, dz = np.abs(rx - cx_), np.abs(ry - cy_), np.abs(rz - cz_)
+    a = (dx > dy) & (dx > dz); b = ~a & (dy > dz)
+    rx0, ry0, rz0 = rx, ry, rz                       # cube rounding (from the rounded values)
+    rx = np.where(a, -ry0 - rz0, rx0)
+    ry = np.where(b, -rx0 - rz0, ry0)
+    rz = np.where(~a & ~b, -rx0 - ry0, rz0)
+    # distance to the centre, 0.5 on every edge of the cell (the edges bisect
+    # the neighbours, which differ by +1/-1 on two cube coordinates)
+    dq, dr, ds = cx_ - rx, cy_ - ry, cz_ - rz
+    e = np.maximum(np.maximum(np.abs(dq - dr), np.abs(dr - ds)), np.abs(ds - dq)) / 2.0
+    hid = ((rx.astype(np.int64) * 73856093) ^ (rz.astype(np.int64) * 19349663)) & 1023
+    tone = (hid.astype(np.float32) / 1023.0)
+    full = (tone < fill).astype(np.float32)
+    shade = 0.35 + 0.65 * tone / max(fill, 1e-3)
+    inner = np.clip(1 - e * 2.0, 0, 1)
+    col = _mix(_rgb(dark), _rgb(light), shade * full * (0.6 + 0.4 * inner))
+    # crisp rim: ~1 px anti-aliased edges (e is in cell units, 1 px = 1/s)
+    rim = np.clip((e - 0.455) * s * 1.3, 0, 1)
+    img = _mix(col, _rgb(edge) * 0.7, rim * 0.8)
+    img = _grain(img, rng, 4)
+    return _vignette(img, 0.35)
+
+
 GENERATORS = dict(marble=marble, aurora=aurora, nebula=nebula, stone=stone, glow=glow,
-                  brushed=brushed, strata=strata, crystal=crystal)
+                  brushed=brushed, strata=strata, crystal=crystal, planks=planks,
+                  synthwave=synthwave, blueprint=blueprint, paper=paper, circuit=circuit,
+                  hexagons=hexagons)
 
 
 def _key(spec):
@@ -336,12 +554,19 @@ def _key(spec):
 
 
 def render(spec) -> np.ndarray:
+    veil = spec.get("veil")
+    if veil:
+        # (08/10) the backdrop under a uniform veil of the panel colour: the
+        # whole window is evened out instead of dark bands with holes
+        base = render({k: v for k, v in spec.items() if k != "veil"}).astype(np.float32)
+        col = _rgb(veil[0]); a = float(veil[1])
+        return np.clip(base * (1.0 - a) + col[None, None, :] * a, 0, 255).astype(np.uint8)
     kind = spec["kind"]
     kw = {k: (tuple(tuple(x) if isinstance(x, list) else x for x in v) if isinstance(v, list) else v)
           for k, v in spec.items() if k not in ("kind", "seed")}
     rng = np.random.default_rng(int(spec.get("seed", 7)))
     global W, H
-    hires = kind == "crystal" or bool(spec.get("petals")) or bool(spec.get("leaves"))
+    hires = kind in ("crystal", "hexagons") or bool(spec.get("petals")) or bool(spec.get("leaves"))
     saved = (W, H)
     if hires:
         W, H = HIRES

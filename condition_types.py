@@ -60,6 +60,34 @@ CONDITION_TYPES = [
     # with almost every small Minecraft version — right once, wrong now. Hidden
     # from the condition menu and the map; the code stays (a loaded session
     # that has one still runs it). Remove « disabled » to bring it back.
+    # (10/10) 1.16 features placed per chunk, from the 48 low bits (checked in
+    # Minecraft 1.16.1): Y range on the spawner / top lava layer. A dungeon
+    # attempt only becomes a dungeon next to a cave; a lake needs rock around.
+    {"key": "dungeon", "name": "Dungeon (1.16)", "category": "Structures", "icon": "💀",
+     "versions": (19, 20),
+     "desc": "Java 1.16 only. The dungeons that really generate: SSA rebuilds the exact "
+             "1.16.1 terrain (caves, ravines, lakes, mineshafts) and runs the game's 8 "
+             "attempts per chunk. Y range: the spawner's height. Near a village / outpost "
+             "(not modelled) they are checked with Minecraft.",
+     "params": {
+         "y_range": {"type": "dual_height_slider", "label": "Spawner Y", "default": (0, 255),
+                     "min": 0, "max": 255},
+         "use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
+    {"key": "lava_lake", "name": "Lava lake (1.16)", "category": "Structures", "icon": "🔥",
+     "versions": (19, 20),
+     "desc": "Java 1.16 only. The lava lakes that really generate (exact 1.16.1 terrain: "
+             "a lake needs rock around it): position = centre of the lake's 16×16 box, "
+             "Y = its real top lava layer (surface lakes dropped to the ground). Near a "
+             "village / outpost (not modelled) they are checked with Minecraft.",
+     "params": {
+         "variant": {"type": "choice", "label": "Lakes",
+                     "options": ["any", "underground", "surface"],
+                     "labels": {"any": "Any", "underground": "Underground",
+                                "surface": "Surface"},
+                     "segmented": True, "default": "any"},
+         "y_range": {"type": "dual_height_slider", "label": "Lava Y", "default": (0, 255),
+                     "min": 0, "max": 255},
+         "use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {"key": "abandoned_camp",   "name": "Abandoned camp",    "category": "Structures", "icon": "⛺", "desc": "",
      "disabled": "Abandoned camps are temporarily disabled: their generation changes with "
                  "almost every small Minecraft version, so the positions are not reliable.",
@@ -351,6 +379,52 @@ CONDITION_TYPES = [
 
     # ── World ──
     {"key": "spawn", "name": "Spawn", "category": "World", "icon": "🌍", "desc": "", "params": {}},
+    # (09/10) a PRESET, not a condition: choosing it adds the two biome
+    # conditions of spawn_check.prefilter_conditions(); every result is then
+    # checked by the real Minecraft 1.16.1 (where the new player appears)
+    {"key": "spawn116_preset", "name": "Buggy spawn 1.16 (preset)", "category": "World",
+     "icon": "🌋", "preset": True,
+     "desc": "Adds the two biome conditions of the 1.16 buggy-spawn search: no spawn can be "
+             "found near (0, 0), so the spawn stays at (8, 64, 8) inside the terrain; when no "
+             "sand / red sand column is near either, the player stays there — in a cave, lava, "
+             "water, a structure or the stone. Each result is then checked "
+             "with the real Minecraft 1.16.1 (Java, as the broken-portal check).",
+     "params": {}},
+    {"key": "mansion_spawn116_preset", "name": "Mansion spawn 1.16 (preset)", "category": "World",
+     "icon": "🏚", "preset": True,
+     "desc": "Adds a mansion near the spawn: the 1.16 spawn search goes down through the "
+             "mansion to the grass under its foundations, and the joining player is put in a "
+             "column where he does not collide — when there is none, he stays inside the "
+             "mansion, its floor or its cobblestone foundations. Each result is then checked "
+             "with the real Minecraft 1.16.1 (about 1 % are such spawns).",
+     "params": {}},
+    {"key": "spawn_feature116", "name": "Fallback spawn feature (1.16)", "category": "World",
+     "icon": "🕳", "no_area": True,
+     "desc": "1.16 fallback spawn: the joining player stays at (8.5, 65, 8.5). True when a "
+             "dungeon (chunk 0, 0) or a lava lake (the four chunks around 0, 0) of 1.16.1 "
+             "falls on his feet / head: the 48 low bits first (fast), then the exact 1.16.1 "
+             "terrain says whether it really generates (caves, lakes, mineshafts).",
+     "params": {
+         "kind": {"type": "choice", "label": "Feature",
+                  "options": ["dungeon", "lava_lake"],
+                  "labels": {"dungeon": "Dungeon", "lava_lake": "Lava lake"},
+                  "segmented": True, "default": "dungeon"},
+     }},
+    {"key": "dungeon_spawn116_preset", "name": "Dungeon spawn 1.16 (preset)", "category": "World",
+     "icon": "💀", "preset": True,
+     "desc": "The buggy-spawn preset + a dungeon on the fallback point: the player starts "
+             "in a dungeon room, its floor, its ceiling or its spawner. The dungeon is checked "
+             "with the exact 1.16.1 terrain (it really generates); where the player really "
+             "appears is then checked with Minecraft 1.16.1 (the spawn search reads trees "
+             "and plants, not modelled).",
+     "params": {}},
+    {"key": "lavalake_spawn116_preset", "name": "Lava lake spawn 1.16 (preset)", "category": "World",
+     "icon": "🔥", "preset": True,
+     "desc": "The buggy-spawn preset + an underground lava lake on the fallback point: the "
+             "player starts with his feet or his head in its lava. The lake is checked with "
+             "the exact 1.16.1 terrain; where the player really appears is then checked with "
+             "Minecraft 1.16.1 (the spawn search reads trees and plants, not modelled).",
+     "params": {}},
     {"key": "slime", "name": "Slime chunk",    "category": "World", "icon": "🟢", "desc": "",
      "params": {}},
 
@@ -395,6 +469,8 @@ TYPE_COLORS = {
     "abandoned_camp":    "#dedede",
     "ocean_ruin":        "#4090b0",
     "desert_well":       "#e0c878",
+    "dungeon":           "#7c8a96",
+    "lava_lake":         "#ff6a1f",
     "fortress":          "#ff6b35",
     "bastion":           "#e05020",
     "end_city":          "#d4a0ff",
@@ -484,41 +560,64 @@ _CLIMATE_FIRST_OCTAVE = {
     "Weirdness":       -7,
 }
 
+def octave_max_amplitude(climate_name: str, nmax: int = -1) -> float:
+    """Theoretical maximum |value| of a 1.18+ climate noise (Minecraft units, ×1
+    — the parameters are this × 10 000) when only its first `nmax` octave halves
+    are kept (-1 = all), exactly as cubiomes builds it (08/10):
+    xDoublePerlinInit keeps the first (nmax+1)/2 octaves of stream A and the rest
+    of B; octave i weighs amplitudes[i] · persist_ini[len] · 2^-i; the double
+    noise multiplies by (5/3) · len' / (len' + 1) (len' = the span of non-zero
+    amplitudes). Each Perlin octave is bounded by 1."""
+    amps = _CLIMATE_AMPS.get(climate_name, [])
+    if not amps:
+        return 0.0
+    n_full = len(amps)
+    persist0 = (1 << (n_full - 1)) / ((1 << n_full) - 1.0)      # persist_ini[len]
+    w = [a * persist0 / (1 << i) for i, a in enumerate(amps) if a != 0]
+    nz = [i for i, a in enumerate(amps) if a != 0]
+    span = nz[-1] - nz[0] + 1
+    dp_amp = (5.0 / 3.0) * span / (span + 1)
+    if nmax is None or nmax < 0:
+        na = nb = len(w)
+    else:
+        na = (nmax + 1) >> 1
+        nb = nmax - na
+    return dp_amp * (sum(w[:na]) + sum(w[:nb]))
+
+
 def _build_octave_options(climate_name: str, large: bool = False):
     """Return a list of (label, value) tuples for the octave dropdown.
 
     `value` is the `nmax` integer to pass to the C engine:
       -1  → use all octaves (Σ.. (all))
-       N  → cap at N halves (each octave A and B counts as 1 half)
-    Labels are cubiomes-viewer style: 'Σ..0A   1:512   x0.634921'
-    """
+       N  → cap at N halves (octave halves in cubiomes' order: 0A, 0B, 1A, 1B…)
+    Labels (08/10): 'Σ..1A   1:256   x1.904762   66.67 %' — the period of the
+    octave, the theoretical maximum of the noise with the octaves up to it (as
+    cubiomes-viewer: × 10 000 for the conditions' units) and its share of the
+    full noise's.
+    Before: a rounded per-octave weight ('all x4.500000') that was no maximum."""
     amps = _CLIMATE_AMPS.get(climate_name, [])
     if not amps:
         return [("Σ.. (all)", -1)]
     first_oct = _CLIMATE_FIRST_OCTAVE.get(climate_name, -10)
     if large:
         first_oct -= 2  # cubiomes large biomes uses larger period
-    # Contribution per half: amp[i] / 2^i (matches cubiomes-viewer scale up to a constant)
-    contribs = [a / (1 << i) for i, a in enumerate(amps)]
-    total = sum(contribs) * 2  # both halves
-    # Normalize so total matches cubiomes-viewer display (approx)
-    norm = 1.0   # display unit; user-facing only
-    options = [(f"Σ.. (all)  x{total*norm:.6f}", -1)]
-    # Per-half period: period_A = 4 << (|first_oct| - i)
-    # period_B ≈ period_A * 331/337 (slightly smaller)
+    full = octave_max_amplitude(climate_name, -1) or 1.0
+
+    def _m(v):                      # cubiomes-viewer style: x<max amplitude>
+        return f"x{v:.6f}"
+    options = [(f"Σ.. (all)   {_m(full)}   100.00 %", -1)]
     nmax_counter = 0
     for i, a in enumerate(amps):
         if a == 0:
             continue
         period_A = 4 << (abs(first_oct) - i) if (abs(first_oct) - i) >= 0 else 4
         period_B = max(1, round(period_A * 331 / 337))
-        half_contrib = a / (1 << i)
-        nmax_counter += 1
-        options.append((f"Σ..{i}A   1:{period_A}   x{half_contrib:.6f}",
-                         nmax_counter))
-        nmax_counter += 1
-        options.append((f"Σ..{i}B   1:{period_B}   x{half_contrib:.6f}",
-                         nmax_counter))
+        for half, period in (("A", period_A), ("B", period_B)):
+            nmax_counter += 1
+            mx = octave_max_amplitude(climate_name, nmax_counter)
+            options.append((f"Σ..{i}{half}   1:{period}   {_m(mx)}   {mx / full * 100:6.2f} %",
+                            nmax_counter))
     return options
 
 

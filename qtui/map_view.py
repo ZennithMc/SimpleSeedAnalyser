@@ -61,6 +61,7 @@ class MapView(QWidget):
     picked = Signal(dict)                    # area drawn in pick mode (see start_pick)
     pickCancelled = Signal()
     measureChanged = Signal(bool)            # measuring tool on / off
+    f116Checked = Signal(object, object)     # (10/10) [(Feat, ok, detail)] | None, error
 
     MEASURE = True                           # the ruler tool exists on this map
     STRUCT_LEGEND = True                     # the structure legend may be drawn
@@ -286,18 +287,27 @@ class MapView(QWidget):
         self._ui_libs.clear()
         self._arrows = None
         self._view_changed()
+        if getattr(self, "_hover_pos", None) is not None and getattr(self, "_readout", None) is not None and self._readout.isVisible():
+            self._hover_timer.start()
 
     def set_overlay(self, **kw):
         self.ov.update(kw)
         self._arrows = None
         self._view_changed()
+        # the cursor readout follows a noise / octave / caves change without a
+        # mouse move (08/10: it kept the previous noise's value)
+        if getattr(self, "_hover_pos", None) is not None and getattr(self, "_readout", None) is not None and self._readout.isVisible():
+            self._hover_timer.start()
         self.overlayChanged.emit()
         if self.link is not None:
             self.link.overlay_changed(self)
 
     # ── painting ────────────────────────────────────────────────────────────
-    def _tile_scale(self):
+    def _tile_scale(self, noise=False):
         mn = self.engine.min_scale()
+        if noise and mn > 1 and self.ov.get("noise") in ("Exact Y", "Approx height"):
+            mn = 1                         # (10/10 bis) 1:1 tiles: Exact Y 1.16 per block,
+                                           # Approx height interpolated between its 1:4 cells
         s = mn
         for k in SCALES:
             if mn <= k <= self.bpp * 2:
@@ -325,7 +335,8 @@ class MapView(QWidget):
             self._paint_layer(p, noise=False, fetch=not opaque, boost=-4 if noise_on else 0)
         if noise_on:
             p.setOpacity(self.ov["opacity"])
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            # magnified (< 1 block per pixel): crisp blocks, like cubiomes-viewer
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.bpp >= 1.0)
             self._paint_layer(p, noise=True, boost=2)
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
             p.setOpacity(1.0)
@@ -372,7 +383,7 @@ class MapView(QWidget):
     def _paint_layer(self, p: QPainter, noise: bool, fetch=True, boost=0):
         """fetch=False: draw what is cached, request nothing (biomes under an
         opaque noise layer). boost: priority offset (noise before biomes)."""
-        s = self._tile_scale()
+        s = self._tile_scale(noise)
         animating = self._anim.isActive()
         tiles, span = self._visible_tiles(s)
         for i, (tx, tz) in enumerate(tiles):
@@ -523,6 +534,229 @@ class MapView(QWidget):
             sy -= h * 0.85
         if -h <= sx <= self.width() + h and -h <= sy <= self.height() + h:
             p.drawPixmap(int(sx - h), int(sy - h), pm)
+
+    # ── (10/10) 1.16 dungeons / lava lakes ─────────────────────────────────
+    # (10/10 bis) the real ones (exact terrain), drawn with their icon like the
+    # other structures. Each 256-block block costs ~0.3 s of CPU (the terrain is
+    # rebuilt), so they show up to F116_MAX_BPP — not to the structures' 48 —
+    # nearest blocks first. Lava lakes are common: a little closer.
+    F116_MAX_BPP = {"dungeon": 4.0, "lava_lake": 2.0}
+    F116_SURF_BPP = 4.0                                   # surface lakes only: rarer
+    F116_SEED_BPP = {"dungeon": 0.5, "lava_lake": 2.0}    # Alt+S: the 48-bit attempts (dots)
+    F116_ICON_BPP = {"dungeon": 0.25, "lava_lake": 0.75}  # Y labels, lake shapes
+    F116_DOT_BPP = F116_MAX_BPP                           # (legend, older callers)
+
+    def f116_yrange(self):
+        lo, hi = self.ov.get("f116_y", (0, 255))
+        return int(lo), int(hi)
+
+    def f116_max_bpp(self, key):
+        if self.engine.seed_view:
+            return self.F116_SEED_BPP[key]
+        if key == "lava_lake" and self.ov.get("f116_surface_only", False):
+            return self.F116_SURF_BPP
+        return self.F116_MAX_BPP[key]
+
+    def _paint_features116(self, p: QPainter, x0, z0, x1, z1, counts):
+        """1.16 dungeons and lava lakes (feature116): icons coloured… by their
+        icon, the lake's lava columns, the dungeon room and a Y label zoomed in;
+        the layers panel's Y range / « surface only » hide the others. Hover /
+        right-click read self._f116_hits."""
+        self._f116_hits = []
+        if int(self.world.mc) not in (19, 20):
+            return
+        from .struct_boxes import grad_rgb
+        import feature116 as f116
+        unchecked = []
+        ylo, yhi = self.f116_yrange()
+        B = self.engine.FEAT_BLOCK
+        fetch = not self._anim.isActive()
+        sv = self.engine.seed_view
+        self.engine.f116_centre = (self.cx, self.cz)
+        surf_only = self.ov.get("f116_surface_only", False)
+        for key in ("lava_lake", "dungeon"):
+            if not self.visible.get(key) or self.bpp > self.f116_max_bpp(key):
+                continue
+            icons = (not sv) or self.bpp <= self.F116_ICON_BPP[key]
+            labels = self.bpp <= self.F116_ICON_BPP[key]
+            confirmed = getattr(self, "f116_checked", {})
+            blocks = [(bx, bz) for bz in range(math.floor(z0 / B), math.floor(z1 / B) + 1)
+                      for bx in range(math.floor(x0 / B), math.floor(x1 / B) + 1)]
+            blocks.sort(key=lambda b: (b[0] * B + B / 2 - self.cx) ** 2 + (b[1] * B + B / 2 - self.cz) ** 2)
+            for bx, bz in blocks:
+                v = self.engine.features116(key, bx, bz, fetch)
+                if not v:
+                    continue
+                feats, cols = v
+                above = cols.get("above", frozenset()) if (sv and self.ov.get("f116_ground", True)) else ()
+                only_real = self.ov.get("f116_only_real", True)
+                for f in feats:
+                    if above and f in above:
+                        continue
+                    if key == "lava_lake" and surf_only and not f.surface:
+                        continue
+                    ok = confirmed.get((self.world.seed, f.kind, f.x, f.y, f.z), True if f.real else None)
+                    if ok is False and only_real:
+                        continue
+                    if not (x0 - 16 <= f.x <= x1 + 16 and z0 - 16 <= f.z <= z1 + 16):
+                        continue
+                    ry = f116.real_y(self.world.seed, f)
+                    if ry is not None:
+                        if not (ylo <= ry <= yhi):
+                            continue
+                    elif not f.surface and not (ylo <= f.y <= yhi):
+                        continue
+                    elif f.surface and (ylo > 0 or yhi < 255):
+                        continue
+                    fy = f.y if ry is None else ry
+                    sx, sy = self.to_screen(f.x + 0.5, f.z + 0.5)
+                    r, g, b = grad_rgb(min(1.0, max(0.0, fy / 80.0)))
+                    col = QColor(r, g, b)
+                    if x0 <= f.x <= x1 and z0 <= f.z <= z1:
+                        counts[key] = counts.get(key, 0) + 1
+                    if labels and ok is None:
+                        unchecked.append(f)
+                    self._f116_hits.append((sx, sy, f))
+                    if key == "lava_lake" and labels and (not f.surface or f.exact):
+                        self._draw_lake_cols(p, f, cols.get((f.ox, f.oz)))
+                    if key == "dungeon" and self.bpp <= 0.125:
+                        self._draw_room(p, f, col)
+                    if not icons:                     # Alt+S zoomed out: the attempts as dots
+                        p.save()
+                        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                        p.setPen(QPen(QColor(16, 20, 28, 200), 1))
+                        p.setBrush(QColor("#ff6a1f") if key == "lava_lake" else col)
+                        rr = 3.2 if key == "lava_lake" else 2.4
+                        p.drawEllipse(QPointF(sx, sy), rr, rr)
+                        p.restore()
+                        continue
+                    k = key
+                    if key == "dungeon" and ok:
+                        k = "dungeon_ok"
+                    elif key == "lava_lake" and f.surface:
+                        k = "lava_lake_surface"
+                    if ok is None:                    # a potential / unsure one
+                        p.save(); p.setOpacity(0.45)
+                        self._draw_icon(p, k, f.x + 0.5, f.z + 0.5)
+                        p.restore()
+                    else:
+                        self._draw_icon(p, k, f.x + 0.5, f.z + 0.5)
+                    if not labels or (ok is None and self.ov.get("f116_auto", True)):
+                        continue
+                    ytxt = ("Y ground" if f.surface and ry is None else f"Y {fy}")
+                    txt = ytxt + ("  ✓" if ok else ("  ✗" if ok is False else "  ?"))
+                    self._chips.append((QRectF(sx - 1, sy + self.icon_px / 2 + 12, 2, 2), txt,
+                                        QColor(120, 220, 160) if ok else
+                                        (QColor(150, 156, 168) if ok is None else col)))
+        # the unsure ones on screen are checked with Minecraft by themselves (a
+        # moment after the map stops moving)
+        if unchecked and self.ov.get("f116_auto", True):
+            self._f116_auto_list = unchecked
+            if not hasattr(self, "_f116_timer"):
+                self._f116_timer = QTimer(self); self._f116_timer.setSingleShot(True)
+                self._f116_timer.timeout.connect(self._f116_auto)
+            if not self._f116_timer.isActive():     # repaints must not push it back
+                self._f116_timer.start(600)
+
+    def _draw_lake_cols(self, p: QPainter, f, cols):
+        if not cols:
+            return
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 106, 31, 120))
+        for i in range(256):
+            if cols[i]:
+                a, b = divmod(i, 16)
+                sx0, sy0 = self.to_screen(f.ox + a, f.oz + b)
+                sx1, sy1 = self.to_screen(f.ox + a + 1, f.oz + b + 1)
+                p.drawRect(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0))
+        p.restore()
+
+    def _draw_room(self, p: QPainter, f, col):
+        """The dungeon room (walls included) and the spawner block."""
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        c = QColor(col); c.setAlpha(200)
+        p.setPen(QPen(c, 1.2, Qt.PenStyle.DashLine))
+        fill = QColor(col); fill.setAlpha(30); p.setBrush(fill)
+        sx0, sy0 = self.to_screen(f.x - f.sx - 1, f.z - f.sz - 1)
+        sx1, sy1 = self.to_screen(f.x + f.sx + 2, f.z + f.sz + 2)
+        p.drawRect(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0))
+        p.restore()
+
+    def _f116_auto(self):
+        """Send the potential dungeons / lakes on screen to Minecraft (300 at
+        most, the nearest to the centre first; each one only once)."""
+        import spawn_check as sc
+        if self._anim.isActive():
+            self._f116_timer.start(600); return
+        if not sc.status()[0]:
+            return
+        pend = self.__dict__.setdefault("_f116_pending", set())
+        seed = self.world.seed
+        todo = [f for f in getattr(self, "_f116_auto_list", ())
+                if (seed, f.kind, f.x, f.y, f.z) not in pend]
+        if not todo:
+            return
+        cx, cy = self.width() / 2, self.height() / 2
+        todo.sort(key=lambda f: sum((a - b) ** 2 for a, b in zip(self.to_screen(f.x, f.z), (cx, cy))))
+        todo = todo[:300]
+        for f in todo:
+            pend.add((seed, f.kind, f.x, f.y, f.z))
+        self.check_features116(todo, quiet=True)
+
+    def check_features116(self, feats, quiet=False):
+        """Ask the real Minecraft 1.16.1 whether these dungeons / lava lakes
+        exist; the map then marks them ✓ / ✗ (f116_checked)."""
+        import feature116 as f116
+        import spawn_check as sc
+        ok, why = sc.status()
+        if not ok:
+            self.status.emit("Minecraft check unavailable: " + str(why))
+            return
+        if not hasattr(self, "_f116_conn"):
+            self._f116_conn = True
+            self.f116Checked.connect(self._on_f116_checked)
+        seed = self.world.seed
+        self.status.emit(f"Minecraft 1.16.1: checking {len(feats)} dungeon(s) / lava lake(s)…")
+        self._f116_quiet = quiet
+        self._f116_seed = seed
+        f116.check(seed, list(feats), lambda r, e, s=seed: self.f116Checked.emit((s, r), e))
+
+    def _on_f116_checked(self, res, err):
+        seed, r = res
+        if r is None:
+            self.status.emit("Minecraft check failed: " + str(err))
+            for k in list(getattr(self, "_f116_pending", ())):
+                if k[0] == seed:
+                    self._f116_pending.discard(k)       # retried on the next paint
+            return
+        d = self.__dict__.setdefault("f116_checked", {})
+        n_ok = 0
+        for f, ok, _det in r:
+            if ok is None:
+                continue
+            d[(seed, f.kind, f.x, f.y, f.z)] = bool(ok)
+            n_ok += bool(ok)
+        n = sum(1 for _f, ok, _d in r if ok is not None)
+        if len(r) == 1 and r[0][1] is not None:
+            f, ok, det = r[0]
+            self.status.emit(f"Minecraft 1.16.1: {f.name.lower()} at {f.x} {f.y} {f.z} — "
+                             + ("exists ✓ " if ok else "not generated ✗ ") + f"({det})")
+        else:
+            self.status.emit(f"Minecraft 1.16.1: {n_ok} of {n} exist (✓ on the map).")
+        self.update()
+
+    def feature116_at(self, sx, sy, radius=None):
+        """The 1.16 dungeon / lava lake drawn nearest the screen point, or None."""
+        r = radius if radius is not None else max(8.0, self.icon_px * 0.6)
+        best, bd = None, r * r
+        for (fx, fy, f) in getattr(self, "_f116_hits", ()):
+            d = (fx - sx) ** 2 + (fy - sy) ** 2
+            if d <= bd:
+                best, bd = f, d
+        return best
 
     def _draw_footprint(self, p: QPainter, key, x, z):
         """Real size of a structure: solid = exact, dashed = approximate."""
@@ -715,6 +949,7 @@ class MapView(QWidget):
                             if self.bpp <= BOX_MAX_BPP:
                                 self._draw_footprint(p, key, x, z)
                             self._draw_icon(p, k, x, z)
+        self._paint_features116(p, x0, z0, x1, z1, counts)
         lm = self.engine.landmarks
         if self.engine.seed_view:         # spawn / strongholds depend on biomes
             return
@@ -789,7 +1024,8 @@ class MapView(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         f = p.font(); f.setPointSizeF(8.5); f.setBold(True); p.setFont(f)
         hid = self.legend_hidden if self.legend else ()
-        items = [zn for zn in self.zones if zn.get("num") not in hid] if hid else list(self.zones)
+        items = ([zn for zn in self.zones if zn.get("num") not in hid or zn.get("active")]
+                 if hid else list(self.zones))
         if self._pick and self._pick.get("start") is not None and self._pick.get("cur") is not None:
             r = self._pick_result()
             col = theme.ACCENT
@@ -951,8 +1187,10 @@ class MapView(QWidget):
                              min(max(y, box.top() + 8), box.bottom() - 8))
             p.setPen(QPen(QColor(0, 0, 0, 140), 3)); p.drawLine(QPointF(x, y), anchor)
             p.setPen(QPen(QColor(theme.TEXT2), 1.2)); p.drawLine(QPointF(x, y), anchor)
-            bg = QColor(theme.BG1); bg.setAlpha(232)
-            p.setPen(QPen(QColor(theme.LINE2), 1)); p.setBrush(bg)
+            # (08/10) lighter, so the map under the bubbles stays readable
+            bg = QColor(theme.BG1); bg.setAlpha(150)
+            ln = QColor(theme.LINE2); ln.setAlpha(170)
+            p.setPen(QPen(ln, 1)); p.setBrush(bg)
             p.drawRoundedRect(box, 5, 5)
             yy = box.top() + 4
             for m, t, _d in lines:
@@ -1181,6 +1419,12 @@ class MapView(QWidget):
             if key == "igloo":
                 rows.append(("igloo_basement", struct_icons.label("igloo_basement"),
                              None if zoomed_out else self._struct_counts.get("igloo_basement", 0)))
+        for key in ("lava_lake", "dungeon"):              # (10/10)
+            if self.visible.get(key) and self.world.structure_available(key):
+                far = self.bpp > self.f116_max_bpp(key)
+                lo, hi = self.f116_yrange()
+                lab = struct_icons.label(key) + ("" if (lo, hi) == (0, 255) else f" · Y {lo}–{hi}")
+                rows.append((key, lab, None if far else self._struct_counts.get(key, 0)))
         return rows, zoomed_out
 
     def _paint_struct_legend(self, p: QPainter):
@@ -1686,6 +1930,20 @@ class MapView(QWidget):
             return
         x, z = (int(math.floor(v)) for v in self.to_world(e.pos().x(), e.pos().y()))
         m = QMenu(self)
+        # (10/10) a 1.16 dungeon / lava lake under the cursor
+        ft = self.feature116_at(e.pos().x(), e.pos().y())
+        a_ftp = a_fck = a_fall = None
+        if ft is not None:
+            key = "dungeon" if ft.kind == 0 else "lava_lake"
+            t = m.addAction(struct_icons.icon(key, 16), ft.text()); t.setEnabled(False)
+            a_ftp = m.addAction(f"Copy {ft.tp(self.world.seed)}")
+            a_fck = m.addAction("Check it with Minecraft 1.16.1")
+            m.addSeparator()
+        n_vis = sum(1 for _x, _y, f in getattr(self, "_f116_hits", ()) if not f.real)
+        if n_vis:                                # (10/10 bis) the uncertain ones only
+            a_fall = m.addAction(f"Check the {min(n_vis, 300)} unsure dungeons / lava lakes on screen "
+                                 "with Minecraft")
+            m.addSeparator()
         sh = self.stronghold_near(e.pos().x(), e.pos().y()) if self.visible.get("__strongholds") else None
         a_sh = a_all = None
         if sh is not None:
@@ -1723,6 +1981,15 @@ class MapView(QWidget):
         if act is not None and act is a_pin:
             self.clear_pin(); return
         cb = QGuiApplication.clipboard()
+        if act is not None and act is a_ftp:
+            cb.setText(ft.tp(self.world.seed)); return
+        if act is not None and act is a_fck:
+            self.check_features116([ft]); return
+        if act is not None and act is a_fall:
+            vis = [f for (_x, _y, f) in self._f116_hits if not f.real]
+            cx, cy = self.width() / 2, self.height() / 2
+            vis.sort(key=lambda f: sum((a - b) ** 2 for a, b in zip(self.to_screen(f.x, f.z), (cx, cy))))
+            self.check_features116(vis[:300]); return
         if act is not None and act is a_sh:
             self.show_stronghold(*sh)
             return
@@ -1783,6 +2050,11 @@ class MapView(QWidget):
                     self._ui_libs[key] = hm
                 h, _ = hm.gen_height_grid(x >> 2, z >> 2, 1, 1)
                 return f"≈ Y {float(h[0, 0]):.0f}"
+            if noise == "Exact Y" and int(self.world.mc) in (19, 20):     # (10/10 bis)
+                import feature116 as _f116
+                y = int(_f116.surface_grid(self.world.mc, self.world.seed, x, z, 1, 1, 1,
+                                           self.ov["caves"])[0, 0])
+                return f"Y {y}"
             if noise == "Exact Y":
                 key = (self.world.key, "terrain")
                 eng = self._ui_libs.get(key)
@@ -1801,6 +2073,16 @@ class MapView(QWidget):
         x, z = (int(math.floor(v)) for v in self.to_world(self._hover_pos.x(), self._hover_pos.y()))
         name = self._biome_at(x, z)
         extra = self._noise_at(x, z) if self.ov["noise"] else ""
+        ft = self.feature116_at(self._hover_pos.x(), self._hover_pos.y())   # (10/10)
+        if ft is not None:
+            ok = getattr(self, "f116_checked", {}).get((self.world.seed, ft.kind, ft.x, ft.y, ft.z),
+                                                       True if ft.real else None)
+            import feature116 as _f116
+            ry = _f116.real_y(self.world.seed, ft)
+            extra = (extra + "    ·    " if extra else "") + ft.text() + (
+                "  ✓ exact terrain" if (ft.real and ok) else
+                (f"  ✓ in Minecraft" + (f", top lava Y {ry}" if ry is not None else ""))
+                if ok else ("  ✗ not generated" if ok is False else "  ? potential (not checked)"))
         self._readout.setText(f"X {x}    Z {z}    ·    {name}" + (f"    ·    {extra}" if extra else ""))
         self._readout.show()
         self._place_readout()
