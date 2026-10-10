@@ -1,4 +1,4 @@
-## SimpleSeedAnalyser (SSA) 
+## SimpleSeedAnalyser (SSA)  v1.0.0
 A free seedfinding tool for Minecraft Java (1.16 → 26.3, Overworld, Large Biomes), built on **Cubiomes**.
 Think of it as an improved Cubiomes Viewer: many additional seedfinding features, and it will keep getting updates.
 
