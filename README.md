@@ -43,3 +43,4 @@ SimpleSeedAnalyser stands on the shoulders of the Minecraft seedfinding communit
 ## Feedback
 If you are encountering any issue, contact me via Discord: @zennith7402
 Also looking for feedback to improve SSA by fixing bugs or adding new features, if you have any suggestion feel free to reach out to me.
+Yes, SSA is VibeCoded, I do not deserve as much credit as other developpers for that reason but please don't let this fact discourage you from trying it and contact me for any issue that you may have with SSA.
