@@ -67,6 +67,8 @@ F_CHAMBERS          = 68
 # SSA key → cubiomes F_* type (conditions exportables en #Cond:)
 _SSA_TO_F: Dict[str, int] = {
     "biome_filter":        F_BIOME_4,
+    "nether_biomes":       32,               # F_BIOME_NETHER (scale in `step`)
+    "end_biomes":          37,               # F_BIOME_END
     "biome_sample":        F_BIOME_SAMPLE,
     "biome_center":        F_BIOME_CENTER,
     "climate_minmax":      F_CLIMATE_MINMAX,
@@ -288,9 +290,9 @@ def _encode_condition(cond: dict, save_idx: int) -> str:
 
     f_type = _SSA_TO_F[t]
 
-    if t == "biome_filter":
+    if t in ("biome_filter", "nether_biomes", "end_biomes"):
         scale  = int(params.get("scale", 4))
-        dim    = params.get("dim", "overworld")
+        dim    = {"nether_biomes": "nether", "end_biomes": "end"}.get(t) or params.get("dim", "overworld")
         # current cubiomes-viewer format (condition version 4): ONE type per
         # dimension and the scale in `step`. The legacy F_BIOME_4 / _16 … types
         # are only understood by cubiomes-viewer in version < 4 conditions: with
@@ -408,8 +410,20 @@ def _encode_condition(cond: dict, save_idx: int) -> str:
         count   = instances                       # 0 = exclusion
         variant = params.get("variant")
         if variant in ("abandoned", "zombie"):          varflags |= 0x0002
+        elif variant == "not_abandoned":                varflags |= 0x0012   # ABANDONED | NOT
+        elif variant == "no_basement":                  varflags |= 0x0030   # BASEMENT | NOT
         elif variant == "with_ship":                    varflags |= 0x0004
+        elif variant == "without_ship":                 varflags |= 0x0014   # ENDSHIP | NOT
+        elif variant == "dense":                        varflags |= 0x0008   # DENSE_BB
         elif variant in ("basement", "with_basement"):  varflags |= 0x0020
+        _sk = {"bastion": "bastion", "ruined_portal": "ruined_portal",
+               "village": "village"}.get(t)
+        if _sk and params.get("starts"):                 # (18/10) start pieces
+            from condition_types import start_bits
+            _bits = start_bits(_sk, params.get("starts"))
+            if _bits:
+                varflags |= 0x0001                        # VAR_WITH_START
+                varstart = _bits
 
     # ── Assemblage 320 bytes ──────────────────────────────────────────
     buf = bytearray(320)

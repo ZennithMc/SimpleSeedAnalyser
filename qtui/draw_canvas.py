@@ -51,6 +51,7 @@ def grid_image(grid: np.ndarray, alpha: int = 255, lut: dict | None = None) -> Q
 
 
 class DrawCanvas(MapView):
+    DIMS_ALLOWED = False                     # (18/10) drawings are overworld terrain
     MEASURE = False                       # clicks paint here: no ruler tool
     STRUCT_LEGEND = False
     cellHover = Signal(int, int)          # cell under the mouse (edit placement) or (-1, -1)

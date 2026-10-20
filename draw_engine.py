@@ -181,6 +181,10 @@ def lib():
         L.dengine_free.argtypes = [ct.c_void_p]
         L.dengine_run.restype = ct.c_int
         L.dengine_run.argtypes = [ct.c_void_p, ct.c_int64, ct.c_int64, ct.c_int, P(ct.c_int)]
+        if hasattr(L, "dengine_run_list"):          # (19/10) Draw on a seed list
+            L.dengine_run_list.restype = ct.c_int
+            L.dengine_run_list.argtypes = [ct.c_void_p, P(ct.c_int64), ct.c_int64, ct.c_int,
+                                           P(ct.c_int)]
         L.dengine_score_seed.restype = ct.c_double
         L.dengine_score_seed.argtypes = [ct.c_void_p, ct.c_int64, P(ct.c_int), P(ct.c_int)]
         L.dengine_eval_at.restype = ct.c_double
@@ -250,6 +254,17 @@ class DrawEngine:
         return bool(lib().dengine_run(self.h, _s64(start), int(count), int(threads),
                                       ct.byref(stop_flag)))
 
+    def run_list(self, seeds, threads, stop_flag: ct.c_int) -> bool:
+        """(19/10) the seeds of a list (int64 array)."""
+        L = lib()
+        if not hasattr(L, "dengine_run_list"):
+            raise RuntimeError("libcubiomes is older than Draw on a seed list "
+                               "(py tools/build_native.py --cubiomes)")
+        import numpy as _np
+        a = _np.ascontiguousarray(seeds, dtype=_np.int64)
+        return bool(L.dengine_run_list(self.h, a.ctypes.data_as(ct.POINTER(ct.c_int64)), len(a),
+                                       int(threads), ct.byref(stop_flag)))
+
     def results(self):
         n = self.top_k
         s = (ct.c_int64 * n)(); sc = (ct.c_double * n)()
@@ -278,8 +293,13 @@ class DrawSearch:
     of ~0.3 s: Pause stops at a batch boundary → the resume point is exact.
     Stop interrupts at once (the current batch will be re-tested on resume)."""
 
-    def __init__(self, engine: DrawEngine, start: int, count: int = 0, threads: int = 4):
+    def __init__(self, engine: DrawEngine, start: int, count: int = 0, threads: int = 4,
+                 seed_list=None, skip: int = 0):
+        """seed_list (19/10): an iterable of seeds (SeedListSource) instead of the
+        range; `skip` = seeds of it already searched (resume)."""
         self.e = engine
+        self.seed_list = seed_list
+        self.skip = int(skip)
         self.start_seed = int(start)
         self.count = int(count)               # 0 = unlimited
         self.threads = max(1, int(threads))
@@ -315,7 +335,40 @@ class DrawSearch:
         if self._thread is not None:
             self._thread.join(timeout)
 
+    def _loop_list(self):
+        """(19/10) The seeds of a list, in batches: done = seeds of the list
+        searched in THIS run (the caller adds the earlier ones)."""
+        import itertools
+        import numpy as _np
+        batch = 256
+        t0 = time.perf_counter()
+        try:
+            it = iter(self.seed_list)
+            for _ in itertools.islice(it, self.skip):   # already searched
+                pass
+            while not self._pause.is_set():
+                chunk = list(itertools.islice(it, batch))
+                if not chunk:
+                    self.finished = True
+                    break
+                arr = _np.array([_s64(x) for x in chunk], dtype=_np.int64)
+                tb = time.perf_counter()
+                complete = self.e.run_list(arr, self.threads, self._stop)
+                dt = time.perf_counter() - tb
+                if not complete:
+                    break
+                self.done += len(chunk)
+                if dt < 0.15:
+                    batch = min(batch * 2, 1 << 20)
+                elif dt > 0.6 and batch > 16:
+                    batch //= 2
+        except Exception as ex:                          # noqa: BLE001
+            self.error = f"{type(ex).__name__}: {ex}"
+        self.t_run += time.perf_counter() - t0
+
     def _loop(self):
+        if self.seed_list is not None:
+            return self._loop_list()
         batch = 256
         t0 = time.perf_counter()
         try:

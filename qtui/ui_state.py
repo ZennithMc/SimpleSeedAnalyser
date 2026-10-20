@@ -250,6 +250,7 @@ def save(win, heavy=True):
     try:
         v0 = win.link.views[0] if win.link.views else win.map
         st["map"] = dict(cx=float(v0.cx), cz=float(v0.cz), bpp=float(v0.bpp),
+                         dim=int(getattr(v0, "dim", 0)),          # (18/10) Nether / End
                          seed_view=bool(win.link.engine.seed_view),
                          drawers={k: bool(d.opened) for k, d in win.drawers.items()})
     except Exception:                           # noqa: BLE001
@@ -305,6 +306,12 @@ def restore_map(win, st):
     try:
         m = (st or {}).get("map") or {}
         if m.get("cx") is not None:
+            d = m.get("dim", 0)
+            if d in (-1, 1) and hasattr(win.map, "set_dim"):     # (18/10) as it was left
+                win.map.ov["dim"] = int(d)
+                for v in (win.link.views if win.link is not None else [win.map]):
+                    v._sync_dim_bar()
+                win.map.overlayChanged.emit()
             win.map.center_on(float(m["cx"]), float(m["cz"]), bpp=float(m.get("bpp", 8.0)))
             if win.link is not None:
                 win.link.moved(win.map)

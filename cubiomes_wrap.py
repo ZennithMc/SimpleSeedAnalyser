@@ -347,6 +347,16 @@ STRUCTURE_TYPES: Dict[str, int] = {
     "abandoned_camp":  Abandoned_Camp,
 }
 
+# (18/10) Nether / End structures shown on the map of their dimension
+DIM_STRUCTURE_TYPES: Dict[int, Dict[str, int]] = {
+    0:  STRUCTURE_TYPES,
+    -1: {"fortress": Fortress, "bastion": Bastion, "ruined_portal_nether": Ruined_Portal_N},
+    1:  {"end_city": End_City, "end_gateway": End_Gateway},
+}
+STRUCTURE_DIM: Dict[str, int] = {k: d for d, m in DIM_STRUCTURE_TYPES.items() for k in m}
+ALL_STRUCTURE_TYPES: Dict[str, int] = {k: v for m in DIM_STRUCTURE_TYPES.values()
+                                       for k, v in m.items()}
+
 # Version Minecraft minimale requise pour chaque structure
 STRUCTURE_MIN_VERSION: Dict[str, int] = {
     "ancient_city":    MC_VERSIONS["Java 1.19"],
@@ -865,11 +875,14 @@ class CubiomesLib:
         self._seed = 0
         self._lock = threading.RLock()
         self._ready = False
+        self._dim = 0                     # (18/10) dimension the generator is seeded in
 
     # ── Setup ────────────────────────────────────────────────────────────────
     def setup_and_seed(self, mc: int, seed: int,
-                        large_biomes: Optional[bool] = None) -> None:
-        """Initialise the overworld generator for (version, seed).
+                        large_biomes: Optional[bool] = None, dim: int = 0) -> None:
+        """Initialise the generator for (version, seed) in dimension `dim`
+        (0 overworld — the default, -1 Nether, 1 End: an instance seeded in the
+        Nether / End serves biomes and structures of that dimension).
         large_biomes=None → reads the global _large_biomes_active flag.
         Pass True/False explicitly to override.
         """
@@ -879,8 +892,9 @@ class CubiomesLib:
         with self._lock:
             self._mc   = mc
             self._seed = seed & 0xFFFFFFFFFFFFFFFF
+            self._dim  = int(dim) if dim in (-1, 1) else 0
             self._lib.setupGenerator(self._gen, mc, ctypes.c_uint32(flags))
-            self._lib.applySeed(self._gen, DIM_OVERWORLD, ctypes.c_uint64(self._seed))
+            self._lib.applySeed(self._gen, ctypes.c_int(self._dim), ctypes.c_uint64(self._seed))
             self._ready = True
 
     # ── Biomes ───────────────────────────────────────────────────────────────
@@ -888,7 +902,7 @@ class CubiomesLib:
         """Biome à la position monde (x, z). Par défaut y=320 = surface
         (au-dessus des grottes 1.18+ comme dripstone/lush caves/deep dark)."""
         MC_1_18 = 22
-        if self._mc < MC_1_18:
+        if self._mc < MC_1_18 and not getattr(self, "_dim", 0):
             scale = max(scale, 4)
             y = 63
         with self._lock:
@@ -908,7 +922,8 @@ class CubiomesLib:
         perf sur les grandes tuiles (16K éléments).
         """
         MC_1_18 = 22  # version à partir de laquelle le système noise-based est actif
-        is_pre_18 = (self._mc < MC_1_18)
+        # (Nether / End: their own noise in every version, 1:1 included)
+        is_pre_18 = (self._mc < MC_1_18) and not getattr(self, "_dim", 0)
 
         # Pré-1.18 : système layer-based. scale=1 est invalide (pas de layer
         # à cette résolution), y est ignoré par cubiomes mais doit être dans
@@ -1083,8 +1098,118 @@ class CubiomesLib:
                             continue
                     out.append((pos.x, pos.z))
                     if len(out) >= max_count:
-                        return out
+                        break
+                if len(out) >= max_count:
+                    break
+            if verify_biome and struct_type == End_City and out:
+                out = self._end_city_terrain(out)      # (18/10) as cubiomes-viewer
         return out
+
+    def _end_city_terrain(self, pts):
+        """The End cities of `pts` that stand on a high enough island (the
+        generator must be seeded in the End). Caller holds the lock."""
+        f = getattr(self._lib, "ssa_end_city_filter", None)
+        if f is None or getattr(self, "_dim", 0) != 1:
+            return pts
+        n = len(pts)
+        buf = (ctypes.c_int32 * (2 * n))(*[v for p in pts for v in p])
+        f.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int]
+        f.restype = ctypes.c_int
+        k = f(self._gen, buf, n)
+        return [(int(buf[2 * i]), int(buf[2 * i + 1])) for i in range(k)]
+
+    def end_city_ships(self, pts) -> List[bool]:
+        """For End cities at `pts`: True where the city has a ship."""
+        f = getattr(self._lib, "ssa_end_city_has_ship", None)
+        if f is None:
+            return [False] * len(pts)
+        f.argtypes = [ctypes.c_uint64, ctypes.c_int32, ctypes.c_int32]
+        f.restype = ctypes.c_int
+        return [bool(f(ctypes.c_uint64(self._seed), int(x), int(z))) for x, z in pts]
+
+    def end_height_grid(self, x: int, z: int, w: int, h: int, scale: int):
+        """(18/10) End surface height (cubiomes-viewer's End height view) on a
+        w × h grid at `scale` blocks per cell from cell (x, z); 0 = void.
+        numpy float32 (h, w), or None with an old library."""
+        f = getattr(self._lib, "ssa_end_height_grid", None)
+        if f is None:
+            return None
+        import numpy as np
+        f.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_int32, ctypes.c_int32,
+                      ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(ctypes.c_float)]
+        f.restype = ctypes.c_int
+        out = np.zeros((int(h), int(w)), np.float32)
+        f(self._mc, ctypes.c_uint64(self._seed), int(x), int(z), int(w), int(h), int(scale),
+          out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        return out
+
+    def struct_pieces(self, key: str, x: int, z: int):
+        """(18/10) Pieces of the End city / Nether fortress at (x, z), as
+        cubiomes-viewer draws them: [(x0, z0, x1, z1, type, rot, y0, y1)]."""
+        f = getattr(self._lib, "ssa_struct_pieces", None)
+        st = ALL_STRUCTURE_TYPES.get(key)
+        if f is None or st is None:
+            return []
+        f.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_int32, ctypes.c_int32,
+                      ctypes.POINTER(ctypes.c_int32), ctypes.c_int]
+        f.restype = ctypes.c_int
+        buf = (ctypes.c_int32 * (8 * 1024))()
+        n = f(int(st), self._mc, ctypes.c_uint64(self._seed), int(x), int(z), buf, 1024)
+        return [tuple(buf[8 * i:8 * i + 8]) for i in range(max(0, n))]
+
+    def variant_bb(self, key: str, x: int, z: int):
+        """(18/10) cubiomes-viewer's variant bounding box (x0, z0, x1, z1)
+        in blocks, inclusive, or None."""
+        f = getattr(self._lib, "ssa_variant_bb", None)
+        st = ALL_STRUCTURE_TYPES.get(key)
+        if f is None or st is None:
+            return None
+        f.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_int32, ctypes.c_int32,
+                      ctypes.c_int, ctypes.POINTER(ctypes.c_int32)]
+        f.restype = ctypes.c_int
+        o = (ctypes.c_int32 * 4)()
+        if not f(int(st), self._mc, ctypes.c_uint64(self._seed), int(x), int(z), -1, o):
+            return None
+        return (int(x) + o[0], int(z) + o[1], int(x) + o[0] + o[2] - 1, int(z) + o[1] + o[3] - 1)
+
+    def climate_at(self, x: int, z: int, y: int = 320):
+        """(19/10) (biome, [T, H, C, E, D, W] ×10000) at block (x, y, z) of a 1.18+
+        overworld (sampleBiomeNoise at 1:4), or None."""
+        f = getattr(self._lib, "ssa_climate_at", None)
+        if f is None:
+            return None
+        f.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+                      ctypes.POINTER(ctypes.c_int64)]
+        f.restype = ctypes.c_int
+        np6 = (ctypes.c_int64 * 6)()
+        with self._lock:
+            b = f(self._gen, int(x), int(y), int(z), np6)
+        if b < 0:
+            return None
+        return int(b), [int(v) for v in np6]
+
+    def biome_param_boxes(self, mc: int, biome: int):
+        """(19/10) The game's parameter points of `biome` (1.18+):
+        [(Tlo, Thi, Hlo, Hhi, Clo, Chi, Elo, Ehi, Dlo, Dhi, Wlo, Whi)] ×10000."""
+        f = getattr(self._lib, "ssa_biome_boxes", None)
+        if f is None:
+            return []
+        f.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int32), ctypes.c_int]
+        f.restype = ctypes.c_int
+        cap = 4096
+        buf = (ctypes.c_int32 * (12 * cap))()
+        n = f(int(mc), int(biome), buf, cap)
+        return [tuple(buf[12 * i:12 * i + 12]) for i in range(max(0, n))]
+
+    def bastion_type(self, x: int, z: int) -> int:
+        """Start piece of the bastion at (x, z): 0 housing units, 1 hoglin
+        stables, 2 treasure, 3 bridge (-1: unknown)."""
+        f = getattr(self._lib, "ssa_bastion_type", None)
+        if f is None:
+            return -1
+        f.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_int32, ctypes.c_int32]
+        f.restype = ctypes.c_int
+        return int(f(self._mc, ctypes.c_uint64(self._seed), int(x), int(z)))
 
     # ── Strongholds (algo spécifique en anneaux) ─────────────────────────────
     def find_strongholds(self, max_count: int = 16,

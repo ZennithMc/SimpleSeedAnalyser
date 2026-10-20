@@ -101,6 +101,13 @@ def set_checker_dir(path):
 
 def find_java_home():
     """Find a JDK 17 (Temurin/Zulu/MS/Oracle); fall back to JAVA_HOME."""
+    try:                                   # (17/10) chosen in Settings
+        from PySide6.QtCore import QSettings
+        jh = str(QSettings("SSA", "SimpleSeedAnalyser").value("prefs/java_home", "") or "")
+        if jh and os.path.isdir(jh):
+            return jh
+    except Exception:
+        pass
     pats = [r"C:\Program Files\Eclipse Adoptium\jdk-17*",
             r"C:\Program Files\Zulu\zulu-17*",
             r"C:\Program Files\Java\jdk-17*",

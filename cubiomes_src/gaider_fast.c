@@ -271,6 +271,7 @@ static inline void skip_portal_room(XrsrState *s) {
 static inline uint64_t eye_offset_xrsr(int mc_version) {
     if (mc_version <= 22) return 50000ULL;   // 1.18.0/1.18.1: STRONGHOLDS step
     if (mc_version == 23) return 40000ULL + 8ULL;  // 1.19.0-1.19.2: registration order
+    if (mc_version >= 35) return 40000ULL + 37ULL; // 26.3+: the 18 abandoned_camp_* structures sort before stronghold (26.3 jar)
     return 40000ULL + 19ULL;                 // 1.19.3+: SURFACE_STRUCTURES, alphabetical (idx 19)
 }
 

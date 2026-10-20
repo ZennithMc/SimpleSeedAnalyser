@@ -543,6 +543,45 @@ def crunchiness_filter_w(seed_start: int, n: int, clim_hash, oct_lo, oct_hi, w_a
     return (int(total), out[:min(total, max_results)].tolist())
 
 
+def has_crunchiness_multi() -> bool:
+    """True when the GPU library tests several crunchiness conditions at once (18/10)."""
+    return is_available() and getattr(_CUDA_LIB, "gaider_cuda_crunchiness_multi", None) is not None
+
+
+def crunchiness_filter_multi(seed_start: int, n: int, conds, max_results: int,
+                             eps: float = 1e-5) -> "tuple[int, list[int]]":
+    """Several EXACT crunchiness filters ANDed on the GPU (18/10). conds: list
+    of dicts like crunchiness_filter_w's keywords (clim_hash, oct_lo, oct_hi,
+    w_a, w_b, threshold, mode_flag), at most 8. Superset of the CPU result."""
+    if not is_available():
+        _unavailable()
+    fn = _CUDA_LIB.gaider_cuda_crunchiness_multi
+    k = len(conds)
+    U64, I32, F32 = ctypes.c_uint64, ctypes.c_int32, ctypes.c_float
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_int64, I32, I32, ctypes.POINTER(U64), ctypes.POINTER(U64),
+                   ctypes.POINTER(I32), ctypes.POINTER(U64), ctypes.POINTER(U64),
+                   ctypes.POINTER(F32), ctypes.POINTER(F32), ctypes.POINTER(F32),
+                   ctypes.POINTER(I32), F32, ctypes.POINTER(ctypes.c_int64), I32]
+    c_lo = (U64 * k)(*[c["clim_hash"][0] for c in conds])
+    c_hi = (U64 * k)(*[c["clim_hash"][1] for c in conds])
+    n_oct = (I32 * k)(*[len(c["oct_lo"]) for c in conds])
+    o_lo = (U64 * (6 * k))(); o_hi = (U64 * (6 * k))()
+    wa = (F32 * (6 * k))(); wb = (F32 * (6 * k))()
+    for j, c in enumerate(conds):
+        for i in range(len(c["oct_lo"])):
+            o_lo[6 * j + i] = c["oct_lo"][i]; o_hi[6 * j + i] = c["oct_hi"][i]
+            wa[6 * j + i] = c["w_a"][i]; wb[6 * j + i] = c["w_b"][i]
+    thr = (F32 * k)(*[float(c["threshold"]) for c in conds])
+    mode = (I32 * k)(*[int(c["mode_flag"]) for c in conds])
+    import numpy as np
+    out = np.zeros(max(1, max_results), dtype=np.int64)
+    total = fn(int(seed_start), int(n), k, c_lo, c_hi, n_oct, o_lo, o_hi, wa, wb, thr, mode,
+               float(eps), out.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)), int(max_results))
+    _check(total)
+    return (int(total), out[:min(total, max_results)].tolist())
+
+
 def crunchiness_filter_ex(
         seed_start: int,
         n: int,

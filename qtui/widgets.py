@@ -220,9 +220,33 @@ class LabeledSlider(QWidget):
 
 
 class WheelGuard(QObject):
-    """App-wide: the mouse wheel never changes a slider, combo box or spin box
-    (it scrolled them by accident when the user only wanted to scroll the
-    panel). The wheel goes to the scroll area around them instead."""
+    """The mouse wheel never changes a slider, combo box or spin box (it
+    scrolled them by accident when the user only wanted to scroll the panel).
+    The wheel goes to the scroll area around them instead.
+
+    (17/10) Installed on those widgets only (`guard()` / the periodic scan of
+    MainWindow), no longer on the whole application: an application-wide
+    Python filter runs for EVERY event of the program, and crash.log showed
+    repeated access violations inside it (Python 3.14 / PySide6), mostly when
+    SSA was closing."""
+
+    KINDS = None
+
+    def guard(self, root):
+        """Install on every slider / combo / spin box under `root` (once)."""
+        from PySide6.QtWidgets import QAbstractSpinBox, QComboBox, QScrollBar
+        n = 0
+        try:
+            for cls in (QAbstractSlider, QComboBox, QAbstractSpinBox):
+                for w in root.findChildren(cls):
+                    if isinstance(w, QScrollBar) or w.property("_ssa_wheel"):
+                        continue
+                    w.setProperty("_ssa_wheel", True)
+                    w.installEventFilter(self)
+                    n += 1
+        except RuntimeError:                         # widget being deleted
+            pass
+        return n
 
     def eventFilter(self, obj, e):
         if e.type() != QEvent.Type.Wheel:
@@ -284,6 +308,7 @@ SHORTCUTS = [
         ("Alt+O", "Climate noise: switch Up to ↔ Only (same octave)"),
         ("Alt+G", "Octave arrows on / off (climate noises)"),
         ("Alt+S", "Structure seed view: potential structure positions, biomes ignored"),
+        ("Ctrl+1 / 2 / 3", "Map dimension: Overworld / Nether (coordinates ÷ 8) / End"),
         ("Alt+Shift+G", "Octave arrows: Gradient ↔ Lattice"),
     ]),
     ("Sessions", [

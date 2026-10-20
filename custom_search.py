@@ -331,12 +331,65 @@ def _cond_min_count(cond: dict) -> int:
         return 1
 
 
+def _struct_collect_c(ctx, cond, at, maxn, stop_at, sums):
+    """The C engine's struct_collect for one condition (Nether / End
+    structures, end ships, dense fortresses, start pieces): same answer as
+    the search. None when the library is older (no ssa_struct_collect_one)."""
+    import ctypes as ct
+    raw = ctx.lib._lib
+    f = getattr(raw, "ssa_struct_collect_one", None)
+    if f is None:
+        return None
+    one = copy.deepcopy(cond)
+    one["relative"] = 0
+    one["enabled"] = True
+    res = _build_ssacond_array([one], raw)
+    if res is None:
+        return None
+    arr, _n = res
+    f.argtypes = [ct.c_void_p, ct.c_int, ct.c_int, ct.c_int64, ct.c_int32, ct.c_int32,
+                  ct.POINTER(ct.c_int32), ct.c_int, ct.c_int, ct.POINTER(ct.c_int64)]
+    f.restype = ct.c_int
+    try:
+        from cubiomes_wrap import get_large_biomes
+        large = 1 if get_large_biomes() else 0
+    except Exception:
+        large = 0
+    cap = max(1, int(maxn))
+    out = (ct.c_int32 * (2 * cap))()
+    sm = (ct.c_int64 * 2)()
+    s64 = ((int(ctx.seed) + (1 << 63)) % (1 << 64)) - (1 << 63)
+    hits = f(arr, int(ctx.mc_version), large, s64, int(at[0]), int(at[1]), out, cap,
+             int(stop_at), sm)
+    pts = [(int(out[2 * k]), int(out[2 * k + 1])) for k in range(max(0, min(hits, cap)))]
+    if sums:
+        return hits, pts, (int(sm[0]), int(sm[1]))
+    return hits, pts
+
+
+def _struct_needs_c(cond) -> bool:
+    """Structures whose rules only the C engine implements: Nether / End
+    (their own generator, End city terrain) and the cubiomes-viewer variants
+    end ship / dense fortress / start pieces."""
+    t = cond.get("type", "")
+    if t in STRUCT_DIM:
+        return True
+    code, _bits = variant_code(t, cond.get("params", {}) or {})
+    return code >= 7
+
+
 def _struct_collect(ctx, cond, at, maxn=1, stop_at=1, sums=False):
     """Python mirror of session_engine.c struct_collect (cubiomes-viewer
-    testCondAt order and checks) for OVERWORLD structures.
+    testCondAt order and checks) for OVERWORLD structures; Nether / End ones
+    and the C-only variants go to the C engine (_struct_collect_c).
     Returns (hits, positions[:maxn]) or (hits, positions, (sx, sz)) with sums;
     hits = -1 if the structure is unknown for this version."""
     t = cond.get("type", "")
+    if _struct_needs_c(cond):
+        r = _struct_collect_c(ctx, cond, at, maxn, stop_at, sums)
+        if r is None:
+            raise RuntimeError(f"{t}: needs the C engine (rebuild libcubiomes)")
+        return r
     stype = STRUCT_TYPES[t]
     px, pz = at
     x1, z1, x2, z2, rmax_sq = _get_box(cond, px, pz)
@@ -1029,10 +1082,20 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
         # (as in C and cubiomes-viewer); before, the children were read around
         # a stale position and their own dependent conditions were skipped.
         ctx.push_position(cond_idx, (px, pz))
-        for child_idx in children:
+        # (19/10) « at least N of its conditions » (min_pass, default 1 = OR)
+        try:
+            need = max(1, int((params or {}).get("min_pass", 1) or 1))
+        except (TypeError, ValueError):
+            need = 1
+        got = 0
+        for k, child_idx in enumerate(children):
             if _eval_node(ctx, all_conds, child_idx, (px, pz)):
-                ctx.push_position(cond_idx, (px, pz))
-                return True
+                got += 1
+                if got >= need:
+                    ctx.push_position(cond_idx, (px, pz))
+                    return True
+            if got + (len(children) - k - 1) < need:
+                break
         return False
 
     if t == "logic_not":
@@ -1246,33 +1309,8 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
         ctx.push_position(cond_idx, (avg_x, avg_z))
         return True
 
-    # ── Nether / End structures ───────────────────────────────────────
-    if t in STRUCT_DIM:
-        dim = STRUCT_DIM[t]
-        struct_id = STRUCT_TYPES[t]
-        min_count = _cond_min_count(cond)
-        exclude = (min_count <= 0)
-        try:
-            positions = ctx.lib.find_structures_in_box_dim(
-                struct_type=struct_id,
-                x1=x1, z1=z1, x2=x2, z2=z2,
-                dim=dim, verify_biome=True, max_count=64)
-        except Exception:
-            return False
-        if rmax_sq:
-            positions = [(bx, bz) for bx, bz in positions
-                         if (bx - px)**2 + (bz - pz)**2 < rmax_sq]
-        if exclude:
-            if positions:
-                return False
-            ctx.push_position(cond_idx, ((x1 + x2) // 2, (z1 + z2) // 2))
-            return True
-        if len(positions) < min_count:
-            return False
-        ctx.push_position(cond_idx, positions[0])
-        return True
-
-    # ── Overworld structures ──────────────────────────────────────────
+    # ── Structures (every dimension: _struct_collect sends the Nether /
+    # End ones to the C engine) ───────────────────────────────────────
     if t in STRUCT_TYPES:
         min_count = _cond_min_count(cond)
         exclude = (min_count <= 0)
@@ -1292,12 +1330,23 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
 
     # ── Climate extreme (1.18+) ───────────────────────────────────────
     # ── Biome filter — C-native checkForBiomes (F_BIOME) ────────────────
-    if t == "biome_filter":
+    if t in ("biome_filter", "nether_biomes", "end_biomes"):
+        # (17/10) the C engine's own evaluation: same answer as the search
+        # (the Python copy ignored the instances of an exclusion, the
+        # coverage / confidence percents of the sample, and found other centres)
+        r = _c_eval_single(ctx, cond, cond_idx, all_conds, px, pz)
+        if r is not None:
+            if not r[0]:
+                return False
+            ctx.push_position(cond_idx, (r[1], r[2]))
+            return True
         biomes_incl = params.get("biomes_incl", [])
         biomes_excl = params.get("biomes_excl", [])
         scale       = params.get("scale", 4)
         dim_key     = params.get("dim", "overworld")
         dim         = {"overworld": 0, "nether": -1, "end": 1}.get(dim_key, 0)
+        if t != "biome_filter":
+            dim = -1 if t == "nether_biomes" else 1
         y           = params.get("y", 64)
         min_count   = params.get("count", 1)
         exclude     = (min_count <= 0)
@@ -1316,6 +1365,15 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
 
     # ── Biome sample — C-native monteCarloBiomes (F_BIOME_SAMPLE) ────────
     if t == "biome_sample":
+        # (17/10) the C engine's own evaluation: same answer as the search
+        # (the Python copy ignored the instances of an exclusion, the
+        # coverage / confidence percents of the sample, and found other centres)
+        r = _c_eval_single(ctx, cond, cond_idx, all_conds, px, pz)
+        if r is not None:
+            if not r[0]:
+                return False
+            ctx.push_position(cond_idx, (r[1], r[2]))
+            return True
         biomes_incl = params.get("biomes_incl", [])
         biomes_excl = params.get("biomes_excl", [])
         coverage    = float(params.get("coverage", 0.5))
@@ -1334,6 +1392,15 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
 
     # ── Biome center — C-native getBiomeCenters (F_BIOME_CENTER) ─────────
     if t == "biome_center":
+        # (17/10) the C engine's own evaluation: same answer as the search
+        # (the Python copy ignored the instances of an exclusion, the
+        # coverage / confidence percents of the sample, and found other centres)
+        r = _c_eval_single(ctx, cond, cond_idx, all_conds, px, pz)
+        if r is not None:
+            if not r[0]:
+                return False
+            ctx.push_position(cond_idx, (r[1], r[2]))
+            return True
         biome_id  = params.get("biome_id", 1)
         min_size  = params.get("min_size", 1)
         tolerance = params.get("tolerance", 4)
@@ -1846,7 +1913,7 @@ def _eval_node(ctx: EvalContext, conditions: List[dict],
             ctx.push_position(cond_1idx, cpos, _tdiv(sum(f.y for f in insts), n))
             return all(_eval_node(ctx, conditions, ch, cpos) for ch in direct_children)
 
-        elif (t in STRUCT_TYPES and t not in STRUCT_DIM and direct_children
+        elif (t in STRUCT_TYPES and direct_children
               and _cond_min_count(cond) > 0):
             # cubiomes-viewer BR_CLUST (see eval_node in session_engine.c):
             # instances == 1 → OR over every instance; > 1 → centroid.
@@ -1989,6 +2056,51 @@ def check_seed(conditions, seed, mc_version, lib=None):
     r = explain_seed(conditions, seed, mc_version, lib)
     rp = _LAST_CHECK.pop(int(seed), (None, None))
     return tuple(r) + tuple(rp)
+
+
+def check_seeds(conditions, seeds, mc_version, lib=None):
+    """(18/10) check_seed for a LIST of seeds (the results' automatic location):
+    the C condition array is built once, not once per seed (≈ 2.5 ms of
+    Python each: 40× the evaluation of a simple session). Returns
+    [(seed, result)] with result as check_seed's, or ("err", text)."""
+    if lib is None:
+        lib = CubiomesLib()
+    import ctypes as ct
+    raw = lib._lib
+    active = active_conditions(conditions)
+    fast = (hasattr(raw, "ssa_explain_seed2") and not any(
+        c.get("type") == "first_stronghold" and _portal_anchor(c.get("params")) for c in active))
+    res = _build_ssacond_array(conditions, raw) if fast else None
+    out = []
+    if res is None:                                   # same path as check_seed
+        for sd in seeds:
+            try:
+                out.append((sd, check_seed(conditions, sd, mc_version, lib)))
+            except Exception as e:                    # noqa: BLE001
+                out.append((sd, ("err", f"{type(e).__name__}: {e}")))
+        return out
+    arr, n = res
+    f = raw.ssa_explain_seed2
+    f.argtypes = [ct.c_void_p, ct.c_int, ct.c_int, ct.c_int, ct.c_int64,
+                  ct.POINTER(ct.c_int32), ct.POINTER(ct.c_uint8),
+                  ct.POINTER(ct.c_uint8), ct.POINTER(ct.c_uint8)]
+    f.restype = ct.c_int
+    try:
+        from cubiomes_wrap import get_large_biomes
+        large = 1 if get_large_biomes() else 0
+    except Exception:
+        large = 0
+    xz = (ct.c_int32 * (2 * n))(); valid = (ct.c_uint8 * n)()
+    rb, pb = (ct.c_uint8 * n)(), (ct.c_uint8 * n)()
+    rels = [int(c.get("relative", 0) or 0) for c in active]
+    for sd in seeds:
+        s64 = int(sd) & _U64
+        s64 = s64 - (1 << 64) if s64 >= (1 << 63) else s64
+        ok = bool(f(arr, n, int(mc_version), large, s64, xz, valid, rb, pb))
+        pos = [(int(xz[2 * i]), int(xz[2 * i + 1])) if valid[i] else None for i in range(n)]
+        anchors = [(0, 0) if r == 0 else (pos[r - 1] if 1 <= r <= n else None) for r in rels]
+        out.append((sd, (ok, active, anchors, pos, [bool(x) for x in rb], [bool(x) for x in pb])))
+    return out
 
 
 def explain_seed(conditions: List[dict], seed: int, mc_version: int, lib: CubiomesLib = None):
@@ -2315,6 +2427,8 @@ def _get_ctype_map(lib) -> dict:
         "slime":               "slime",
         "spawn":               "spawn",
         "biome_filter":        "biome_filter",
+        "nether_biomes":       "biome_filter",     # (18/10) Nether / End at scale
+        "end_biomes":          "biome_filter",
         "biome_sample":        "biome_sample",
         "biome_center":        "biome_center",
         "climate_minmax":      "climate_minmax",
@@ -2464,6 +2578,32 @@ def cv_full_octave_conditions(enabled: List[dict]) -> set:
     return out
 
 
+# engine variant codes (session_engine.c VARIANT_*)
+_VARIANT_CODES = {"any": 0, "abandoned": 1, "not_abandoned": 2, "basement": 3,
+                  "no_basement": 4, "with_ship": 7, "without_ship": 8, "dense": 9}
+_START_KEY = {"bastion": "bastion", "ruined_portal": "ruined_portal", "village": "village"}
+
+
+def variant_code(t: str, params: dict):
+    """(variant_filter, var_start bits) of a condition for the C engine."""
+    if t in ("dungeon", "lava_lake"):
+        return 0, 0                     # handled by their own fields
+    starts = params.get("starts") or []
+    sk = _START_KEY.get(t)
+    v = params.get("variant", "any") or "any"
+    if sk and starts and v in ("any", None):
+        from condition_types import start_bits
+        bits = start_bits(sk, starts)
+        if bits:
+            return 10, bits             # VARIANT_START
+    code = _VARIANT_CODES.get(v, 0)
+    if code in (7, 8) and t != "end_city":
+        code = 0
+    if code == 9 and t != "fortress":
+        code = 0
+    return code, 0
+
+
 def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
     """
     Serialise enabled conditions into a ctypes array of SsaCond structs.
@@ -2555,6 +2695,8 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
             ("skip_ref",            ct.c_int32),
             ("yield_samples",       ct.c_int32),
             ("dy_max",              ct.c_int32),     # (10/10 ter) height link to the parent
+            ("var_start_lo",        ct.c_uint32),    # (18/10) VARIANT_START pieces
+            ("var_start_hi",        ct.c_uint32),
         ]
 
     # Verify size matches C
@@ -2614,6 +2756,12 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
             min_count = 1
         s.min_count  = max(1, min_count) if min_count > 0 else 1
         s.exclude    = 1 if min_count <= 0 else 0
+        if t == "logic_or":             # (19/10) « at least N of its conditions »
+            try:
+                s.min_count = max(1, int(params.get("min_pass", 1) or 1))
+            except (TypeError, ValueError):
+                s.min_count = 1
+            s.exclude = 0
         s.skip_ref   = 1 if cond.get("ignore_ref") else 0
         # biome / noise sample « Yield individual samples » (cubiomes-viewer count == 1)
         s.yield_samples = 1 if (t in ("biome_sample", "noise_sample")
@@ -2633,11 +2781,11 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
             s.height_ymin = ylo if ylo > 0 else -1e9
             s.height_ymax = yhi if yhi < 255 else 1e9
 
-        # variant_filter (village abandoned, igloo basement)
-        _variant_str = params.get("variant", "any")
-        _variant_int = {"any":0, "abandoned":1, "not_abandoned":2,
-                         "basement":3, "no_basement":4}.get(_variant_str, 0)
-        s.variant_filter = _variant_int
+        # variant_filter (village abandoned, igloo basement, end ship, dense
+        # fortress, start pieces) — see variant_code()
+        s.variant_filter, _vbits = variant_code(t, params)
+        s.var_start_lo = _vbits & 0xFFFFFFFF
+        s.var_start_hi = (_vbits >> 32) & 0xFFFFFFFF
         if t == "lava_lake":                  # (10/10) underground 5 / surface 6
             s.variant_filter = {"underground": 5, "surface": 6}.get(params.get("variant"), 0)
         elif t == "dungeon":                  # (10/10 ter) the exact terrain decides: no
@@ -2660,6 +2808,10 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
 
         dim_str = params.get("dim", "overworld")
         s.biome_dim   = {"overworld":0,"nether":-1,"end":1}.get(dim_str,0)
+        if t == "nether_biomes":
+            s.biome_dim = -1
+        elif t == "end_biomes":
+            s.biome_dim = 1
         # Cubiomes-viewer convention: y=256 (real coord) which maps to r.y=64
         # (sea level) when scale=4. This is what monteCarloBiomes expects to
         # sample at the surface.
@@ -3047,10 +3199,25 @@ _GPU_PROF = {"buf": None, "n": 0, "pos": None, "scanned": 0, "kept": 0,
              "lock": threading.Lock()}
 
 
+_TSB_TLS = threading.local()     # .stop: ctypes c_int of the running _hybrid_loop
+
+
 def _tsb(raw, arr, n, mc, large, pin, nin, pout, cap):
     """ssa_test_seeds_batch, counted into the running search's statistics."""
     buf = _GPU_PROF["buf"]
     nn = int(getattr(n, "value", n))
+    # (18/10) stoppable inside a seed when the validator thread has a stop flag
+    # (a spiral over a whole map: seconds per seed, Stop / Pause waited for it)
+    stop = getattr(_TSB_TLS, "stop", None)
+    fs = getattr(raw, "ssa_test_seeds_batch_stop", None) if stop is not None else None
+    if fs is not None:
+        fs.restype = ctypes.c_int64
+        fs.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                       ctypes.POINTER(ctypes.c_int64), ctypes.c_int64,
+                       ctypes.POINTER(ctypes.c_int64), ctypes.c_int64,
+                       ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_int)]
+        use_buf = buf if (buf is not None and nn == _GPU_PROF["n"]) else None
+        return fs(arr, nn, mc, large, pin, nin, pout, cap, use_buf, ctypes.byref(stop))
     f = getattr(raw, "ssa_test_seeds_batch_prof", None)
     if buf is not None and f is not None and nn == _GPU_PROF["n"]:
         f.restype = ctypes.c_int64
@@ -3058,6 +3225,64 @@ def _tsb(raw, arr, n, mc, large, pin, nin, pout, cap):
                       ctypes.c_int64, ctypes.POINTER(ctypes.c_int64), ctypes.c_int64, ctypes.POINTER(ctypes.c_int64)]
         return f(arr, nn, mc, large, pin, nin, pout, cap, buf)
     return raw.ssa_test_seeds_batch(arr, n, mc, large, pin, nin, pout, cap)
+
+
+def _tsb_cand(raw, arr, n, mc, large, seeds, cand_off, cand_xz, node, out):
+    """(19/10) ssa_test_seeds_cand: the full test, the GPU-scanned spiral
+    visiting only its kept positions (ring_gpu). Counted / stoppable as _tsb."""
+    f = raw.ssa_test_seeds_cand
+    f.restype = ctypes.c_int64
+    f.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                  ctypes.POINTER(ctypes.c_int64), ctypes.c_int64,
+                  ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_int32), ctypes.c_int,
+                  ctypes.POINTER(ctypes.c_int64), ctypes.c_int64,
+                  ctypes.c_void_p, ctypes.c_void_p]
+    nn = int(getattr(n, "value", n))
+    buf = _GPU_PROF["buf"]
+    use_buf = buf if (buf is not None and nn == _GPU_PROF["n"]) else None
+    stop = getattr(_TSB_TLS, "stop", None)
+    return f(arr, nn, int(mc), int(large),
+             seeds.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)), len(seeds),
+             cand_off.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+             cand_xz.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), int(node),
+             out.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)), len(out),
+             use_buf, ctypes.byref(stop) if stop is not None else None)
+
+
+def _ring_setup(enabled, mc, large, raw, on_mode):
+    """(19/10) The GPU scan of a spiral's positions, when the session has a
+    top-level spiral with « GPU » ticked: (spec, node) or None (said why)."""
+    if not any(c.get("type") == "spiral" and not int(c.get("relative", 0) or 0)
+               and (c.get("params") or {}).get("use_gpu") for c in enabled):
+        return None
+    why = None
+    try:
+        import ring_gpu
+        if not hasattr(raw, "ssa_test_seeds_cand"):
+            why = "libcubiomes is older than the GPU spiral scan (rebuild --cubiomes)"
+        elif not ring_gpu.available():
+            why = "the CUDA library has no spiral scan yet (rebuild CUDA)"
+        else:
+            spec, node, notes = ring_gpu.compile_spec(enabled, mc, large)
+            if spec is None:
+                why = notes
+            else:
+                if on_mode is not None:
+                    try:
+                        on_mode(("gpu_status", "Spiral scanned on the GPU: "
+                                 f"{spec.npt} point test(s), {spec.nor} OR(s)"
+                                 + (" — " + "; ".join(notes) if notes else "")))
+                    except Exception:
+                        pass
+                return spec, node
+    except Exception as e:                                   # noqa: BLE001
+        why = f"{type(e).__name__}: {e}"
+    if on_mode is not None and why:
+        try:
+            on_mode(("gpu_status", f"Spiral GPU scan off: {why} — the CPU scans it."))
+        except Exception:
+            pass
+    return None
 
 
 def _gpu_prof_target(enabled, cond):
@@ -3229,7 +3454,26 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
             if last:
                 _bump(rec[2], rec[1])
 
+    # (18/10) a C stop flag mirrored from stop_event: the validations stop
+    # inside a seed too (see _tsb)
+    _cstop = ctypes.c_int(0)
+
+    def _stop_watch():
+        while not stop_event.wait(0.05):
+            if gpu_done.is_set() and all_done.is_set():
+                return
+        _cstop.value = 1
+
+    all_done = threading.Event()
+
     def _cpu_worker():
+        _TSB_TLS.stop = _cstop
+        try:
+            _cpu_worker_run()
+        finally:
+            _TSB_TLS.stop = None
+
+    def _cpu_worker_run():
         csz = 64                                   # per worker, adapts to ~0.3 s
         while not stop_event.is_set():
             try:
@@ -3264,10 +3508,15 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
                     continue
                 _safe_test(item)
 
-    with _cf.ThreadPoolExecutor(max_workers=nw + 1) as ex:
-        futs = [ex.submit(_gpu_worker)] + [ex.submit(_cpu_worker) for _ in range(nw)]
-        for f in futs:
-            f.result()
+    _watch = threading.Thread(target=_stop_watch, daemon=True)
+    _watch.start()
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=nw + 1) as ex:
+            futs = [ex.submit(_gpu_worker)] + [ex.submit(_cpu_worker) for _ in range(nw)]
+            for f in futs:
+                f.result()
+    finally:
+        all_done.set()
     if trk is not None and trk.used:
         try:
             _rcb(trk.point())
@@ -3282,6 +3531,11 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
 # climate sessions were silently refused → "GPU not engaged").
 GPU_GRID_CELLS = 1 << 20
 _GPU_DECLINE = {}                      # thread id -> why the last GPU pipeline declined
+
+
+class _GpuDecline(RuntimeError):
+    """A GPU pre-filter that declines on purpose (it would not help): said in
+    the status, not printed as an error."""
 
 
 def _gpu_decline(why):
@@ -5727,40 +5981,58 @@ def _evaluate_session_impl0(
                     _v_large = 1 if get_large_biomes() else 0
                 except Exception:
                     _v_large = 0
-                # the crunchiness entry of the C array (same order as `enabled`),
+                # the crunchiness entries of the C array (same order as `enabled`),
                 # so the GPU uses the very parameters the CPU re-test uses (p96)
-                _pos = next(i for i, c in enumerate(enabled) if c is _crunch_cond)
-                _cc = _v_arr[_pos]
-                if int(_cc.ctype) != 19:
-                    raise RuntimeError("the crunchiness condition was not found in the C array")
                 if not hasattr(_raw_v, "ssa_crunch_gpu_params"):
                     raise RuntimeError("libcubiomes is older than the exact crunchiness "
                                        "filter — rebuild it (py tools/build_native.py --cubiomes)")
-                _ch = (ct.c_uint64 * 2)(); _ol = (ct.c_uint64 * 6)(); _oh = (ct.c_uint64 * 6)()
-                _wa = (ct.c_float * 6)(); _wb = (ct.c_float * 6)()
                 _raw_v.ssa_crunch_gpu_params.restype = ct.c_int
                 _raw_v.ssa_crunch_gpu_params.argtypes = [
                     ct.c_int, ct.c_int, ct.c_uint32, ct.POINTER(ct.c_float),
                     ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint64),
                     ct.POINTER(ct.c_float), ct.POINTER(ct.c_float), ct.c_int]
-                _kp = _raw_v.ssa_crunch_gpu_params(
-                    int(_cc.crunch_climate), int(_v_large), int(_cc.crunch_octave_mask),
-                    _cc.crunch_weights, _ch, _ol, _oh, _wa, _wb, 6)
-                _gp = dict(clim_hash=(_ch[0], _ch[1]), oct_lo=list(_ol[:_kp]),
-                           oct_hi=list(_oh[:_kp]), w_a=list(_wa[:_kp]), w_b=list(_wb[:_kp]),
-                           threshold=float(_cc.crunch_threshold), mode_flag=int(_cc.crunch_mode))
+
+                def _gpu_params(cond):
+                    _pos = next(i for i, c in enumerate(enabled) if c is cond)
+                    _cc = _v_arr[_pos]
+                    if int(_cc.ctype) != 19:
+                        raise RuntimeError("the crunchiness condition was not found in the C array")
+                    _ch = (ct.c_uint64 * 2)(); _ol = (ct.c_uint64 * 6)(); _oh = (ct.c_uint64 * 6)()
+                    _wa = (ct.c_float * 6)(); _wb = (ct.c_float * 6)()
+                    _kp = _raw_v.ssa_crunch_gpu_params(
+                        int(_cc.crunch_climate), int(_v_large), int(_cc.crunch_octave_mask),
+                        _cc.crunch_weights, _ch, _ol, _oh, _wa, _wb, 6)
+                    return dict(clim_hash=(_ch[0], _ch[1]), oct_lo=list(_ol[:_kp]),
+                                oct_hi=list(_oh[:_kp]), w_a=list(_wa[:_kp]), w_b=list(_wb[:_kp]),
+                                threshold=float(_cc.crunch_threshold),
+                                mode_flag=int(_cc.crunch_mode))
+                _gp = _gpu_params(_crunch_cond)
+                # (18/10) EVERY top-level crunchiness condition ticked GPU goes on
+                # the GPU (AND): before, only the first one did, and the CPU
+                # re-tested all its survivors (70 % of a 5-noise session's time)
+                _gps = [_gpu_params(c) for c in enabled if c.get("type") == "crunchiness"
+                        and int(c.get("relative", 0) or 0) == 0
+                        and (c.get("params") or {}).get("use_gpu")][:8]
+                _multi = len(_gps) > 1 and _gc.has_crunchiness_multi()
 
                 def _scan(ss, n):
                     ss = ((int(ss) + (1 << 63)) % (1 << 64)) - (1 << 63)
-                    _t, _c = _gc.crunchiness_filter_w(ss, int(n), max_results=int(n), **_gp)
+                    if _multi:
+                        _t, _c = _gc.crunchiness_filter_multi(ss, int(n), _gps, max_results=int(n))
+                    else:
+                        _t, _c = _gc.crunchiness_filter_w(ss, int(n), max_results=int(n), **_gp)
                     return _np.asarray(_c, _np.int64)
 
-                # a threshold that keeps most seeds: the GPU would not help
+                # a threshold that keeps most seeds: the GPU would not help.
+                # (18/10) the limit was 5 %: thresholds keeping 13–37 % of the
+                # seeds fell back to the CPU alone and the searches got much
+                # slower than before (Édouard) — the GPU still drops most seeds
+                # there and every CPU thread validates the rest
                 _probe = 1 << 20
                 _kept0 = len(_scan(seed_start, _probe))
-                if _kept0 > _probe // 20:
-                    raise RuntimeError(f"this crunchiness threshold keeps {_kept0 / _probe:.0%} "
-                                       f"of the seeds: the GPU pre-filter would not help")
+                if _kept0 > (_probe * 3) // 4:
+                    raise _GpuDecline(f"this crunchiness threshold keeps {_kept0 / _probe:.0%} "
+                                      f"of the seeds: the GPU pre-filter would not help")
 
                 _emit_lock = threading.Lock()
 
@@ -5787,6 +6059,61 @@ def _evaluate_session_impl0(
                         s0.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(1),
                         o0.ctypes.data_as(ct.POINTER(ct.c_int64)), ct.c_int64(1))
 
+                # (19/10) the spiral's positions scanned on the GPU too (ring_gpu):
+                # only the crunchy seeds with kept positions reach the CPU, which
+                # tests the whole session at those positions only
+                _ring = _ring_setup(enabled, mc_version, _v_large, _raw_v, on_mode)
+                if _ring is not None:
+                    import ring_gpu as _rgm
+                    _rspec, _rnode = _ring
+                    _scan_c, _validate_c = _scan, _validate
+                    _cand = {}
+                    _cand_lock = threading.Lock()
+
+                    def _scan(ss, n):
+                        c = _scan_c(ss, n)
+                        if not len(c):
+                            return c
+                        si, xz = _rgm.scan(_rspec, c.view(_np.uint64), int(mc_version))
+                        if not len(si):
+                            return c[:0]
+                        o = _np.argsort(si, kind="stable")
+                        si, xz = si[o], xz[o]
+                        uq, st = _np.unique(si, return_index=True)
+                        en = list(st[1:]) + [len(si)]
+                        keep = c[uq]
+                        with _cand_lock:
+                            for k, a, b in zip(keep, st, en):
+                                _cand[int(k)] = _np.ascontiguousarray(xz[a:b], _np.int32)
+                        return keep
+
+                    def _validate(seeds_i64):
+                        if seeds_i64 is None or len(seeds_i64) == 0:
+                            return
+                        seeds_i64 = _np.ascontiguousarray(seeds_i64, _np.int64)
+                        with _cand_lock:
+                            lists = [_cand.pop(int(x), None) for x in seeds_i64]
+                        raw_s = _np.array([x for x, l in zip(seeds_i64, lists) if l is None],
+                                          _np.int64)
+                        if len(raw_s):
+                            _validate_c(raw_s)           # not GPU-scanned: the full test
+                        idx = [i for i, l in enumerate(lists) if l is not None]
+                        if not idx:
+                            return
+                        ss = _np.ascontiguousarray(seeds_i64[idx], _np.int64)
+                        ll = [lists[i] for i in idx]
+                        off = _np.zeros(len(ss) + 1, _np.int64)
+                        off[1:] = _np.cumsum([len(l) for l in ll])
+                        xz = _np.ascontiguousarray(_np.concatenate(ll).reshape(-1), _np.int32)
+                        out = _np.empty(len(ss), _np.int64)
+                        kept = _tsb_cand(_raw_v, _v_arr, ct.c_int(_v_nc), mc_version, _v_large,
+                                         ss, off, xz, _rnode, out)
+                        for k in range(int(kept)):
+                            if stop_event.is_set():
+                                break
+                            with _emit_lock:
+                                on_match(int(out[k]), "")
+
                 if on_mode is not None:
                     try: on_mode(3)            # 3 = GPU (CUDA) + C validation
                     except Exception: pass
@@ -5796,7 +6123,8 @@ def _evaluate_session_impl0(
                              num_workers, stop_event, on_progress)
                 return   # chemin CUDA terminé, on ne passe pas au moteur C
             except Exception as _gpu_ex:
-                import traceback; traceback.print_exc()
+                if not isinstance(_gpu_ex, _GpuDecline):     # a choice, not an error
+                    import traceback; traceback.print_exc()
                 if on_mode is not None:
                     try:
                         on_mode(("gpu_status", f"Crunchiness GPU: {_gpu_ex} — "

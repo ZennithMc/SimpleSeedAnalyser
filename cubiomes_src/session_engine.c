@@ -108,6 +108,11 @@
 #define VARIANT_NO_BASEMENT   4
 #define VARIANT_UNDERGROUND   5     /* (10/10) lava lake below sea level */
 #define VARIANT_SURFACE       6     /* (10/10) lava lake at sea level or above */
+/* (18/10) Nether / End variants, as cubiomes-viewer isVariantOk() */
+#define VARIANT_END_SHIP      7     /* end city with a ship (VAR_ENDSHIP) */
+#define VARIANT_NO_END_SHIP   8     /* end city without ship (VAR_ENDSHIP|VAR_NOT) */
+#define VARIANT_DENSE         9     /* fortress: 2x2 start/crossings (VAR_DENSE_BB) */
+#define VARIANT_START        10     /* start piece in var_start (VAR_WITH_START) */
 
 #define SSA_MODE_INC    0
 #define SSA_MODE_FAM48  1
@@ -197,6 +202,11 @@ typedef struct {
      * dungeon / lava lake, …), only the instances with |Y - parent Y| <=
      * dy_max - 1 are kept (0 = no height link) */
     int32_t  dy_max;
+
+    /* (18/10) VARIANT_START: the accepted start pieces, bits of the
+     * cubiomes-viewer start-piece table (g_start_pieces, Condition::varstart) */
+    uint32_t var_start_lo;
+    uint32_t var_start_hi;
 } SsaCond;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -233,6 +243,14 @@ typedef struct {
     SurfaceNoise sn_end;
     int          sn_ow_ready;
     int          sn_end_ready;
+    /* (18/10) Nether / End generators of the current seed, kept apart from the
+     * overworld one (g): a Nether or End condition no longer re-seeds the
+     * overworld biome noise twice per seed. [0] = Nether, [1] = End. Both
+     * dimensions only depend on the 48 low bits (Java LCG), except the 1:1
+     * voronoi hash (sha) — re-seeded like cubiomes-viewer init4Dim(). */
+    Generator    gdim[2];
+    int          gdim_setup[2];
+    int          gdim_seeded[2];
     int          current_dim;
     int          mc;
     int          large;
@@ -275,6 +293,11 @@ typedef struct {
     struct SsaProf_s *prof;
     /* ssa_explain_seed: positions only from the evaluation that succeeded */
     int          explain;
+    /* (19/10) GPU-scanned spiral: this spiral node visits only these positions
+     * (the GPU kept them, in the spiral's own order) — ssa_test_seeds_cand */
+    int            cand_node;
+    const int32_t *cand_xz;
+    int            cand_n;
 } SsaEnv;
 
 /* ── Profiler (27/09) ─────────────────────────────────────────────────────
@@ -481,6 +504,30 @@ static inline void env_set_dim(SsaEnv *e, int dim) {
         applySeed(&e->g, dim, e->seed);
         e->current_dim = dim;
     }
+}
+
+/* The generator of `dim` for the current seed (overworld: env->g). */
+static Generator *env_dim_gen(SsaEnv *e, int dim) {
+    if (dim != DIM_NETHER && dim != DIM_END) {
+        env_set_dim(e, DIM_OVERWORLD);
+        return &e->g;
+    }
+    int k = (dim == DIM_NETHER) ? 0 : 1;
+    Generator *g = &e->gdim[k];
+    if (!e->gdim_setup[k]) {
+        setupGenerator(g, e->mc, e->g.flags);
+        e->gdim_setup[k] = 1;
+        e->gdim_seeded[k] = 0;
+    }
+    if (!e->gdim_seeded[k] || g->dim != dim || ((g->seed ^ e->seed) & MASK48)) {
+        applySeed(g, dim, e->seed);
+        e->gdim_seeded[k] = 1;
+    } else if (g->seed != e->seed) {           /* same 48 bits: only the hash */
+        g->seed = e->seed;
+        if (g->mc >= MC_1_15)
+            g->sha = getVoronoiSHA(e->seed);
+    }
+    return g;
 }
 
 static inline void env_push(SsaEnv *e, int idx, int32_t x, int32_t z) {
@@ -1492,18 +1539,131 @@ static int village_maybe_abandoned(int mc, uint64_t seed, int x, int z)
 /* ═══════════════════════════════════════════════════════════════════════════
  * Variant filter check
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* cubiomes-viewer start-piece table (search.cpp g_start_pieces): the bit index
+ * of an entry is how a condition encodes it (Condition::varstart) — keep the
+ * order. {structure, biome (-1 any), start piece, giant (-1 any)} */
+typedef struct { int stype, biome, start, giant; } SsaStartPiece;
+static const SsaStartPiece g_ssa_start_pieces[] = {
+    {Village, plains, 0, -1}, /* 0 plains_fountain_01 */
+    {Village, plains, 1, -1}, /* 1 plains_meeting_point_1 */
+    {Village, plains, 2, -1}, /* 2 plains_meeting_point_2 */
+    {Village, plains, 3, -1}, /* 3 plains_meeting_point_3 */
+    {Village, desert, 1, -1}, /* 4 desert_meeting_point_1 */
+    {Village, desert, 2, -1}, /* 5 desert_meeting_point_2 */
+    {Village, desert, 3, -1}, /* 6 desert_meeting_point_3 */
+    {Village, savanna, 1, -1}, /* 7 savanna_meeting_point_1 */
+    {Village, savanna, 2, -1}, /* 8 savanna_meeting_point_2 */
+    {Village, savanna, 3, -1}, /* 9 savanna_meeting_point_3 */
+    {Village, savanna, 4, -1}, /* 10 savanna_meeting_point_4 */
+    {Village, taiga, 1, -1}, /* 11 taiga_meeting_point_1 */
+    {Village, taiga, 2, -1}, /* 12 taiga_meeting_point_2 */
+    {Village, snowy_tundra, 1, -1}, /* 13 snowy_meeting_point_1 */
+    {Village, snowy_tundra, 2, -1}, /* 14 snowy_meeting_point_2 */
+    {Village, snowy_tundra, 3, -1}, /* 15 snowy_meeting_point_3 */
+    {Bastion, -1, 0, -1}, /* 16 units */
+    {Bastion, -1, 1, -1}, /* 17 hoglin_stable */
+    {Bastion, -1, 2, -1}, /* 18 treasure */
+    {Bastion, -1, 3, -1}, /* 19 bridge */
+    {Ruined_Portal, -1, 1, 1}, /* 20 giant_ruined_portal_1 */
+    {Ruined_Portal, -1, 2, 1}, /* 21 giant_ruined_portal_2 */
+    {Ruined_Portal, -1, 3, 1}, /* 22 giant_ruined_portal_3 */
+    {Ruined_Portal, -1, 1, 0}, /* 23 ruined_portal_1 */
+    {Ruined_Portal, -1, 2, 0}, /* 24 ruined_portal_2 */
+    {Ruined_Portal, -1, 3, 0}, /* 25 ruined_portal_3 */
+    {Ruined_Portal, -1, 4, 0}, /* 26 ruined_portal_4 */
+    {Ruined_Portal, -1, 5, 0}, /* 27 ruined_portal_5 */
+    {Ruined_Portal, -1, 6, 0}, /* 28 ruined_portal_6 */
+    {Ruined_Portal, -1, 7, 0}, /* 29 ruined_portal_7 */
+    {Ruined_Portal, -1, 8, 0}, /* 30 ruined_portal_8 */
+    {Ruined_Portal, -1, 9, 0}, /* 31 ruined_portal_9 */
+    {Ruined_Portal, -1, 10, 0}, /* 32 ruined_portal_10 */
+};
+#define SSA_N_START_PIECES ((int)(sizeof(g_ssa_start_pieces) / sizeof(g_ssa_start_pieces[0])))
+EXPORT int ssa_n_start_pieces(void) { return SSA_N_START_PIECES; }
+
+/* The variant filter of a structure instance (cubiomes-viewer isVariantOk, same
+ * order and rules). `g` is the generator of the structure's dimension. A dense
+ * fortress MOVES the instance to the corner of its 2x2 crossing block (CV). */
 static int variant_pass(SsaEnv *env, const SsaCond *c, int struct_id,
-                          int biome_id, int32_t bx, int32_t bz)
+                          int biome_id, Generator *g, Pos *pos)
 {
     if (c->variant_filter == VARIANT_NONE) return 1;
+    int bx = pos->x, bz = pos->z;
     StructureVariant sv;
     memset(&sv, 0, sizeof(sv));
-    getVariant(&sv, struct_id, env->mc, env->seed, bx, bz, biome_id);
     switch (c->variant_filter) {
-        case VARIANT_ABANDONED:     return sv.abandoned ? 1 : 0;
-        case VARIANT_NOT_ABANDONED: return sv.abandoned ? 0 : 1;
-        case VARIANT_BASEMENT:      return sv.basement ? 1 : 0;
-        case VARIANT_NO_BASEMENT:   return sv.basement ? 0 : 1;
+    case VARIANT_ABANDONED: case VARIANT_NOT_ABANDONED:
+    case VARIANT_BASEMENT:  case VARIANT_NO_BASEMENT:
+        getVariant(&sv, struct_id, env->mc, env->seed, bx, bz, biome_id);
+        switch (c->variant_filter) {
+            case VARIANT_ABANDONED:     return sv.abandoned ? 1 : 0;
+            case VARIANT_NOT_ABANDONED: return sv.abandoned ? 0 : 1;
+            case VARIANT_BASEMENT:      return sv.basement ? 1 : 0;
+            default:                    return sv.basement ? 0 : 1;
+        }
+    case VARIANT_END_SHIP: case VARIANT_NO_END_SHIP: {
+        if (struct_id != End_City) return 1;
+        Piece pieces[END_CITY_PIECES_MAX];
+        int n = getEndCityPieces(pieces, env->seed, bx >> 4, bz >> 4);
+        int ship = 0;
+        for (int i = 0; i < n; i++)
+            if (pieces[i].type == END_SHIP) { ship = 1; break; }
+        return (c->variant_filter == VARIANT_END_SHIP) ? ship : !ship;
+    }
+    case VARIANT_DENSE: {
+        if (struct_id != Fortress) return 1;
+        enum { FP_MAX = 400 };
+        Piece p[FP_MAX];
+        int i, n, b;
+        n = getFortressPieces(p, FP_MAX, env->mc, env->seed, bx >> 4, bz >> 4);
+        for (b = i = 0; i < n; i++)
+            if (p[i].type == FORTRESS_START || p[i].type == BRIDGE_CROSSING)
+                p[b++] = p[i];
+        if (b < 4) return 0;
+        for (i = 0; i < b; i++) {
+            int j, adj = 0;
+            for (j = 0; j < b; j++) {
+                if (p[i].bb0.y != p[j].bb0.y) continue;
+                if (p[i].bb1.x != p[j].bb1.x && p[i].bb1.x+1 != p[j].bb0.x) continue;
+                if (p[i].bb1.z != p[j].bb1.z && p[i].bb1.z+1 != p[j].bb0.z) continue;
+                adj++;
+            }
+            if (adj >= 4) {
+                pos->x = p[i].bb1.x;
+                pos->z = p[i].bb1.z;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    case VARIANT_START: {
+        if (struct_id == Village) {
+            if (env->mc < MC_1_10) return 1;
+            getVariant(&sv, Village, env->mc, env->seed, bx, bz, biome_id);
+            if (env->mc < MC_1_14) return 1;
+        } else if (struct_id == Bastion) {
+            if (env->mc <= MC_1_15) return 1;
+            getVariant(&sv, Bastion, env->mc, env->seed, bx, bz, -1);
+        } else if (struct_id == Ruined_Portal || struct_id == Ruined_Portal_N) {
+            if (env->mc <= MC_1_15) return 1;
+            int vb = getBiomeAt(g, 4, (bx >> 2) + 2, 0, (bz >> 2) + 2);
+            getVariant(&sv, struct_id, env->mc, env->seed, bx, bz, vb);
+        } else {
+            return 1;
+        }
+        uint64_t bits = ((uint64_t)c->var_start_hi << 32) | c->var_start_lo;
+        while (bits) {
+            int idx = __builtin_ctzll(bits);
+            bits &= bits - 1;
+            if (idx >= SSA_N_START_PIECES) continue;
+            const SsaStartPiece *sp = &g_ssa_start_pieces[idx];
+            if (sp->stype != struct_id || sp->start != sv.start) continue;
+            if (sp->biome != -1 && sp->biome != sv.biome) continue;
+            if (sp->giant != -1 && sp->giant != sv.giant) continue;
+            return 1;
+        }
+        return 0;
+    }
     }
     return 1;
 }
@@ -1613,7 +1773,7 @@ static int struct_collect(SsaEnv *env, const SsaCond *c, int cond_idx,
         rx2 = (x2 >= 0) ? (x2 / csz) : -((-x2 + csz - 1) / csz);
         rz2 = (z2 >= 0) ? (z2 / csz) : -((-z2 + csz - 1) / csz);
     }
-    env_set_dim(env, dim);
+    Generator *g = env_dim_gen(env, dim);
     int hits = 0;
     for (int32_t rz = rz1; rz <= rz2; rz++) {
         for (int32_t rx = rx1; rx <= rx2; rx++) {
@@ -1633,21 +1793,21 @@ static int struct_collect(SsaEnv *env, const SsaCond *c, int cond_idx,
             if (stype == Village && c->variant_filter == VARIANT_ABANDONED &&
                 !village_maybe_abandoned(env->mc, env->seed, p.x, p.z))
                 continue;                          /* cheap, before the biome */
-            int biome_id = isViableStructurePos(stype, &env->g, p.x, p.z, 0);
+            int biome_id = isViableStructurePos(stype, g, p.x, p.z, 0);
             if (!biome_id) continue;
             if (stype == End_City) {
                 if (!env->sn_end_ready) {
                     initSurfaceNoise(&env->sn_end, DIM_END, env->seed);
                     env->sn_end_ready = 1;
                 }
-                if (!isViableEndCityTerrain(&env->g, &env->sn_end, p.x, p.z))
+                if (!isViableEndCityTerrain(g, &env->sn_end, p.x, p.z))
                     continue;
             }
             if (c->variant_filter != VARIANT_NONE &&
-                !variant_pass(env, c, stype, biome_id, p.x, p.z))
+                !variant_pass(env, c, stype, biome_id, g, &p))
                 continue;
             if (env->mc >= MC_1_18 && dim == DIM_OVERWORLD &&
-                !isViableStructureTerrain(stype, &env->g, p.x, p.z))
+                !isViableStructureTerrain(stype, g, p.x, p.z))
                 continue;
             if (hits < maxn) out[hits] = p;
             if (xs) { *xs += p.x; *zs += p.z; }
@@ -1656,7 +1816,6 @@ static int struct_collect(SsaEnv *env, const SsaCond *c, int cond_idx,
         }
     }
 done:
-    env_set_dim(env, DIM_OVERWORLD);
     return hits;
 }
 
@@ -1867,19 +2026,26 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
         return 1;
 
     case CTYPE_LOGIC_OR: {
-        int has_child = 0;
+        /* (19/10) « at least N of its conditions » : min_count (1 = OR) */
+        int has_child = 0, need = c->min_count > 1 ? c->min_count : 1, got = 0, left = 0;
+        for (int i = 0; i < n_conds; i++)
+            if (all_conds[i].cond_idx && all_conds[i].parent_idx == cond_idx) left++;
         for (int i = 0; i < n_conds; i++) {
             const SsaCond *ch = &all_conds[i];
             if (!ch->cond_idx || ch->parent_idx != cond_idx) continue;
             has_child = 1;
+            left--;
             /* on appelle eval_node (et non eval_condition) pour que chaque
              * alternative du OR évalue AUSSI ses enfants AND (ex. un height
              * sous un Locate W). Sinon les enfants ne sont jamais testés. */
             if (eval_node(env, all_conds, n_conds, caches,
                            ch->cond_idx, at_x, at_z)) {
-                env_push(env, cond_idx, at_x, at_z);
-                return 1;
+                if (++got >= need) {
+                    env_push(env, cond_idx, at_x, at_z);
+                    return 1;
+                }
             }
+            if (got + left < need) break;
         }
         /* cubiomes-viewer: « empty ORs are ignored » — an OR without any
          * (enabled) alternative passes (before: rejected every seed) */
@@ -2103,7 +2269,7 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
             default:  return 0;
         }
         int dim = c->biome_dim;
-        env_set_dim(env, dim);
+        Generator *bg = env_dim_gen(env, dim);
 
         CondCache *cache = &caches[cond_idx - 1];
         if (!cache->bf_ready) {
@@ -2140,11 +2306,10 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
         r.sz = (z2 >> s_shift) - r.z + 1; if (r.sz < 1) r.sz = 1;
         r.y = (s_shift > 0) ? (c->biome_y >> 2) : c->biome_y;
         r.sy = 1;
-        int ok = fast_check_biomes(env, cache, r, dim);
+        int ok = (dim == DIM_OVERWORLD) ? fast_check_biomes(env, cache, r, dim) : -1;
         if (ok < 0)
-            ok = checkForBiomes(&env->g, NULL, r, dim, env->seed,
+            ok = checkForBiomes(bg, NULL, r, dim, env->seed,
                                   &cache->bf, (volatile char*)env->stop_flag) > 0;
-        env_set_dim(env, DIM_OVERWORLD);
         if (c->exclude) {
             if (ok) return 0;
             env_push(env, cond_idx, cx_def, cz_def); return 1;
@@ -2224,7 +2389,11 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
         r.sz = (z2 >> 2) - r.z + 1; if (r.sz < 1) r.sz = 1;
         r.y = c->biome_y >> 2; r.sy = 1;
         Pos centers[64];
-        int request = exclude ? 1 : (min_count < 64 ? min_count : 64);
+        /* (17/10) with a radius (SSA option) or « ignore the reference », the
+         * first centres found may be outside / the parent itself: ask for all
+         * of them (before: a centre at the box corner made the seed fail) */
+        int request = (rmax_sq || c->skip_ref) ? 64
+                    : exclude ? 1 : (min_count < 64 ? min_count : 64);
         int n = getBiomeCenters(centers, NULL, request,
                                   &env->g, r,
                                   c->biome_id, c->biome_min_size,
@@ -2857,11 +3026,17 @@ static int eval_node_impl(SsaEnv *env, const SsaCond *conds, int n_conds,
         spiral_init(&it, bx1, bz1, bx2, bz2, step, rmax_sq, at_x, at_z);
         int32_t gx, gz;
         int spiral_guard = 0;
-        while (spiral_next(&it, &gx, &gz)) {
+        /* (19/10) the positions kept by the GPU only (already in spiral order) */
+        const int use_cand = (env->cand_xz && env->cand_node == cond_1idx);
+        int cand_k = 0;
+        while (use_cand ? (cand_k < env->cand_n
+                           ? (gx = env->cand_xz[2*cand_k], gz = env->cand_xz[2*cand_k+1],
+                              cand_k++, 1) : 0)
+                        : spiral_next(&it, &gx, &gz)) {
             /* Arrêt réactif : une spirale fine sur une grande zone peut itérer
              * des dizaines de milliers de points ; on vérifie le drapeau Stop
              * périodiquement pour ne pas bloquer l'arrêt sur une seule seed. */
-            if (env->stop_flag && ((++spiral_guard & 1023) == 0) && *env->stop_flag)
+            if (env->stop_flag && ((++spiral_guard & 63) == 0) && *env->stop_flag)
                 break;
             env_push(env, cond_1idx, gx, gz);
             int all_ok = 1;
@@ -3038,7 +3213,10 @@ static int clust_node(SsaEnv *env, const SsaCond *conds, int n_conds, CondCache 
         r.y = c->biome_y >> 2; r.sy = 1;
         /* CV: branch mode asks for `count` (= 1) centres; the average mode
          * for all of them; exclusion for 1 */
-        int want = branch ? 1 : (count == 0 ? 1 : CLUST_MAX);
+        /* (17/10) with a radius / « ignore the reference » the first centres
+         * may be dropped below: ask for all, then (branch) keep the first
+         * one that is kept — the parent position eval_condition gives too */
+        int want = (rmax_sq || c->skip_ref) ? CLUST_MAX : branch ? 1 : (count == 0 ? 1 : CLUST_MAX);
         int m = getBiomeCenters(inst, NULL, want, &env->g, r, c->biome_id,
                                 c->biome_min_size, c->biome_tolerance, NULL);
         if (m > want) m = want;
@@ -3052,6 +3230,7 @@ static int clust_node(SsaEnv *env, const SsaCond *conds, int n_conds, CondCache 
                     if (dx*dx + dz*dz >= rmax_sq) continue;
                 }
                 inst[n++] = inst[i]; xt += inst[i].x; zt += inst[i].z;
+                if (branch) break;              /* CV: one centre in branch mode */
             }
             if (n >= count && n > 0) { avg_ok = 1; ax = (int32_t)(xt / n) + 2; az = (int32_t)(zt / n) + 2; }
         }
@@ -3469,6 +3648,81 @@ static int test_structure_pos_only(SsaEnv *env, const SsaCond *c,
     return exclude ? 1 : 0;
 }
 
+/* (18/10) A Nether structure position known from the 48 bits alone to really
+ * generate: ruined portals always; fortresses up to 1.17, and in 1.18+ where
+ * the region holds no bastion candidate (isViableStructurePos's own rules).
+ * 0 = unknown (the biome decides), never « certainly not ». */
+static int nether_pos_certain(int stype, int mc, uint64_t seed, int x, int z,
+                              const StructureConfig *sc)
+{
+    if (stype == Ruined_Portal_N) return mc >= MC_1_16;
+    if (stype != Fortress) return 0;
+    if (mc <= MC_1_17) return 1;
+    Pos rp;
+    return !getStructurePos(Bastion, mc, seed, floordiv(x, sc->regionSize << 4),
+                            floordiv(z, sc->regionSize << 4), &rp);
+}
+
+/* (18/10) Does this leaf structure condition CERTAINLY pass at (0, 0), from the
+ * 48 bits alone? (same area / count / skipref rules as struct_collect) Only
+ * Nether ruined portals and fortresses without variant; anything else → 0. */
+static int struct_certain_pass48(SsaEnv *env, const SsaCond *c, CondCache *cache)
+{
+    if (c->ctype != CTYPE_STRUCTURE_NETHER || c->variant_filter != VARIANT_NONE) return 0;
+    int stype = c->struct_type;
+    if (stype != Fortress && stype != Ruined_Portal_N) return 0;
+    if (!cache->sconf_ready) {
+        if (!getStructureConfig(stype, env->mc, &cache->sconf)) return 0;
+        cache->sconf_ready = 1;
+    }
+    int rs = cache->sconf.regionSize;
+    if (rs <= 0) return 0;
+    int32_t x1, z1, x2, z2; int64_t rmax_sq = 0;
+    if (c->rmax > 0) {
+        int32_t rb = c->rmax - 1;
+        x1 = -rb; z1 = -rb; x2 = rb; z2 = rb; rmax_sq = (int64_t)rb*rb + 1;
+    } else { x1 = c->x1; z1 = c->z1; x2 = c->x2; z2 = c->z2; }
+    int csz = rs << 4;
+    int32_t rx1 = floordiv(x1, csz), rz1 = floordiv(z1, csz);
+    int32_t rx2 = floordiv(x2, csz), rz2 = floordiv(z2, csz);
+    int need = c->min_count <= 0 ? 1 : c->min_count;
+    int sure = 0, any = 0;
+    for (int32_t rz = rz1; rz <= rz2; rz++) {
+        for (int32_t rx = rx1; rx <= rx2; rx++) {
+            Pos p;
+            if (!getStructurePos(stype, env->mc, env->seed, rx, rz, &p)) continue;
+            if (c->skip_ref && p.x == 0 && p.z == 0) continue;
+            int inside = rmax_sq ? ((int64_t)p.x*p.x + (int64_t)p.z*p.z < rmax_sq)
+                                 : (p.x >= x1 && p.x <= x2 && p.z >= z1 && p.z <= z2);
+            if (!inside) continue;
+            any++;
+            if (!c->exclude && nether_pos_certain(stype, env->mc, env->seed, p.x, p.z,
+                                                  &cache->sconf)) {
+                if (++sure >= need) return 1;
+            }
+            if (c->exclude) return 0;           /* a candidate: maybe excluded */
+        }
+    }
+    return c->exclude ? (any == 0) : 0;         /* no candidate: exclusion passes */
+}
+
+/* (18/10) A top-level NOT fails for the whole 48-bit family when one of its
+ * children is a leaf Nether structure that certainly passes (see above). */
+static int not_fails48(SsaEnv *env, const SsaCond *conds, int n_conds,
+                       CondCache *caches, int not_idx)
+{
+    for (int j = 0; j < n_conds; j++) {
+        const SsaCond *ch = &conds[j];
+        if (!ch->cond_idx || ch->parent_idx != not_idx) continue;
+        int leaf = 1;
+        for (int k = 0; k < n_conds; k++)
+            if (conds[k].cond_idx && conds[k].parent_idx == ch->cond_idx) { leaf = 0; break; }
+        if (leaf && struct_certain_pass48(env, ch, &caches[ch->cond_idx - 1]))
+            return 1;
+    }
+    return 0;
+}
+
 /* Returns 1 if all top-level structure-position checks pass without doing
  * the full biome/terrain validation. Used in the 2-pass fast-skip mode.
  * Conditions that are NOT structure positions are conservatively considered
@@ -3512,6 +3766,10 @@ static int ssa_test_seed_pos_only(SsaEnv *env, const SsaCond *conds,
              * (before: never tested here → every family expanded) */
             if (!(conds[i].struct_type == 1 ? sf_lava_lake_hit48(env->seed) : sf_dungeon_hit2(env->seed, NULL)))
                 return 0;
+        }
+        else if (ctype == CTYPE_LOGIC_NOT &&
+                 not_fails48(env, conds, n_conds, caches, conds[i].cond_idx)) {
+            return 0;
         }
         /* Other condition types: conservatively "maybe ok" → no skip */
     }
@@ -4034,8 +4292,11 @@ static void worker_run(EngineState *st) {
                     env.current_dim = -2;
                     prof_seed_begin(prof);
                     uint64_t pt0 = (prof && prof->timing) ? SSA_TICKS() : 0;
-                    applySeed(&env.g, DIM_OVERWORLD, full);
-                    env.current_dim = DIM_OVERWORLD;
+                    /* (18/10) lazy, as in Incremental: the conditions that need
+                     * the overworld generator call env_set_dim themselves.
+                     * Before: an overworld applySeed for every expanded seed,
+                     * even in a Nether / End session (≈ 4× slower than Inc) */
+                    env.current_dim = -2;
                     int bok = ssa_test_seed_sorted(&env, st->conds, st->n_conds, caches, st->toplevel_order, st->n_toplevel);
                     if (prof && prof->timing) prof->total_ticks += SSA_TICKS() - pt0;
                     STOP_DURING_TEST();
@@ -4608,14 +4869,15 @@ EXPORT int ssa_village_abandoned(int mc, int large, uint64_t seed, int x, int z)
 static int64_t test_seeds_batch_impl(
         const SsaCond *conds, int n_conds, int mc, int large,
         const int64_t *in_seeds, int64_t n_in,
-        int64_t *out_seeds, int64_t out_cap, SsaProf *prof);
+        int64_t *out_seeds, int64_t out_cap, SsaProf *prof, volatile int *stop,
+        const int64_t *cand_off, const int32_t *cand_xz, int cand_node);
 
 EXPORT int64_t ssa_test_seeds_batch(
         const SsaCond *conds, int n_conds, int mc, int large,
         const int64_t *in_seeds, int64_t n_in,
         int64_t *out_seeds, int64_t out_cap) {
     return test_seeds_batch_impl(conds, n_conds, mc, large, in_seeds, n_in,
-                                 out_seeds, out_cap, NULL);
+                                 out_seeds, out_cap, NULL, NULL, NULL, NULL, 0);
 }
 
 /* Same, with the per-condition statistics of the search engine (01/10): the
@@ -4624,16 +4886,35 @@ EXPORT int64_t ssa_test_seeds_batch(
  * validator threads share one buffer) — per condition: seeds reached, branch
  * passed, own ticks (sampled 1 seed in 32), checks, checks passed; then the
  * ticks of the whole seed tests. Same counting as ssa_engine_profile2. */
+/* (18/10) Same as ssa_test_seeds_batch_prof, stoppable: *stop != 0 ends the
+ * batch at once, also INSIDE a seed (spiral loops, biome filters — as the
+ * search worker): a session costing seconds per seed (a spiral over a whole
+ * map) kept Stop / Pause waiting for whole validation pieces, all buttons
+ * greyed. After a stop the return value is meaningless for the seeds not
+ * finished (the caller does not count that piece). prof_out may be NULL. */
+EXPORT int64_t ssa_test_seeds_batch_stop(
+        const SsaCond *conds, int n_conds, int mc, int large,
+        const int64_t *in_seeds, int64_t n_in,
+        int64_t *out_seeds, int64_t out_cap, int64_t *prof_out, volatile int *stop);
+
 EXPORT int64_t ssa_test_seeds_batch_prof(
         const SsaCond *conds, int n_conds, int mc, int large,
         const int64_t *in_seeds, int64_t n_in,
         int64_t *out_seeds, int64_t out_cap, int64_t *prof_out) {
+    return ssa_test_seeds_batch_stop(conds, n_conds, mc, large, in_seeds, n_in,
+                                     out_seeds, out_cap, prof_out, NULL);
+}
+
+EXPORT int64_t ssa_test_seeds_batch_stop(
+        const SsaCond *conds, int n_conds, int mc, int large,
+        const int64_t *in_seeds, int64_t n_in,
+        int64_t *out_seeds, int64_t out_cap, int64_t *prof_out, volatile int *stop) {
     if (!prof_out)
         return test_seeds_batch_impl(conds, n_conds, mc, large, in_seeds, n_in,
-                                     out_seeds, out_cap, NULL);
+                                     out_seeds, out_cap, NULL, stop, NULL, NULL, 0);
     SsaProf *pf = (SsaProf *)calloc(1, sizeof(SsaProf));
     int64_t kept = test_seeds_batch_impl(conds, n_conds, mc, large, in_seeds, n_in,
-                                         out_seeds, out_cap, pf);
+                                         out_seeds, out_cap, pf, stop, NULL, NULL, 0);
     if (pf) {
         int n = n_conds < MAX_CONDS ? n_conds : MAX_CONDS;
         for (int i = 0; i < n; i++) {
@@ -4652,7 +4933,8 @@ EXPORT int64_t ssa_test_seeds_batch_prof(
 static int64_t test_seeds_batch_impl(
         const SsaCond *conds, int n_conds, int mc, int large,
         const int64_t *in_seeds, int64_t n_in,
-        int64_t *out_seeds, int64_t out_cap, SsaProf *prof) {
+        int64_t *out_seeds, int64_t out_cap, SsaProf *prof, volatile int *stop,
+        const int64_t *cand_off, const int32_t *cand_xz, int cand_node) {
     if (n_conds <= 0 || n_conds > MAX_CONDS || n_in <= 0) return 0;
 
     /* Ordre d'évaluation des enfants, propre à CET appel (thread-safe) */
@@ -4686,6 +4968,7 @@ static int64_t test_seeds_batch_impl(
     memset(&env, 0, sizeof(env));
     env.co = co;
     env.prof = prof;                    /* per-condition stats (NULL = off) */
+    env.stop_flag = stop;               /* (18/10) NULL = not stoppable */
     env.mc = mc; env.large = large;
     env.current_dim = -2;
     env.gbn_seed = ~0ULL; env.gbn_nmax = -999;
@@ -4702,6 +4985,7 @@ static int64_t test_seeds_batch_impl(
 
     int64_t kept = 0;
     for (int64_t i = 0; i < n_in; i++) {
+        if (stop && *stop) break;
         env.seed = (uint64_t)in_seeds[i];
         env.sn_ow_ready = 0;
         env.sn_end_ready = 0;
@@ -4710,6 +4994,11 @@ static int64_t test_seeds_batch_impl(
          * biomes of the FIRST seed of the batch → every biome / viability test
          * of the GPU-survivor validation used the wrong world. */
         env.current_dim = -2;
+        if (cand_xz && cand_off) {           /* (19/10) GPU-kept spiral positions */
+            env.cand_node = cand_node;
+            env.cand_xz = cand_xz + 2 * cand_off[i];
+            env.cand_n = (int)(cand_off[i + 1] - cand_off[i]);
+        }
         prof_seed_begin(prof);
         /* every seed is timed here (02/10): the counter restarts at each call and
          * the GPU validators call with a few survivors at a time, so the engine's
@@ -4720,6 +5009,9 @@ static int64_t test_seeds_batch_impl(
         int ok = ssa_test_seed_sorted(&env, conds, n_conds, caches,
                                       toplevel_order, n_toplevel);
         if (prof && prof->timing) prof->total_ticks += SSA_TICKS() - pt0;
+        /* (18/10) a Stop during the test may have cut a branch short (a NOT
+         * over it would pass): that seed is not kept (its piece is re-tested) */
+        if (stop && *stop) break;
         if (ok) {
             if (kept < out_cap) out_seeds[kept] = in_seeds[i];
             kept++;
@@ -4727,6 +5019,96 @@ static int64_t test_seeds_batch_impl(
     }
     free(co);
     return kept;
+}
+
+/* (19/10) index of grid offset (u, v) from the spiral's centre in the order
+ * of spiral_next: +x 1, +z 1, -x 2, -z 2, +x 3 … (0 = the centre) */
+static int64_t spiral_order_index(int64_t u, int64_t v)
+{
+    if (!u && !v) return 0;
+    int64_t idx = 0, x = 0, z = 0;
+    for (int64_t s = 0; ; s++) {
+        int64_t L = s / 2 + 1; int d = (int)(s & 3);
+        int64_t dx = (d == 0) - (d == 2), dz = (d == 1) - (d == 3);
+        if (dx) { if (v == z) { int64_t t = (u - x) * dx; if (t >= 1 && t <= L) return idx + t; } }
+        else    { if (u == x) { int64_t t = (v - z) * dz; if (t >= 1 && t <= L) return idx + t; } }
+        x += dx * L; z += dz * L; idx += L;
+        if (s > 8 * (llabs(u) + llabs(v)) + 16) return INT64_MAX;     /* not on the grid */
+    }
+}
+typedef struct { int64_t key; int32_t x, z; } CandKey;
+static int cand_cmp(const void *a, const void *b)
+{
+    int64_t ka = ((const CandKey *)a)->key, kb = ((const CandKey *)b)->key;
+    return (ka > kb) - (ka < kb);
+}
+
+/* (19/10) ssa_test_seeds_batch where ONE top-level spiral (cand_node, 1-based)
+ * visits only the positions a GPU scan kept: seed i's are cand_xz[2*cand_off[i]
+ * .. 2*cand_off[i+1]) (any order: sorted here into the spiral's own order, so
+ * the first match is the CPU's). Everything else is the normal full test, so
+ * the result is the CPU's as long as the GPU kept every position that passes.
+ * cand_xz is reordered in place. */
+EXPORT int64_t ssa_test_seeds_cand(
+        const SsaCond *conds, int n_conds, int mc, int large,
+        const int64_t *in_seeds, int64_t n_in,
+        const int64_t *cand_off, int32_t *cand_xz, int cand_node,
+        int64_t *out_seeds, int64_t out_cap, int64_t *prof_out, volatile int *stop)
+{
+    if (cand_node < 1 || cand_node > n_conds || !cand_off || !cand_xz) return 0;
+    const SsaCond *sp = &conds[cand_node - 1];
+    if (sp->ctype != CTYPE_SPIRAL || sp->parent_idx != 0) return 0;
+    int step = sp->step > 0 ? sp->step : 512;
+    int32_t bx1, bz1, bx2, bz2;
+    if (sp->rmax > 0) { int32_t rb = sp->rmax - 1; bx1 = -rb; bz1 = -rb; bx2 = rb; bz2 = rb; }
+    else { bx1 = sp->x1; bz1 = sp->z1; bx2 = sp->x2; bz2 = sp->z2; }
+    SpiralIter it;
+    spiral_init(&it, bx1, bz1, bx2, bz2, step, 0, 0, 0);
+    for (int64_t i = 0; i < n_in; i++) {
+        int64_t a = cand_off[i], b = cand_off[i + 1];
+        if (b - a < 2) continue;
+        CandKey *k = (CandKey *)malloc(sizeof(CandKey) * (size_t)(b - a));
+        if (!k) continue;
+        for (int64_t j = a; j < b; j++) {
+            int32_t x = cand_xz[2*j], z = cand_xz[2*j+1];
+            k[j-a].x = x; k[j-a].z = z;
+            k[j-a].key = spiral_order_index((int64_t)SSA_FLOORDIV(x, step) - it.rx,
+                                            (int64_t)SSA_FLOORDIV(z, step) - it.rz);
+        }
+        qsort(k, (size_t)(b - a), sizeof(CandKey), cand_cmp);
+        for (int64_t j = a; j < b; j++) { cand_xz[2*j] = k[j-a].x; cand_xz[2*j+1] = k[j-a].z; }
+        free(k);
+    }
+    if (!prof_out)
+        return test_seeds_batch_impl(conds, n_conds, mc, large, in_seeds, n_in, out_seeds,
+                                     out_cap, NULL, stop, cand_off, cand_xz, cand_node);
+    SsaProf *pf = (SsaProf *)calloc(1, sizeof(SsaProf));
+    int64_t kept = test_seeds_batch_impl(conds, n_conds, mc, large, in_seeds, n_in, out_seeds,
+                                         out_cap, pf, stop, cand_off, cand_xz, cand_node);
+    if (pf) {
+        int n = n_conds < MAX_CONDS ? n_conds : MAX_CONDS;
+        for (int q = 0; q < n; q++) {
+            __atomic_fetch_add(&prof_out[5 * q],     pf->reached[q],   __ATOMIC_RELAXED);
+            __atomic_fetch_add(&prof_out[5 * q + 1], pf->passed[q],    __ATOMIC_RELAXED);
+            __atomic_fetch_add(&prof_out[5 * q + 2], (int64_t)pf->ticks[q], __ATOMIC_RELAXED);
+            __atomic_fetch_add(&prof_out[5 * q + 3], pf->checks[q],    __ATOMIC_RELAXED);
+            __atomic_fetch_add(&prof_out[5 * q + 4], pf->checks_ok[q], __ATOMIC_RELAXED);
+        }
+        __atomic_fetch_add(&prof_out[5 * n], (int64_t)pf->total_ticks, __ATOMIC_RELAXED);
+        free(pf);
+    }
+    return kept;
+}
+
+/* (19/10) the spiral's order index of each (x, z) grid position (tests) */
+EXPORT void ssa_spiral_order(int32_t x1, int32_t z1, int32_t x2, int32_t z2, int step,
+                             const int32_t *xz, int n, int64_t *out)
+{
+    SpiralIter it;
+    spiral_init(&it, x1, z1, x2, z2, step > 0 ? step : 512, 0, 0, 0);
+    for (int i = 0; i < n; i++)
+        out[i] = spiral_order_index((int64_t)SSA_FLOORDIV(xz[2*i], step) - it.rx,
+                                    (int64_t)SSA_FLOORDIV(xz[2*i+1], step) - it.rz);
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -4804,6 +5186,532 @@ EXPORT int ssa_explain_seed(
 static int eval_single_impl(const SsaCond *conds, int mc, int large, int64_t seed,
                             int32_t at_x, int32_t at_z, int has_y, int32_t at_y, int32_t *out_xz,
                             int32_t *samples_xz, int samples_cap, int *n_samples, int32_t *out_y);
+
+/* (18/10) The instances of ONE structure condition around (at_x, at_z), as the
+ * search sees them (any dimension, variants, End city terrain): up to `maxn`
+ * positions in out_xz, stop after `stop_at` (<= 0: all), coordinate sums in
+ * sums[0..1]. Returns the number found (-1: structure unknown in mc). Used by
+ * the Python evaluator so both evaluators share the dimension rules. */
+EXPORT int ssa_struct_collect_one(const SsaCond *cond, int mc, int large, int64_t seed,
+                                  int32_t at_x, int32_t at_z, int32_t *out_xz, int maxn,
+                                  int stop_at, int64_t *sums)
+{
+    if (!cond) return -1;
+    SsaEnv *env = (SsaEnv *)calloc(1, sizeof(SsaEnv));
+    if (!env) return -1;
+    env->mc = mc; env->large = large;
+    env->current_dim = -2;
+    setupGenerator(&env->g, mc, large ? LARGE_BIOMES : 0);
+    env->seed = (uint64_t)seed;
+    CondCache cache;
+    memset(&cache, 0, sizeof(cache));
+    int cap = maxn > 0 ? maxn : 1;
+    Pos *pts = (Pos *)malloc(sizeof(Pos) * (size_t)cap);
+    int64_t xs = 0, zs = 0;
+    int n = -1;
+    if (pts) {
+        n = struct_collect(env, cond, 1, &cache, at_x, at_z, pts, cap, stop_at, &xs, &zs);
+        int k = n < cap ? n : cap;
+        for (int i = 0; out_xz && i < k; i++) { out_xz[2*i] = pts[i].x; out_xz[2*i+1] = pts[i].z; }
+        free(pts);
+    }
+    if (sums) { sums[0] = xs; sums[1] = zs; }
+    free(env);
+    return n;
+}
+
+/* (18/10) Map helpers for the End. g: an End generator of the seed.
+ * ssa_end_city_filter keeps, in place, the (x, z) pairs whose End city has
+ * a high enough island (isViableEndCityTerrain) and returns how many stay. */
+EXPORT int ssa_end_city_filter(Generator *g, int32_t *xz, int n)
+{
+    if (!g || !xz || n <= 0) return 0;
+    SurfaceNoise sn;
+    initSurfaceNoise(&sn, DIM_END, g->seed);
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (isViableEndCityTerrain(g, &sn, xz[2*i], xz[2*i+1])) {
+            xz[2*k] = xz[2*i]; xz[2*k+1] = xz[2*i+1]; k++;
+        }
+    }
+    return k;
+}
+
+/* 1 when the End city at block (x, z) has a ship (its pieces include END_SHIP). */
+EXPORT int ssa_end_city_has_ship(uint64_t seed, int32_t x, int32_t z)
+{
+    Piece pieces[END_CITY_PIECES_MAX];
+    int n = getEndCityPieces(pieces, seed, x >> 4, z >> 4);
+    for (int i = 0; i < n; i++)
+        if (pieces[i].type == END_SHIP) return 1;
+    return 0;
+}
+
+void sampleNoiseColumnEnd(double column[], const SurfaceNoise *sn, const EndNoise *en,
+                          int x, int z, int colymin, int colymax);
+/* (biomenoise.c, not in its header) — declared here: newer GCC (w64devkit)
+ * makes an implicit declaration an error */
+int getSurfaceHeight(const double ncol00[], const double ncol01[],
+        const double ncol10[], const double ncol11[],
+        int colymin, int colymax, int blockspercell, double dx, double dz);
+#define ssa_snce sampleNoiseColumnEnd
+/* (18/10) isViableEndCityTerrain's corner heights over the FULL height range:
+ * cubiomes stops at y 71 (cells 15-18: enough for its ≥ 60 test), the game
+ * takes the real ground, up to y 127 (islands above 71 put the city higher) */
+static int ssa_end_city_ground_full(const Generator *g, const SurfaceNoise *sn,
+        int blockX, int blockZ)
+{
+    const EndNoise *en = &g->en;
+    int chunkX = blockX >> 4;
+    int chunkZ = blockZ >> 4;
+    blockX = chunkX * 16 + 7;
+    blockZ = chunkZ * 16 + 7;
+    int cellx = (blockX >> 3);
+    int cellz = (blockZ >> 3);
+
+    enum { y0 = 15, y1 = 32, yn = y1-y0+1 };
+    double ncol[3][3][yn];
+
+    ssa_snce(ncol[0][0], sn, en, cellx, cellz, y0, y1);
+    ssa_snce(ncol[0][1], sn, en, cellx, cellz+1, y0, y1);
+    ssa_snce(ncol[1][0], sn, en, cellx+1, cellz, y0, y1);
+    ssa_snce(ncol[1][1], sn, en, cellx+1, cellz+1, y0, y1);
+
+    int h00, h01, h10, h11;
+    h00 = getSurfaceHeight(ncol[0][0], ncol[0][1], ncol[1][0], ncol[1][1],
+            y0, y1, 4, (blockX & 7) / 8.0, (blockZ & 7) / 8.0);
+
+    uint64_t cs;
+    if (en->mc <= MC_1_18)
+        setSeed(&cs, chunkX + chunkZ * 10387313ULL);
+    else
+        cs = chunkGenerateRnd(g->seed, chunkX, chunkZ);
+
+    switch (nextInt(&cs, 4))
+    {
+    case 0: // (++) 0
+        ssa_snce(ncol[0][2], sn, en, cellx+0, cellz+2, y0, y1);
+        ssa_snce(ncol[1][2], sn, en, cellx+1, cellz+2, y0, y1);
+        ssa_snce(ncol[2][0], sn, en, cellx+2, cellz+0, y0, y1);
+        ssa_snce(ncol[2][1], sn, en, cellx+2, cellz+1, y0, y1);
+        ssa_snce(ncol[2][2], sn, en, cellx+2, cellz+2, y0, y1);
+        h01 = getSurfaceHeight(ncol[0][1], ncol[0][2], ncol[1][1], ncol[1][2],
+                y0, y1, 4, ((blockX    ) & 7) / 8.0, ((blockZ + 5) & 7) / 8.0);
+        h10 = getSurfaceHeight(ncol[1][0], ncol[1][1], ncol[2][0], ncol[2][1],
+                y0, y1, 4, ((blockX + 5) & 7) / 8.0, ((blockZ    ) & 7) / 8.0);
+        h11 = getSurfaceHeight(ncol[1][1], ncol[1][2], ncol[2][1], ncol[2][2],
+                y0, y1, 4, ((blockX + 5) & 7) / 8.0, ((blockZ + 5) & 7) / 8.0);
+        break;
+
+    case 1: // (-+) 90
+        ssa_snce(ncol[0][2], sn, en, cellx+0, cellz+2, y0, y1);
+        ssa_snce(ncol[1][2], sn, en, cellx+1, cellz+2, y0, y1);
+        h01 = getSurfaceHeight(ncol[0][1], ncol[0][2], ncol[1][1], ncol[1][2],
+                y0, y1, 4, ((blockX    ) & 7) / 8.0, ((blockZ + 5) & 7) / 8.0);
+        h10 = getSurfaceHeight(ncol[0][0], ncol[0][1], ncol[1][0], ncol[1][1],
+                y0, y1, 4, ((blockX - 5) & 7) / 8.0, ((blockZ    ) & 7) / 8.0);
+        h11 = getSurfaceHeight(ncol[0][1], ncol[0][2], ncol[1][1], ncol[1][2],
+                y0, y1, 4, ((blockX - 5) & 7) / 8.0, ((blockZ + 5) & 7) / 8.0);
+        break;
+
+    case 2: // (--) 180
+        h01 = getSurfaceHeight(ncol[0][0], ncol[0][1], ncol[1][0], ncol[1][1],
+                y0, y1, 4, ((blockX    ) & 7) / 8.0, ((blockZ - 5) & 7) / 8.0);
+        h10 = getSurfaceHeight(ncol[0][0], ncol[0][1], ncol[1][0], ncol[1][1],
+                y0, y1, 4, ((blockX - 5) & 7) / 8.0, ((blockZ    ) & 7) / 8.0);
+        h11 = getSurfaceHeight(ncol[0][0], ncol[0][1], ncol[1][0], ncol[1][1],
+                y0, y1, 4, ((blockX - 5) & 7) / 8.0, ((blockZ - 5) & 7) / 8.0);
+        break;
+
+    case 3: // (+-) 270
+        ssa_snce(ncol[2][0], sn, en, cellx+2, cellz+0, y0, y1);
+        ssa_snce(ncol[2][1], sn, en, cellx+2, cellz+1, y0, y1);
+        h01 = getSurfaceHeight(ncol[0][0], ncol[0][1], ncol[1][0], ncol[1][1],
+                y0, y1, 4, ((blockX    ) & 7) / 8.0, ((blockZ - 5) & 7) / 8.0);
+        h10 = getSurfaceHeight(ncol[1][0], ncol[1][1], ncol[2][0], ncol[2][1],
+                y0, y1, 4, ((blockX + 5) & 7) / 8.0, ((blockZ    ) & 7) / 8.0);
+        h11 = getSurfaceHeight(ncol[1][0], ncol[1][1], ncol[2][0], ncol[2][1],
+                y0, y1, 4, ((blockX + 5) & 7) / 8.0, ((blockZ - 5) & 7) / 8.0);
+        break;
+
+    default:
+        return 0; // error
+    }
+    //printf("%d %d %d %d\n", h00, h01, h10, h11);
+    if (h01 < h00) h00 = h01;
+    if (h10 < h00) h00 = h10;
+    if (h11 < h00) h00 = h11;
+    return h00;
+}
+#undef ssa_snce
+
+EXPORT int ssa_end_city_ground(int mc, uint64_t seed, int32_t x, int32_t z, int full)
+{
+    Generator g; setupGenerator(&g, mc, 0); applySeed(&g, DIM_END, seed);
+    SurfaceNoise sn; initSurfaceNoise(&sn, DIM_END, seed);
+    return full ? ssa_end_city_ground_full(&g, &sn, x, z) : isViableEndCityTerrain(&g, &sn, x, z);
+}
+
+/* (19/10) the 6 climate parameters (×10000: T, H, C, E, D, W) and the biome at
+ * block (x, y, z) of a 1.18+ overworld generator (sampleBiomeNoise at 1:4) */
+EXPORT int ssa_climate_at(const Generator *g, int32_t x, int32_t y, int32_t z, int64_t *np)
+{
+    if (!g || g->mc < MC_1_18 || g->dim != DIM_OVERWORLD) return -1;
+    return sampleBiomeNoise(&g->bn, np, x >> 2, y >> 2, z >> 2, NULL, 0);
+}
+
+/* (19/10) the game's parameter points of a biome (see getBiomeLeafBoxes) */
+EXPORT int ssa_biome_boxes(int mc, int biome, int32_t *out12, int max)
+{
+    return getBiomeLeafBoxes(mc, biome, (int (*)[12])out12, max);
+}
+
+/* (18/10) The pieces of an End city / a Nether fortress at block (x, z), as
+ * cubiomes-viewer draws them (getEndCityPieces / getFortressPieces). out: 8
+ * int32 per piece — bb0.x, bb0.z, bb1.x, bb1.z, type, rot, bb0.y, bb1.y (End city:
+ * absolute Y, the ground height added).
+ * Returns the number of pieces written (0: other structure / none). */
+EXPORT int ssa_struct_pieces(int stype, int mc, uint64_t seed, int32_t x, int32_t z,
+                             int32_t *out, int maxn)
+{
+    static const int CAP = 1024;
+    Piece *pc = (Piece *)malloc(sizeof(Piece) * CAP);
+    if (!pc) return 0;
+    int n = 0, yoff = 0, xzoff = 0;
+    if (stype == End_City) {
+        n = getEndCityPieces(pc, seed, x >> 4, z >> 4);
+        /* the pieces' Y are relative to the city's ground (cubiomes-viewer:
+         * « relative to surface »): the island height isViableEndCityTerrain
+         * finds there makes them absolute */
+        Generator g;
+        setupGenerator(&g, mc, 0);
+        applySeed(&g, DIM_END, seed);
+        SurfaceNoise sn;
+        initSurfaceNoise(&sn, DIM_END, seed);
+        yoff = isViableEndCityTerrain(&g, &sn, x, z);
+        /* (18/10) the game starts the city at block 7 of its chunk from 1.18
+         * (EndCityStructure: chunkPos.getBlockX(7) / getBlockZ(7), read in the
+         * 26.3 jar; 1.17 and before: + 8). cubiomes' getEndCityPieces keeps
+         * the old + 8: every piece one block too far east and south */
+        if (mc >= MC_1_18) xzoff = -1;
+    }
+    else if (stype == Fortress)
+        n = getFortressPieces(pc, CAP, mc, seed, x >> 4, z >> 4);
+    if (n > CAP) n = CAP;
+    if (n > maxn) n = maxn;
+    for (int i = 0; i < n; i++) {
+        int32_t *o = out + 8 * i;
+        o[0] = pc[i].bb0.x + xzoff; o[1] = pc[i].bb0.z + xzoff;
+        o[2] = pc[i].bb1.x + xzoff; o[3] = pc[i].bb1.z + xzoff;
+        o[4] = pc[i].type;  o[5] = pc[i].rot;   o[6] = pc[i].bb0.y + yoff; o[7] = pc[i].bb1.y + yoff;
+    }
+    free(pc);
+    return n;
+}
+
+/* (18/10) The variant bounding box cubiomes-viewer draws (getVariant: x, z
+ * offsets from the structure position, sx, sz size); out[4]. 0 = none. */
+EXPORT int ssa_variant_bb(int stype, int mc, uint64_t seed, int32_t x, int32_t z,
+                          int biome, int32_t *out)
+{
+    StructureVariant sv;
+    memset(&sv, 0, sizeof(sv));
+    if (!getVariant(&sv, stype, mc, seed, x, z, biome)) return 0;
+    out[0] = sv.x; out[1] = sv.z; out[2] = sv.sx; out[3] = sv.sz;
+    return sv.sx && sv.sz;
+}
+
+/* ── (18/10) fast End surface: the same numbers as mapEndSurfaceHeight ──────
+ * mapEndSurfaceHeight samples one noise column per 8-block cell, and each
+ * column's getEndHeightNoise tests the 25 × 25 island cells around it with a
+ * simplex noise each (625 per column, the main cost far from the centre).
+ * Neighbouring columns test almost the same island cells: they are computed
+ * once per call in a grid (EhGrid) and looked up — bit-identical results
+ * (same float / int arithmetic, same order of the minimum). */
+int getSurfaceHeight(const double ncol00[], const double ncol01[],
+        const double ncol10[], const double ncol11[],
+        int colymin, int colymax, int blockspercell, double dx, double dz);
+
+typedef struct { int64_t x0, z0; int w, h; int8_t *v; } EhGrid;   /* -1 = not yet */
+
+static int eh_island(EhGrid *gr, const EndNoise *en, int64_t rx, int64_t rz)
+{
+    uint64_t rsq = rx*rx + rz*rz;
+    if (!(rsq > 4096)) return 0;
+    int8_t *slot = NULL;
+    if (gr && gr->v) {
+        int64_t i = rx - gr->x0, j = rz - gr->z0;
+        if (i >= 0 && j >= 0 && i < gr->w && j < gr->h) {
+            slot = &gr->v[j * (int64_t)gr->w + i];
+            if (*slot >= 0) return *slot;
+        }
+    }
+    int v = 0;
+    if (sampleSimplex2D(&en->perlin, rx, rz) < -0.9f)
+        v = (unsigned int)(fabsf((float)rx) * 3439.0f + fabsf((float)rz) * 147.0f) % 13 + 9;
+    if (slot) *slot = (int8_t)v;
+    return v;
+}
+
+static float eh_height_noise(EhGrid *gr, const EndNoise *en, int x, int z)
+{   /* = getEndHeightNoise(en, x, z, 0) */
+    int hx = x / 2, hz = z / 2, oddx = x % 2, oddz = z % 2;
+    int64_t h = 64 * (x*(int64_t)x + z*(int64_t)z);
+    for (int j = -12; j <= 12; j++)
+        for (int i = -12; i <= 12; i++) {
+            int64_t rx = hx + i, rz = hz + j;
+            int v = eh_island(gr, en, rx, rz);
+            if (v) {
+                int64_t ax = (oddx - i * 2), az = (oddz - j * 2);
+                int64_t noise = (ax*ax + az*az) * v*v;
+                if (noise < h) h = noise;
+            }
+        }
+    float ret = 100 - sqrtf((float) h);
+    if (ret < -100) ret = -100;
+    if (ret > 80) ret = 80;
+    return ret;
+}
+
+/* A noise column of the End, computed lazily (18/10): every y first with
+ * sampleSurfaceNoiseBetween's early exit set just under the solid threshold
+ * (noise + depth > 0): far from any island (the void, most of a map) that
+ * stops after the first octave instead of 24. A y cut short this way is
+ * certainly ≤ 0 (not solid); its exact value is computed only if a
+ * neighbouring corner can be solid (the surface interpolation needs it).
+ * The surface found is then the very one of getSurfaceHeight. */
+static const double EH_UPPER[] = {
+       1.0,    1.0,    1.0,    1.0,    1.0,    1.0,    1.0,    1.0,
+       1.0,    1.0,    1.0,    1.0,    1.0,    1.0,    1.0, 63./64,
+    62./64, 61./64, 60./64, 59./64, 58./64, 57./64, 56./64, 55./64,
+    54./64, 53./64, 52./64, 51./64, 50./64, 49./64, 48./64, 47./64,
+    46./64 };
+static const double EH_LOWER[] = {
+      0.0,  0.0, 1./7, 2./7, 3./7, 4./7, 5./7, 6./7,
+      1.0,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0,
+      1.0,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0,
+      1.0,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0,  1.0,
+      1.0 };
+#define EH_Y0 2
+#define EH_Y1 18
+#define EH_YN (EH_Y1 - EH_Y0 + 1)
+typedef struct { int x, z; double depth; double v[EH_YN]; uint8_t ex[EH_YN]; } EhCol;
+
+static inline double eh_value(double noise, double depth, int y)
+{
+    double clamped = noise + depth;
+    clamped = lerp(EH_UPPER[y], -3000, clamped);
+    clamped = lerp(EH_LOWER[y], -30, clamped);
+    return clamped;
+}
+
+/* ex[k]: 0 = not sampled yet, 1 = certainly ≤ 0 (cut short), 2 = exact */
+static void eh_col_init(EhCol *c, const SurfaceNoise *sn, const EndNoise *en, EhGrid *gr,
+                        int x, int z)
+{
+    (void)sn;
+    c->x = x; c->z = z;
+    if (en->mc > MC_1_13) {
+        uint64_t rsq = (uint64_t) x * x + (uint64_t) z * z;
+        if ((int)rsq < 0) {
+            for (int k = 0; k < EH_YN; k++) { c->v[k] = nan(""); c->ex[k] = 2; }
+            return;
+        }
+    }
+    c->depth = eh_height_noise(gr, en, x, z) - 8.0f;
+    memset(c->ex, 0, sizeof(c->ex));
+}
+
+/* the noise level above which this y is solid: value > 0 ⇔
+ * l·(u·(n + depth) − 3000·(1 − u)) − 30·(1 − l) > 0 */
+static inline double eh_solid_noise(const EhCol *c, int y)
+{
+    double u = EH_UPPER[y], l = EH_LOWER[y];
+    return (30.0 * (1.0 - l) / l + 3000.0 * (1.0 - u)) / u - c->depth;
+}
+
+static inline void eh_sample(EhCol *c, const SurfaceNoise *sn, int k)
+{
+    int y = k + EH_Y0;
+    if (EH_LOWER[y] == 0.0) { c->v[k] = -30; c->ex[k] = 2; return; }
+    double lim = eh_solid_noise(c, y) - 4.0;   /* margin: perlin may exceed 1 a little */
+    if (lim < -128) lim = -128;
+    double noise = sampleSurfaceNoiseBetween(sn, c->x, y, c->z, lim, +128);
+    if (noise > lim) { c->v[k] = eh_value(noise, c->depth, y); c->ex[k] = 2; }
+    else             { c->v[k] = -1.0; c->ex[k] = 1; }            /* certainly ≤ 0 */
+}
+
+static inline double eh_get(EhCol *c, const SurfaceNoise *sn, int k)
+{
+    if (c->ex[k] == 0) eh_sample(c, sn, k);
+    if (c->ex[k] == 1) {
+        int y = k + EH_Y0;
+        c->v[k] = eh_value(sampleSurfaceNoiseBetween(sn, c->x, y, c->z, -128, +128), c->depth, y);
+        c->ex[k] = 2;
+    }
+    return c->v[k];
+}
+
+static inline int eh_maybe(EhCol *c, const SurfaceNoise *sn, int k)
+{   /* can be > 0 (NaN counts: the original loop decides then) */
+    if (c->ex[k] == 0) eh_sample(c, sn, k);
+    return c->ex[k] == 2 && !(c->v[k] <= 0);
+}
+
+/* = getSurfaceHeight(c00, c01, c10, c11, 2, 18, 4, dx, dz) */
+static int eh_surface(EhCol *c00, EhCol *c01, EhCol *c10, EhCol *c11,
+                      const SurfaceNoise *sn, double dx, double dz)
+{
+    for (int celly = EH_Y1 - 1; celly >= EH_Y0; celly--) {
+        int k = celly - EH_Y0;
+        if (!(eh_maybe(c00, sn, k) || eh_maybe(c01, sn, k) || eh_maybe(c10, sn, k) ||
+              eh_maybe(c11, sn, k) || eh_maybe(c00, sn, k + 1) || eh_maybe(c01, sn, k + 1) ||
+              eh_maybe(c10, sn, k + 1) || eh_maybe(c11, sn, k + 1)))
+            continue;                              /* 8 corners ≤ 0: nothing solid here */
+        double v000 = eh_get(c00, sn, k),     v001 = eh_get(c01, sn, k);
+        double v100 = eh_get(c10, sn, k),     v101 = eh_get(c11, sn, k);
+        double v010 = eh_get(c00, sn, k + 1), v011 = eh_get(c01, sn, k + 1);
+        double v110 = eh_get(c10, sn, k + 1), v111 = eh_get(c11, sn, k + 1);
+        for (int y = 3; y >= 0; y--) {
+            double dy = y / (double) 4;
+            double noise = lerp3(dy, dx, dz, v000, v010, v100, v110, v001, v011, v101, v111);
+            if (noise > 0)
+                return celly * 4 + y;
+        }
+    }
+    return 0;
+}
+
+/* = mapEndSurfaceHeight(y, en, sn, x, z, w, h, scale, 0), faster */
+static int eh_map_surface(float *y, const EndNoise *en, const SurfaceNoise *sn,
+                          int x, int z, int w, int h, int scale)
+{
+    if (scale != 1 && scale != 2 && scale != 4 && scale != 8) return 1;
+    double cellmid = scale > 1 ? scale / 16.0 : 0;
+    int cellsiz = 8 / scale;
+    int cx = floordiv(x, cellsiz), cz = floordiv(z, cellsiz);
+    int cw = floordiv(x + w - 1, cellsiz) - cx + 2;
+    int ch = floordiv(z + h - 1, cellsiz) - cz + 2;
+    EhGrid gr;
+    gr.x0 = (int64_t)(cx / 2) - 14; gr.z0 = (int64_t)(cz / 2) - 14;
+    gr.w = cw / 2 + 30; gr.h = ch / 2 + 30;
+    gr.v = (int8_t *)malloc((size_t)gr.w * gr.h);
+    if (gr.v) memset(gr.v, -1, (size_t)gr.w * gr.h);
+    EhCol *buf = (EhCol *)malloc(sizeof(EhCol) * cw * 2);
+    if (!buf) { free(gr.v); return 1; }
+    EhCol *row[2] = { buf, buf + cw };
+    for (int i = 0; i < cw; i++)
+        eh_col_init(&row[1][i], sn, en, &gr, cx + i, cz + 0);
+    for (int j = 0; j < h; j++) {
+        int cj = floordiv(z + j, cellsiz);
+        int dj = z + j - cj * cellsiz;
+        if (j == 0 || dj == 0) {
+            EhCol *tmp = row[0]; row[0] = row[1]; row[1] = tmp;
+            for (int i = 0; i < cw; i++)
+                eh_col_init(&row[1][i], sn, en, &gr, cx + i, cj + 1);
+        }
+        for (int i = 0; i < w; i++) {
+            int ci = floordiv(x + i, cellsiz);
+            int di = x + i - ci * cellsiz;
+            double dx = di / (double) cellsiz + cellmid;
+            double dz = dj / (double) cellsiz + cellmid;
+            int q = ci - cx;
+            y[j * w + i] = eh_surface(&row[0][q], &row[1][q], &row[0][q + 1], &row[1][q + 1],
+                                      sn, dx, dz);
+        }
+    }
+    free(buf); free(gr.v);
+    return 0;
+}
+
+/* 1:8 surface at single cells (the coarse map tiles), one EhGrid for all */
+static void eh_points8(float *out, const EndNoise *en, const SurfaceNoise *sn,
+                       int x, int z, int w, int h, int r)
+{
+    EhGrid gr = {0};
+    int64_t bx0 = (int64_t)x * r, bz0 = (int64_t)z * r;
+    int64_t span_w = (int64_t)w * r / 2 + 32, span_h = (int64_t)h * r / 2 + 32;
+    if (span_w * span_h <= (8 << 20)) {           /* ≤ 8 MB */
+        gr.x0 = bx0 / 2 - 16; gr.z0 = bz0 / 2 - 16; gr.w = (int)span_w + 2; gr.h = (int)span_h + 2;
+        gr.v = (int8_t *)malloc((size_t)gr.w * gr.h);
+        if (gr.v) memset(gr.v, -1, (size_t)gr.w * gr.h);
+    }
+    EhCol c[4];
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++) {
+            int px = (x + i) * r, pz = (z + j) * r;   /* 1:8 cell = noise cell */
+            /* mapEndSurfaceHeight at scale 8, w = h = 1: cellsiz 1, dx = dz = 0.5 */
+            eh_col_init(&c[0], sn, en, &gr, px,     pz);
+            eh_col_init(&c[1], sn, en, &gr, px,     pz + 1);
+            eh_col_init(&c[2], sn, en, &gr, px + 1, pz);
+            eh_col_init(&c[3], sn, en, &gr, px + 1, pz + 1);
+            out[j * w + i] = eh_surface(&c[0], &c[1], &c[2], &c[3], sn, 0.5, 0.5);
+        }
+    free(gr.v);
+}
+
+/* reference (tests): cubiomes' own mapEndSurfaceHeight + mapEndIslandHeight */
+EXPORT int ssa_end_height_ref(int mc, uint64_t seed, int32_t x, int32_t z,
+                              int32_t w, int32_t h, int32_t scale, float *out)
+{
+    EndNoise en; setEndSeed(&en, mc, seed);
+    SurfaceNoise sn; initSurfaceNoise(&sn, DIM_END, seed);
+    memset(out, 0, sizeof(float) * (size_t)w * h);
+    if (scale <= 8) {
+        if (mapEndSurfaceHeight(out, &en, &sn, x, z, w, h, scale, 0)) return 1;
+        mapEndIslandHeight(out, &en, seed, x, z, w, h, scale);
+        return 0;
+    }
+    int r = scale / 8;
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++) {
+            float y = 0; int px = (x + i) * r, pz = (z + j) * r;
+            mapEndSurfaceHeight(&y, &en, &sn, px, pz, 1, 1, 8, 0);
+            mapEndIslandHeight(&y, &en, seed, px, pz, 1, 1, 8);
+            out[j * w + i] = y;
+        }
+    return 0;
+}
+
+/* (18/10) The End surface height, as cubiomes-viewer's height view in the End
+ * (mapEndSurfaceHeight + mapEndIslandHeight; 0 = void). out[j*w+i] = the
+ * height at block ((x+i)*scale, (z+j)*scale). Scales 1, 2, 4, 8 in one go;
+ * coarser ones are sampled cell by cell at 1:8. */
+EXPORT int ssa_end_height_grid(int mc, uint64_t seed, int32_t x, int32_t z,
+                               int32_t w, int32_t h, int32_t scale, float *out)
+{
+    if (w <= 0 || h <= 0 || scale <= 0) return 1;
+    EndNoise en;
+    setEndSeed(&en, mc, seed);
+    SurfaceNoise sn;
+    initSurfaceNoise(&sn, DIM_END, seed);
+    memset(out, 0, sizeof(float) * (size_t)w * h);
+    if (scale == 1 || scale == 2 || scale == 4 || scale == 8) {
+        if (eh_map_surface(out, &en, &sn, x, z, w, h, scale))
+            mapEndSurfaceHeight(out, &en, &sn, x, z, w, h, scale, 0);
+        mapEndIslandHeight(out, &en, seed, x, z, w, h, scale);
+        return 0;
+    }
+    int r = scale / 8;
+    eh_points8(out, &en, &sn, x, z, w, h, r);
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++) {
+            int px = (x + i) * r, pz = (z + j) * r;          /* in 1:8 cells */
+            mapEndIslandHeight(&out[j * w + i], &en, seed, px, pz, 1, 1, 8);
+        }
+    return 0;
+}
+
+/* Bastion type at block (x, z): the start piece index (0 housing units,
+ * 1 hoglin stables, 2 treasure, 3 bridge), -1 before 1.16. */
+EXPORT int ssa_bastion_type(int mc, uint64_t seed, int32_t x, int32_t z)
+{
+    if (mc <= MC_1_15) return -1;
+    StructureVariant sv;
+    memset(&sv, 0, sizeof(sv));
+    getVariant(&sv, Bastion, mc, seed, x, z, -1);
+    return sv.start;
+}
 
 EXPORT int ssa_eval_single(const SsaCond *conds, int mc, int large, int64_t seed,
                            int32_t at_x, int32_t at_z, int32_t *out_xz,

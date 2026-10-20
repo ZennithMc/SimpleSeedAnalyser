@@ -543,10 +543,30 @@ def hexagons(rng, dark="#2a1702", light="#8a5410", edge="#ffc94a", size=46, fill
     return _vignette(img, 0.35)
 
 
+def image(rng, path="", stamp=0, light=False):
+    """(17/10) The user's own picture (custom image theme): scaled to cover the
+    window (hi-res), centred, no other effect — the panels' veil keeps the text
+    readable."""
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtGui import QImage
+    h, w = H, W
+    img = QImage(path)
+    if img.isNull():
+        return np.zeros((h, w, 3), np.float32) + 40.0
+    img = img.convertToFormat(QImage.Format.Format_RGB888)
+    sc = img.scaled(w, h, _Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    _Qt.TransformationMode.SmoothTransformation)
+    x0, y0 = max(0, (sc.width() - w) // 2), max(0, (sc.height() - h) // 2)
+    sc = sc.copy(x0, y0, w, h).convertToFormat(QImage.Format.Format_RGB888)
+    bpl = sc.bytesPerLine()
+    buf = np.frombuffer(sc.constBits(), np.uint8, count=bpl * sc.height()).reshape(sc.height(), bpl)
+    return buf[:, :w * 3].reshape(sc.height(), w, 3).astype(np.float32)
+
+
 GENERATORS = dict(marble=marble, aurora=aurora, nebula=nebula, stone=stone, glow=glow,
                   brushed=brushed, strata=strata, crystal=crystal, planks=planks,
                   synthwave=synthwave, blueprint=blueprint, paper=paper, circuit=circuit,
-                  hexagons=hexagons)
+                  hexagons=hexagons, image=image)
 
 
 def _key(spec):
@@ -566,7 +586,7 @@ def render(spec) -> np.ndarray:
           for k, v in spec.items() if k not in ("kind", "seed")}
     rng = np.random.default_rng(int(spec.get("seed", 7)))
     global W, H
-    hires = kind in ("crystal", "hexagons") or bool(spec.get("petals")) or bool(spec.get("leaves"))
+    hires = kind in ("crystal", "hexagons", "image") or bool(spec.get("petals")) or bool(spec.get("leaves"))
     saved = (W, H)
     if hires:
         W, H = HIRES
@@ -614,3 +634,21 @@ def backdrop_path(spec) -> str | None:
             traceback.print_exc()
             return None
     return path.replace("\\", "/")
+
+
+def cache_dir() -> str:
+    return os.path.join(tempfile.gettempdir(), "ssa_qt_assets", "backdrops")
+
+
+def clear_cache() -> int:
+    """(17/10, Settings) Removes the cached backdrop pictures SSA rendered
+    itself (they are re-rendered when needed). Returns how many."""
+    n = 0
+    d = cache_dir()
+    for f in (os.listdir(d) if os.path.isdir(d) else []):
+        if f.endswith(".png"):
+            try:
+                os.remove(os.path.join(d, f)); n += 1
+            except OSError:
+                pass
+    return n

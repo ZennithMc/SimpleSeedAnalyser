@@ -48,11 +48,12 @@ SPEC = {
     "stronghold":       ("Stronghold",        "#2f8f62"),
     "spawn":            ("Spawn",             "#e5484d"),
     "origin":           ("Origin (0, 0)",     "#e8ecf3"),
-    "fortress":         ("Nether fortress",   "#8a2a2a"),
-    "bastion":          ("Bastion remnant",   "#3b3940"),
+    "fortress":         ("Nether fortress",   "#c4553f"),
+    "bastion":          ("Bastion remnant",   "#c9a02e"),
     "end_city":         ("End city",          "#b58ccf"),
     "ruined_portal_nether": ("Ruined portal (Nether)", "#7a3fe0"),
-    "end_gateway":      ("End gateway",       "#6fd3c9"),
+    "end_gateway":      ("End gateway",       "#3a3548"),
+    "end_city_ship":    ("End city with a ship", "#c79be0"),
     "mineshaft":        ("Mineshaft",         "#8b6a3c"),
     "desert_well":      ("Desert well",       "#d6bd78"),
     "dungeon":          ("Dungeon (1.16)",    "#5f6b75"),
@@ -61,6 +62,8 @@ SPEC = {
     "lava_lake_surface": ("Surface lava lake", "#e88a3a"),
     # ── non-structure conditions ──
     "biome_filter":     ("Overworld at scale", "#58a64a"),
+    "nether_biomes":    ("Nether at scale",    "#b8342c"),
+    "end_biomes":       ("End at scale",       "#9b86d6"),
     "biome_sample":     ("Biome samples",      "#58a64a"),
     "biome_center":     ("Locate biome center", "#58a64a"),
     "climate_minmax":   ("Locate climate extreme", "#e0604a"),
@@ -219,6 +222,17 @@ def _glyph(k: str, p: QPainter, ink: QColor, bg: QColor):
         p.drawRect(QRectF(15.4, 10.4, 3, 11))            # right post (top broken off)
         p.drawRect(QRectF(5.6, 4.6, 6.4, 3))             # top (half)
         p.drawRect(QRectF(16.6, 4.4, 2.4, 2.4))          # loose block
+    elif k == "ruined_portal_nether":                # the same ruin, on netherrack + magma
+        p.setBrush(QColor("#ffb37a"))
+        p.drawRect(QRectF(8.6, 7.6, 6.8, 10.8))          # portal glow
+        p.setBrush(QColor("#1d1230"))                    # obsidian
+        p.drawRect(QRectF(5.6, 4.6, 3, 16.8))
+        p.drawRect(QRectF(15.4, 10.4, 3, 11))
+        p.drawRect(QRectF(5.6, 4.6, 6.4, 3))
+        p.setBrush(QColor("#ff6a1f"))                    # magma floor
+        p.drawRect(QRectF(4.4, 18.4, 15.2, 3))
+        p.setBrush(QColor("#1d1230"))
+        p.drawRect(QRectF(16.6, 4.4, 2.4, 2.4))          # loose block
     elif k == "ancient_city":                        # the great arch
         path = QPainterPath()
         path.moveTo(4.5, 19); path.lineTo(4.5, 10); path.quadTo(4.5, 4.5, 12, 4.5)
@@ -282,13 +296,52 @@ def _glyph(k: str, p: QPainter, ink: QColor, bg: QColor):
         for x in (5, 9.1, 13.2, 16.6):
             p.drawRect(QRectF(x, 7, 2.4, 3.2))
         cut(lambda: p.drawPie(QRectF(9.6, 13, 4.8, 9), 0, 180 * 16))
-    elif k == "bastion":                             # blackstone keep with gold
-        p.drawPolygon(_poly((5, 18.5), (5, 9), (8, 6), (16, 6), (19, 9), (19, 18.5)))
-        p.setBrush(QColor("#f2c43b")); p.drawRect(QRectF(10, 10.5, 4, 4))
+    elif k == "bastion":                             # polished blackstone bricks block
+        # (18/10) the block cubiomes-viewer and the game use for the bastion:
+        # dark blackstone, a long brick on top, two below, on a gold badge
+        p.setBrush(QColor("#141118")); p.drawRect(QRectF(4.2, 4.2, 15.6, 15.6))
+        p.setBrush(QColor("#4b4554")); p.drawRect(QRectF(5.4, 5.4, 13.2, 13.2))
+        p.setBrush(QColor("#6a6375"))                    # lit edges / speckles
+        p.drawRect(QRectF(5.4, 5.4, 13.2, 1.1))
+        p.drawRect(QRectF(5.4, 12.6, 5.6, 0.9)); p.drawRect(QRectF(12.6, 12.6, 6.0, 0.9))
+        for x, y in ((8.2, 8.0), (14.6, 9.2), (7.0, 15.6), (15.4, 16.2)):
+            p.drawRect(QRectF(x, y, 1.1, 1.1))
+        p.setBrush(QColor("#2a2530"))                    # dark speckles
+        for x, y in ((11.0, 9.6), (6.6, 10.2), (13.6, 15.0), (9.0, 17.0)):
+            p.drawRect(QRectF(x, y, 1.1, 1.1))
+        p.setBrush(QColor("#141118"))                    # mortar
+        p.drawRect(QRectF(5.4, 11.5, 13.2, 1.1)); p.drawRect(QRectF(11.4, 11.5, 1.1, 7.1))
+        p.setBrush(fill)
     elif k == "end_city":                            # stacked tower
         for w, y, h in ((10, 13, 5.5), (7.5, 8.5, 4.6), (5, 4.8, 3.8)):
             p.drawRect(QRectF(12 - w / 2, y, w, h))
             p.drawRect(QRectF(12 - w / 2 - 1.2, y, w + 2.4, 1.3))
+    elif k == "end_city_ship":                       # the tower + the ship at its side
+        for w, y, h in ((7.6, 13, 5.5), (5.6, 8.5, 4.6), (3.8, 4.8, 3.8)):
+            p.drawRect(QRectF(9 - w / 2, y, w, h))
+            p.drawRect(QRectF(9 - w / 2 - 1, y, w + 2, 1.3))
+        p.drawPolygon(_poly((13.6, 13.4), (21, 13.4), (19.4, 17.2), (15, 17.2)))   # hull
+        p.drawRect(QRectF(16.8, 7.6, 1.3, 5.9))                                   # mast
+        p.drawPolygon(_poly((18.1, 8), (20.8, 10.2), (18.1, 12.2)))               # sail
+    elif k == "end_gateway":                         # bedrock cross around the portal
+        # (18/10) as in the game / cubiomes-viewer: the portal block between two
+        # bedrock crosses (drawn on cubiomes-viewer's 20-px grid, shifted to centre)
+        def R(x, y, w, h):
+            p.drawRect(QRectF(2 + x, 3.5 + y, w, h))
+        p.setBrush(QColor("#0d0d10"))                    # outline
+        R(7, 0, 6, 17); R(4, 3, 12, 5); R(4, 9, 12, 5)
+        p.setBrush(QColor("#a7a7a7"))                    # bedrock
+        R(8, 1, 4, 15); R(5, 4, 10, 3); R(5, 10, 10, 3)
+        p.setBrush(QColor("#5c5c5c"))
+        for x, y in ((9, 2), (6, 5), (13, 4), (10, 12), (6, 11), (13, 11.5), (9.5, 14.5)):
+            R(x, y, 1, 1)
+        p.setBrush(QColor("#d2d2d2"))
+        for x, y in ((10.5, 1.2), (8, 4.2), (12, 5.6), (8.2, 11), (11, 13.6)):
+            R(x, y, 1, 1)
+        p.setBrush(QColor("#0b0a14")); R(8, 6, 4, 5)     # the portal
+        p.setBrush(QColor("#c78bff")); R(8.8, 7.0, 0.9, 0.9); R(10.6, 8.6, 0.9, 0.9)
+        p.setBrush(QColor("#7fe0d2")); R(9.4, 9.6, 0.8, 0.8)
+        p.setBrush(fill)
     elif k == "mineshaft":                           # pickaxe
         stroke(2.2)
         path = QPainterPath(); path.moveTo(5, 9); path.quadTo(12, 3.5, 19, 9); p.drawPath(path)
@@ -314,13 +367,21 @@ def _glyph(k: str, p: QPainter, ink: QColor, bg: QColor):
         p.drawPolygon(_poly((5, 8.5), (12, 4.5), (19, 8.5)))
         p.drawRect(QRectF(7, 8.4, 1.4, 4.8)); p.drawRect(QRectF(15.6, 8.4, 1.4, 4.8))
         cut(lambda: p.drawRect(QRectF(8, 14.4, 8, 1.4)))
-    elif k in ("biome_filter", "biome_sample", "biome_center"):
+    elif k in ("biome_filter", "biome_sample", "biome_center", "nether_biomes", "end_biomes"):
         # a patch of map: four biomes, then samples / a target on top
         tile = QPainterPath(); tile.addRoundedRect(QRectF(4, 4, 16, 16), 3, 3)
         p.save(); p.setClipPath(tile)
-        for (x, y, c) in ((4, 4, "#58a64a"), (12, 4, "#2f6fb0"), (4, 12, "#d9c77e"), (12, 12, "#2e7d32")):
+        quad = {"nether_biomes": ("#7a2222", "#4d3a2c", "#b0302e", "#167e86"),   # wastes, soul sand,
+                "end_biomes": ("#2b2140", "#d8d79c", "#4b3c6e", "#bdbb83")}.get(  # crimson, warped
+            k, ("#58a64a", "#2f6fb0", "#d9c77e", "#2e7d32"))
+        for (x, y), c in zip(((4, 4), (12, 4), (4, 12), (12, 12)), quad):
             p.setBrush(QColor(c)); p.drawRect(QRectF(x, y, 8, 8))
-        p.setBrush(QColor("#3f86c8")); p.drawEllipse(QRectF(9.5, 3, 7, 7))
+        if k == "nether_biomes":
+            p.setBrush(QColor("#ff8a2a")); p.drawEllipse(QRectF(9.5, 3, 7, 7))   # lava
+        elif k == "end_biomes":
+            p.setBrush(QColor("#e9e6b0")); p.drawEllipse(QRectF(8, 8, 8, 8))     # island
+        else:
+            p.setBrush(QColor("#3f86c8")); p.drawEllipse(QRectF(9.5, 3, 7, 7))
         p.restore()
         if k == "biome_sample":
             p.setBrush(QColor("#ffffff"))

@@ -18,7 +18,7 @@ import colorsys
 import math
 import time
 
-from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QElapsedTimer, QObject, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QInputDialog, QLabel, QMenu, QToolButton, QVBoxLayout, QWidget
 
@@ -31,7 +31,20 @@ from .map_engine import CLIMATE, SCALES, TILE, MapEngine, octave_arrays
 
 MIN_BPP, MAX_BPP = 1 / 32, 1024.0      # blocks per screen pixel
 STRUCT_MAX_BPP = 48.0                  # structures hidden when zoomed out further
+
+
+def _struct_max():
+    """STRUCT_MAX_BPP, or the Settings value (17/10)."""
+    try:
+        from . import prefs
+        return max(4.0, min(256.0, float(prefs.get("struct_max_bpp"))))
+    except Exception:
+        return STRUCT_MAX_BPP
 BOX_MAX_BPP = 4.0                      # real footprints of the structures from this zoom
+CV_PIECE_TYPES = ("end_city", "fortress", "bastion")   # (18/10) cubiomes-viewer red boxes
+CV_BB_MAX_BPP = 2.0                    # cubiomes-viewer: blocks2pix > 0.5
+END_SHIP_PIECE = 12                    # cubiomes finders.h End city piece enum (END_SHIP)
+FORTRESS_BRIDGE_SPAWNER = 5            # cubiomes finders.h piece enum (BRIDGE_SPAWNER)
 PIECES_MAX_BPP = 2.0                   # stronghold pieces from this zoom (03/10)
 ARROW_UNIFORM = {"White": "#f2f2f2", "Black": "#111111", "Cyan": "#33e0ff", "Yellow": "#ffe14d"}
 
@@ -54,6 +67,11 @@ def _default_noise_palette():
     return random.choice(pool) if pool else "Aurora"
 
 
+class _SelBus(QObject):
+    """(18/10) details of the selected structure, back from the helper process"""
+    done = Signal(object, object)
+
+
 class MapView(QWidget):
     hover = Signal(int, int, str)            # block x, block z, biome name
     status = Signal(str)
@@ -64,6 +82,7 @@ class MapView(QWidget):
     f116Checked = Signal(object, object)     # (10/10) [(Feat, ok, detail)] | None, error
 
     MEASURE = True                           # the ruler tool exists on this map
+    DIMS_ALLOWED = True                      # (18/10) Nether / End may be shown here
     STRUCT_LEGEND = True                     # the structure legend may be drawn
 
     def __init__(self, world, parent=None, link=None):
@@ -78,11 +97,15 @@ class MapView(QWidget):
         self._style = {"icon_px": 22}            # shared with the linked maps
         self.visible = {"__spawn": True, "__strongholds": True, "__origin": True,
                         "village": True, "zombie_village": True, "pillager_outpost": True, "desert_pyramid": True,
-                        "jungle_temple": True, "swamp_hut": True, "igloo": True, "mansion": True}
+                        "jungle_temple": True, "swamp_hut": True, "igloo": True, "mansion": True,
+                        # (18/10) Nether / End
+                        "fortress": True, "bastion": True, "ruined_portal_nether": True,
+                        "end_city": True, "end_gateway": True}
         # noise overlay state
         self.ov = dict(noise=None, octave=None, caves=True, palette=_default_noise_palette(), opacity=1.0,
                        arrows=False, arrow_mode="Gradient", arrow_color="Direction",
-                       arrow_density=1.0, arrow_length=1.0, arrow_y=0.0)
+                       arrow_density=1.0, arrow_length=1.0, arrow_y=0.0,
+                       dim=0)                       # (18/10) 0 overworld, -1 Nether, 1 End
         self._drag = None
         self._vel = (0.0, 0.0)
         self._last_move = None
@@ -138,6 +161,7 @@ class MapView(QWidget):
         self._hover_timer = QTimer(self, singleShot=True, interval=30, timeout=self._do_readout)
         self._hover_pos = None
         self._build_overlay()
+        self._sync_dim_bar()
         theme.signals.changed.connect(self._on_theme)
 
     @property
@@ -149,6 +173,73 @@ class MapView(QWidget):
         self._style["icon_px"] = int(v)
         if self.link is not None:
             self.link.repaint_all()
+
+    # ── dimension (18/10) ───────────────────────────────────────────────────
+    DIMS = {"Overworld": 0, "Nether": -1, "End": 1}
+
+    @property
+    def dim(self) -> int:
+        d = self.ov.get("dim", 0)
+        return d if d in (-1, 1) else 0
+
+    def set_dim(self, d):
+        """Show another dimension (shared by the linked maps). The Nether and
+        the End are shown at 1:8 of the Overworld: Overworld → Nether / End
+        divides the coordinates by 8, back to the Overworld multiplies them."""
+        d = d if d in (-1, 1) else 0
+        old = self.dim
+        if d == old:
+            return
+        self._stop_motion()
+        if getattr(self, "selected", None) is not None:
+            self.select_structure(None)
+        # (18/10) the Nether AND the End at 1:8 of the Overworld (Édouard): going
+        # there divides by 8, coming back multiplies — Nether ↔ End keeps the
+        # numbers (before: the End kept the Nether's ÷ 8 and the Overworld got it)
+        scale = {0: 1.0, -1: 0.125, 1: 0.125}
+        f = scale[d] / scale[old]
+        if f != 1.0:
+            self.cx, self.cz = self.cx * f, self.cz * f
+        self.ov["dim"] = d
+        self._arrows = None
+        if self.link is not None:
+            for v in self.link.views:
+                if v is not self:
+                    v._stop_motion()
+                    v.cx, v.cz = self.cx, self.cz
+                    v._sync_dim_bar()
+        self._sync_dim_bar()
+        self._view_changed()
+        self.overlayChanged.emit()
+        if self.link is not None:
+            self.link.overlay_changed(self)
+        if getattr(self, "_hover_pos", None) is not None and self._readout.isVisible():
+            self._hover_timer.start()
+
+    def set_dims_allowed(self, on):
+        """A page whose map is the overworld only (Stronghold, Draw): no
+        dimension switch, and the shared view goes back to the overworld when
+        that page is shown."""
+        self.DIMS_ALLOWED = bool(on)
+        bar = getattr(self, "_dim_bar", None)
+        if bar is not None:
+            bar.setVisible(self.DIMS_ALLOWED)
+
+    def _sync_dim_bar(self):
+        bar = getattr(self, "_dim_bar", None)
+        if bar is not None:
+            bar.setVisible(self.DIMS_ALLOWED)
+            name = next(k for k, v in self.DIMS.items() if v == self.dim)
+            bar.blockSignals(True); bar.set_value(name); bar.blockSignals(False)
+
+    def tp_command(self, x, z, y=None):
+        """/tp to (x, z) in the dimension shown (execute in … for the Nether / End)."""
+        yy = "~" if y is None else str(y)
+        if self.dim == -1:
+            return f"/execute in minecraft:the_nether run tp @s {x} {yy} {z}"
+        if self.dim == 1:
+            return f"/execute in minecraft:the_end run tp @s {x} {yy} {z}"
+        return f"/tp @s {x} {yy} {z}"
 
     # ── floating controls ───────────────────────────────────────────────────
     def _tool(self, name, tip, fn):
@@ -179,12 +270,29 @@ class MapView(QWidget):
             lay.addWidget(self._ruler)
         box.move(12, 12); box.adjustSize()
         self._controls = box
+        # (18/10) Overworld | Nether | End, at the top, right of the tools
+        from .widgets import Segmented
+        self._dim_bar = Segmented(list(self.DIMS), "Overworld", self)
+        self._dim_bar.setObjectName("DimBar")
+        self._dim_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._style_dim_bar()
+        self._dim_bar.setToolTip("Dimension shown  (Ctrl+1 Overworld · Ctrl+2 Nether · Ctrl+3 End)\n"
+                                 "Overworld → Nether / End: coordinates ÷ 8; back to the Overworld: × 8.")
+        self._dim_bar.changed.connect(lambda n: self.set_dim(self.DIMS[n]))
+        self._dim_bar.adjustSize()
+        self._dim_bar.move(56, 12)
         self._readout = QLabel(self)
         self._readout.setObjectName("MapReadout")
         self._readout.setFont(theme.mono_font(9))
         self._readout.hide()
 
+    def _style_dim_bar(self):
+        bar = getattr(self, "_dim_bar", None)
+        if bar is not None:           # opaque: readable over a busy map
+            bar.setStyleSheet(f"QWidget#DimBar {{ background: {theme.BG1}; border-radius: 7px; }}")
+
     def _on_theme(self):
+        self._style_dim_bar()
         icons.refresh(self)
         self.update()
 
@@ -194,6 +302,8 @@ class MapView(QWidget):
 
     def showEvent(self, e):
         super().showEvent(e)
+        if not self.DIMS_ALLOWED and self.dim != 0:     # (18/10) overworld-only page
+            self.set_dim(0)
         # a linked map may have moved / changed layers while this one was hidden
         if self.ov["arrows"] and self.ov["noise"] in CLIMATE and self._arrows is None:
             self._arrow_timer.start()
@@ -220,8 +330,10 @@ class MapView(QWidget):
 
     def center_on_spawn(self):
         sp = self.engine.landmarks.get("spawn")
-        if sp:
-            self.center_on(*sp)
+        if self.dim == 1:                       # the End: the main island
+            self.center_on(0, 0)
+        elif sp:
+            self.center_on(*((sp[0] // 8, sp[1] // 8) if self.dim == -1 else sp))
 
     def _zoom_to(self, nb, anchor):
         wx, wz = self.to_world(anchor.x(), anchor.y())
@@ -304,7 +416,7 @@ class MapView(QWidget):
 
     # ── painting ────────────────────────────────────────────────────────────
     def _tile_scale(self, noise=False):
-        mn = self.engine.min_scale()
+        mn = self.engine.min_scale(0 if noise else self.dim)
         if noise and mn > 1 and self.ov.get("noise") in ("Exact Y", "Approx height"):
             mn = 1                         # (10/10 bis) 1:1 tiles: Exact Y 1.16 per block,
                                            # Approx height interpolated between its 1:4 cells
@@ -327,7 +439,8 @@ class MapView(QWidget):
         # the biome tiles under it — beta tester, 28/09), and under an opaque
         # one the biomes are not computed at all (only cached ones are drawn)
         seed_view = self.engine.seed_view
-        noise_on = bool(self.ov["noise"]) and not seed_view
+        noise_on = bool(self.ov["noise"]) and not seed_view and (
+            self.dim == 0 or self._end_height())     # overworld noises; (18/10) End height
         opaque = noise_on and self.ov["opacity"] >= 0.999
         if seed_view:                     # structure-seed view: no biomes (Alt+S)
             p.fillRect(self.rect(), QColor("#161c26" if not theme.IS_LIGHT else "#dfe3ea"))
@@ -344,7 +457,9 @@ class MapView(QWidget):
         self._paint_grid(p)
         self._paint_origin(p)
         self._paint_arrows(p)
+        self._icon_hits = []
         self._paint_structures(p)
+        self._paint_selected(p)
         self._paint_zones(p)
         self._paint_pin(p)
         self._paint_measures(p)
@@ -374,11 +489,19 @@ class MapView(QWidget):
         tiles.sort(key=lambda t: (t[0] + 0.5 - ctx) ** 2 + (t[1] + 0.5 - ctz) ** 2)
         return tiles, span
 
+    def _end_height(self):
+        """(18/10) « Approx height » in the End = the island surface, like
+        cubiomes-viewer's height view there (the climate noises: overworld)."""
+        return self.dim == 1 and self.ov.get("noise") == "Approx height"
+
     def _get(self, noise, s, tx, tz, prio, fetch=True):
         if noise:
+            if self._end_height():
+                spec = ("End height", None, False)
+                return self.engine.noise_tile(spec, self.ov["palette"], s, tx, tz, prio, fetch)
             spec = (self.ov["noise"], self.ov["octave"], self.ov["caves"])
             return self.engine.noise_tile(spec, self.ov["palette"], s, tx, tz, prio, fetch)
-        return self.engine.tile(s, tx, tz, prio, fetch)
+        return self.engine.tile(s, tx, tz, prio, fetch, dim=self.dim)
 
     def _paint_layer(self, p: QPainter, noise: bool, fetch=True, boost=0):
         """fetch=False: draw what is cached, request nothing (biomes under an
@@ -405,7 +528,7 @@ class MapView(QWidget):
     def _paint_fallback(self, p, noise, s, tx, tz, target):
         """Stretch a coarser cached tile (or finer ones) over a tile still generating."""
         if not noise:                     # quick coarse version of this very tile
-            pm = self.engine.preview(s, tx, tz)
+            pm = self.engine.preview(s, tx, tz, self.dim)
             if pm is not None:
                 p.drawPixmap(target, pm, QRectF(pm.rect()))
                 return
@@ -524,7 +647,7 @@ class MapView(QWidget):
             self._icon_cache[k] = pm
         return pm
 
-    def _draw_icon(self, p, key, x, z):
+    def _draw_icon(self, p, key, x, z, ref=None):
         pm = self._icon(key)
         if pm is None:
             return
@@ -534,6 +657,10 @@ class MapView(QWidget):
             sy -= h * 0.85
         if -h <= sx <= self.width() + h and -h <= sy <= self.height() + h:
             p.drawPixmap(int(sx - h), int(sy - h), pm)
+            # (18/10) clickable: (screen centre, key, structure position)
+            rx, rz = ref if ref is not None else (x, z)
+            self.__dict__.setdefault("_icon_hits", []).append(
+                (sx, sy, key, int(math.floor(rx)), int(math.floor(rz))))
 
     # ── (10/10) 1.16 dungeons / lava lakes ─────────────────────────────────
     # (10/10 bis) the real ones (exact terrain), drawn with their icon like the
@@ -758,6 +885,59 @@ class MapView(QWidget):
                 best, bd = f, d
         return best
 
+    def _cv_pieces(self, key, x, z):
+        """(18/10) Pieces (End city, fortress) or the variant box (bastion) of
+        the structure at (x, z), cached per world."""
+        cache = self.__dict__.setdefault("_cvp_cache", {})
+        ck = (self.world.key, key, x, z)
+        got = cache.get(ck)
+        if got is None:
+            lib = self._ui_lib(cw.STRUCTURE_DIM.get(key, 0))
+            if key == "bastion":
+                got = ("bb", lib.variant_bb(key, x, z))
+            else:
+                got = ("pieces", lib.struct_pieces(key, x, z))
+            if len(cache) > 4000:
+                cache.clear()
+            cache[ck] = got
+        return got
+
+    def _draw_cv_pieces(self, p: QPainter, key, x, z):
+        """(18/10) As cubiomes-viewer with its bounding boxes on: the variant box
+        in red (QColor(192, 0, 0, 160), the icon then at its centre), every
+        piece outlined (QColor(192, 0, 0, 128), 1 px) and the fortress
+        spawners. Returns the icon position (block) or None."""
+        kind, data = self._cv_pieces(key, x, z)
+        if not data:
+            return None
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        k = 1.0 / self.bpp                                  # pixels per block
+        centre = None
+        if kind == "bb":
+            bx0, bz0, bx1, bz1 = data
+            sx0, sy0 = self.to_screen(bx0, bz0)
+            p.setPen(QPen(QColor(192, 0, 0, 160), 1))
+            p.drawRect(QRectF(int(sx0), int(sy0), int((bx1 - bx0 + 1) * k), int((bz1 - bz0 + 1) * k)))
+            centre = ((bx0 + bx1 + 1) / 2.0, (bz0 + bz1 + 1) / 2.0)
+        else:
+            pen = QPen(QColor(192, 0, 0, 128)); pen.setCosmetic(True); pen.setWidth(0)
+            p.setPen(pen)
+            for (a0, c0, a1, c1, typ, rot, _y0, _y1) in data:
+                px, py = self.to_screen(a0, c0)
+                dx, dy = (a1 - a0 + 1) * k, (c1 - c0 + 1) * k
+                p.drawRect(QRectF(int(px), int(py), int(dx), int(dy)))
+                if key == "fortress" and typ == FORTRESS_BRIDGE_SPAWNER:
+                    off = ((0, -1), (1, 0), (0, 1), (-1, 0))[rot & 3]
+                    ox = off[0] - (1 if a0 < 0 else 0)
+                    oz = off[1] - (1 if c0 < 0 else 0)
+                    r = QRectF(int(px), int(py), k, k)
+                    r.translate((dx - k) / 2 + k * ox, (dy - k) / 2 + k * oz)
+                    p.drawRect(r)
+        p.restore()
+        return centre
+
     def _draw_footprint(self, p: QPainter, key, x, z):
         """Real size of a structure: solid = exact, dashed = approximate."""
         from .struct_boxes import footprint
@@ -781,11 +961,21 @@ class MapView(QWidget):
         p.drawRect(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0))
         p.restore()
 
-    def _draw_pieces(self, p: QPainter, pieces):
-        """Every piece of a stronghold (like cubiomes-viewer), coloured by its
-        height; the portal room stands out (green, thick outline)."""
+    # (18/10) the special piece of each kind: stronghold portal room, End ship
+    _PIECE_KINDS = {
+        "stronghold": dict(special=None, col=(63, 214, 160), label="Portal Y"),
+        "end_city": dict(special=END_SHIP_PIECE, col=(206, 150, 255), label="Ship Y"),
+    }
+
+    def _draw_pieces(self, p: QPainter, pieces, kind="stronghold"):
+        """Every piece of a stronghold / an End city (18/10) (like
+        cubiomes-viewer), coloured by its height; the portal room / the ship
+        stands out (thick outline)."""
         from .struct_boxes import grad_rgb
         import stronghold_eyes as se
+        spec = self._PIECE_KINDS[kind]
+        special = se.PORTAL_ROOM if kind == "stronghold" else spec["special"]
+        scol = QColor(*spec["col"])
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         ylo = min(q[4] for q in pieces); yhi = max(q[4] for q in pieces)
@@ -798,13 +988,15 @@ class MapView(QWidget):
         if d < getattr(self, "_legend_d", 1e18):
             self._legend_d = d
             self._legend_range = (ylo, yhi)
-            pr = next((q for q in pieces if q[6] == se.PORTAL_ROOM), None)
-            self._legend_portal = (pr[4], pr[1] + 3) if pr else None
+            self._legend_kind = kind
+            pr = next((q for q in pieces if q[6] == special), None)
+            self._legend_portal = ((pr[4], pr[1] + 3) if kind == "stronghold" else (pr[4], pr[1])) \
+                if pr else None
         top_piece = max(pieces, key=lambda q: q[4])
         portal = None
         for pc in sorted(pieces, key=lambda q: q[4]):          # higher pieces on top
             x0, y0, z0, x1, y1, z1, t = pc
-            if t == se.PORTAL_ROOM:
+            if t == special:
                 portal = pc
                 continue
             sx0, sy0 = self.to_screen(x0, z0)
@@ -819,7 +1011,8 @@ class MapView(QWidget):
             sx1, sy1 = self.to_screen(x1 + 1, z1 + 1)
             rect = QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0)
             p.setPen(QPen(QColor(255, 255, 255, 240), 3))
-            p.setBrush(QColor(63, 214, 160, 150))
+            fb_ = QColor(scol); fb_.setAlpha(150)
+            p.setBrush(fb_)
             p.drawRect(rect)
             r, g, b = height_rgb(y1)
             p.setPen(QPen(QColor(r, g, b), 1.5))
@@ -832,12 +1025,20 @@ class MapView(QWidget):
         if portal is not None:
             x0, y0, z0, x1, y1, z1, t = portal
             same = top_piece is portal or y1 == ty1 and (tx0, tz0) == (x0, z0)
-            txt = f"Portal Y {y1}" + (" = max" if same else "")
-            self._chips.append((self._srect(x0, z0, x1, z1), txt, QColor(63, 214, 160)))
+            txt = f"{spec['label']} {y1}" + (" = max" if same else "")
+            self._chips.append((self._srect(x0, z0, x1, z1), txt, QColor(scol)))
         if portal is None or not (top_piece is portal):
             r, g, b = height_rgb(ty1)
             self._chips.append((self._srect(tx0, tz0, tx1, tz1), f"max Y {ty1}", QColor(r, g, b)))
         p.restore()
+
+    def _paint_chips(self, p: QPainter):
+        if self._chips:
+            p.save()
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            for (rect, txt, col) in self._chips:
+                self._chip(p, rect, txt, col)
+            p.restore()
 
     def _srect(self, x0, z0, x1, z1):
         sx0, sy0 = self.to_screen(x0, z0)
@@ -874,7 +1075,7 @@ class MapView(QWidget):
         x, y = 14.0, self.height() - 80.0
         bg = QColor(theme.BG1 or "#1b1f27"); bg.setAlpha(225)
         p.setPen(QPen(QColor(theme.LINE2), 1)); p.setBrush(bg)
-        p.drawRoundedRect(QRectF(x - 8, y - 20, w + 16, 82), 8, 8)
+        p.drawRoundedRect(QRectF(x - 8, y - 20, w + 46, 82), 8, 8)
         g = QLinearGradient(x, 0, x + w, 0)
         for k in range(11):
             g.setColorAt(k / 10, QColor(*grad_rgb(k / 10)))
@@ -882,17 +1083,21 @@ class MapView(QWidget):
         p.drawRoundedRect(QRectF(x, y, w, h), 3, 3)
         f = QFont(theme.ui_font(7.5)); p.setFont(f)
         p.setPen(QColor(theme.TEXT2 or theme.TEXT))
-        p.drawText(QPointF(x, y - 6), "Stronghold pieces: top Y, lowest → highest")
+        kind = getattr(self, "_legend_kind", "stronghold")
+        name = "End city" if kind == "end_city" else "Stronghold"
+        p.drawText(QPointF(x, y - 6), f"{name} pieces: top Y, lowest → highest")
         p.drawText(QRectF(x, y + h + 1, 60, 12), Qt.AlignmentFlag.AlignLeft, f"Y {lo}")
         p.drawText(QRectF(x + w - 60, y + h + 1, 60, 12), Qt.AlignmentFlag.AlignRight, f"Y {hi}")
         # the two heights that matter (stronghold nearest the centre)
         fb = QFont(theme.ui_font(8.5)); fb.setBold(True); p.setFont(fb)
         p.setPen(QColor(*grad_rgb(1.0)))
-        p.drawText(QPointF(x, y + h + 30), f"▲ Stronghold max Y {hi}")
+        p.drawText(QPointF(x, y + h + 30), f"▲ {name} max Y {hi}")
         if portal is not None:
-            p.setPen(QColor(63, 214, 160))
+            p.setPen(QColor(*self._PIECE_KINDS[kind]["col"]))
             p.drawText(QPointF(x, y + h + 46),
-                       f"▣ Portal room top Y {portal[0]}   ·   frames Y {portal[1]}")
+                       f"▣ Portal room top Y {portal[0]}   ·   frames Y {portal[1]}"
+                       if kind == "stronghold" else
+                       f"▣ Ship: Y {portal[1]} → {portal[0]}  (elytra on board)")
         p.restore()
 
     def _paint_seed_view_tag(self, p: QPainter):
@@ -918,14 +1123,15 @@ class MapView(QWidget):
         self._chips = []                      # stronghold labels, drawn over the icons
         self._pieces_shown = False
         self._legend_d = 1e18
-        if self.bpp <= STRUCT_MAX_BPP:
+        if self.bpp <= _struct_max():
             B = self.engine.STRUCT_BLOCK
             fetch = not self._anim.isActive()
             # abandoned villages follow the Village switch (no switch of their
             # own, 01/10); they keep their own icon
             show_z = bool(self.visible.get("village"))
+            dim_types = cw.DIM_STRUCTURE_TYPES[self.dim]          # (18/10) this dimension's
             for key, on in self.visible.items():
-                if not on or key.startswith("__") or key not in cw.STRUCTURE_TYPES:
+                if not on or key.startswith("__") or key not in dim_types:
                     continue
                 if not self.world.structure_available(key):
                     continue
@@ -934,9 +1140,12 @@ class MapView(QWidget):
                         pts = self.engine.structures(key, bx, bz, fetch) or ()
                         zset = self.engine.abandoned(bx, bz) if key == "village" and pts else ()
                         bset = self.engine.with_basement(bx, bz) if key == "igloo" and pts else ()
+                        sset = self.engine.with_ship(bx, bz) if key == "end_city" and pts else ()
                         for (x, z) in pts:
                             k = key
-                            if zset and (x, z) in zset:
+                            if sset and (x, z) in sset:
+                                k = "end_city_ship"
+                            elif zset and (x, z) in zset:
                                 k = "zombie_village"
                                 if not show_z:
                                     continue
@@ -946,9 +1155,29 @@ class MapView(QWidget):
                                 k = "igloo_basement"
                             if x0 <= x <= x1 and z0 <= z <= z1:
                                 counts[k] = counts.get(k, 0) + 1
-                            if self.bpp <= BOX_MAX_BPP:
+                            ix, iz = x, z
+                            if key == "end_city":
+                                # (18/10) coloured by height like the strongholds
+                                if self.bpp <= PIECES_MAX_BPP:
+                                    _k, pcs = self._cv_pieces(key, x, z)
+                                    if pcs:
+                                        self._draw_pieces(p, [(a0, y0_, c0, a1, y1_, c1, t_)
+                                                              for (a0, c0, a1, c1, t_, _r, y0_, y1_) in pcs],
+                                                          kind="end_city")
+                                        self._pieces_shown = True
+                            elif key in CV_PIECE_TYPES:
+                                # (18/10) cubiomes-viewer's red pieces / box
+                                if self.bpp < CV_BB_MAX_BPP:
+                                    c = self._draw_cv_pieces(p, key, x, z)
+                                    if c is not None:
+                                        ix, iz = c
+                            elif self.bpp <= BOX_MAX_BPP:
                                 self._draw_footprint(p, key, x, z)
-                            self._draw_icon(p, k, x, z)
+                            self._draw_icon(p, k, ix, iz, ref=(x, z))
+        if self.dim != 0:                 # (18/10) no 1.16 features / landmarks there
+            self._f116_hits = []
+            self._paint_chips(p)          # the End cities' « Ship Y » / « max Y »
+            return
         self._paint_features116(p, x0, z0, x1, z1, counts)
         lm = self.engine.landmarks
         if self.engine.seed_view:         # spawn / strongholds depend on biomes
@@ -969,12 +1198,7 @@ class MapView(QWidget):
                 ei = info.get((x, z))
                 if show_eyes and ei is not None:
                     self._draw_eye_badge(p, x, z, int(ei[0]))
-        if self._chips:
-            p.save()
-            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            for (rect, txt, col) in self._chips:
-                self._chip(p, rect, txt, col)
-            p.restore()
+        self._paint_chips(p)
         if self.visible.get("__spawn") and lm.get("spawn"):
             self._draw_icon(p, "spawn", *lm["spawn"])
 
@@ -1023,9 +1247,11 @@ class MapView(QWidget):
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         f = p.font(); f.setPointSizeF(8.5); f.setBold(True); p.setFont(f)
-        hid = self.legend_hidden if self.legend else ()
-        items = ([zn for zn in self.zones if zn.get("num") not in hid or zn.get("active")]
-                 if hid else list(self.zones))
+        # (19/10) Simple follows what was hidden in Detailed's legend
+        hid = self.legend_hidden if (self.legend or self.hit_style == "simple") else ()
+        dm = self.dim                     # (18/10) the zones of the dimension shown
+        items = [zn for zn in self.zones if int(zn.get("dim", 0) or 0) == dm
+                 and (not hid or zn.get("num") not in hid or zn.get("active"))]
         if self._pick and self._pick.get("start") is not None and self._pick.get("cur") is not None:
             r = self._pick_result()
             col = theme.ACCENT
@@ -1105,9 +1331,12 @@ class MapView(QWidget):
     def _hit_groups(self):
         """Markers on screen, grouped when they (nearly) coincide."""
         groups = []
-        hid = self.legend_hidden if self.legend else ()
+        # (19/10) Simple follows what was hidden in Detailed's legend
+        hid = self.legend_hidden if (self.legend or self.hit_style == "simple") else ()
         for m in self.markers:
             if hid and m.get("num") in hid:
+                continue
+            if int(m.get("dim", 0) or 0) != self.dim:      # (18/10) other dimension
                 continue
             x, y = self.to_screen(m["x"], m["z"])
             if not (-30 <= x <= self.width() + 30 and -30 <= y <= self.height() + 30):
@@ -1340,8 +1569,136 @@ class MapView(QWidget):
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, txt)
         p.restore()
 
+    # ── (18/10) a clicked structure: bigger icon + bubble with its details ──
+    def icon_hit_at(self, sx, sy):
+        best, bd = None, max(10.0, self.icon_px * 0.6) ** 2
+        for (hx, hy, key, x, z) in getattr(self, "_icon_hits", ()):
+            d = (hx - sx) ** 2 + (hy - sy) ** 2
+            if d <= bd:
+                best, bd = (key, x, z), d
+        return best
+
+    def _bubble(self):
+        b = self.__dict__.get("_sbubble")
+        if b is None:
+            from .struct_bubble import StructBubble
+            b = self._sbubble = StructBubble(self)
+            b.closed.connect(lambda: self.select_structure(None))
+            bus = self._sel_bus = _SelBus(self)
+            bus.done.connect(self._sel_details)
+        return b
+
+    def _sel_sub(self, tok):
+        key, x, z, dim = tok[:4]
+        return {-1: "Nether", 1: "The End"}.get(dim, "Overworld") + f"   ·   X {x}   Z {z}"
+
+    def select_structure(self, hit):
+        """hit = (key, x, z) or None (deselect)."""
+        b = self._bubble()
+        if hit is None:
+            if getattr(self, "selected", None) is not None:
+                self.selected = None
+                b.hide()
+                self.update()
+            return
+        key, x, z = hit
+        tok = (key, x, z, self.dim, self.world.key)
+        self.selected = tok
+        got = self.__dict__.setdefault("_sel_cache", {}).get(tok)
+        if got is not None:
+            b.show_for(key, got["rows"], got["tps"], subtitle=self._sel_sub(tok))
+        else:
+            b.show_for(key, [], [("Here", self.tp_command(x, z))], loading=True,
+                       subtitle=self._sel_sub(tok))
+            seed, mc, large = self.world.key
+            dim = self.dim
+            bus = self._sel_bus
+            fallback = self.tp_command(x, z)
+
+            def work():
+                try:
+                    import struct_info
+                    from .map_engine import _eye_pool
+                    res = _eye_pool().submit(struct_info.details, seed, mc, large, key, x, z,
+                                             dim).result()
+                except Exception as e:                      # noqa: BLE001
+                    res = dict(rows=[("Details", f"unavailable ({type(e).__name__})")],
+                               tps=[("Here", fallback)])
+                bus.done.emit(tok, res)
+            import threading
+            threading.Thread(target=work, daemon=True).start()
+        self._place_bubble()
+        self.update()
+
+    def _sel_details(self, tok, res):
+        cache = self.__dict__.setdefault("_sel_cache", {})
+        if len(cache) > 500:
+            cache.clear()
+        cache[tok] = res
+        if tok == getattr(self, "selected", None):
+            self._bubble().show_for(tok[0], res["rows"], res["tps"], subtitle=self._sel_sub(tok))
+            self._place_bubble()
+
+    def _sel_screen(self):
+        sel = getattr(self, "selected", None)
+        if sel is None:
+            return None
+        key, x, z = sel[:3]
+        for (hx, hy, k, rx, rz) in getattr(self, "_icon_hits", ()):
+            if (rx, rz) == (x, z) and (k == key or k.startswith(key) or key.startswith(k)):
+                return hx, hy, k
+        sx, sy = self.to_screen(x, z)
+        return sx, sy, key
+
+    def _paint_selected(self, p: QPainter):
+        """The selected structure: its icon 1.6 × bigger in a white ring (as
+        cubiomes-viewer enlarges the selected one)."""
+        sel = getattr(self, "selected", None)
+        if sel is None:
+            return
+        if sel[3] != self.dim or sel[4] != self.world.key:
+            self.selected = None
+            if self.__dict__.get("_sbubble") is not None:
+                self._sbubble.hide()
+            return
+        sx, sy, key = self._sel_screen()
+        big = int(round(self.icon_px * 1.6))
+        pm = struct_icons.pixmap(key, big, max(2.0, self.devicePixelRatioF()))
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = big * 0.62
+        p.setPen(QPen(QColor(255, 255, 255, 235), 2.2))
+        p.setBrush(QColor(255, 255, 255, 40))
+        p.drawEllipse(QPointF(sx, sy), r, r)
+        p.drawPixmap(int(sx - big / 2), int(sy - big / 2), pm)
+        p.restore()
+        QTimer.singleShot(0, self._place_bubble)
+
+    def _place_bubble(self):
+        b = self.__dict__.get("_sbubble")
+        if b is None or not b.isVisible() or getattr(self, "selected", None) is None:
+            return
+        sp = self._sel_screen()
+        if sp is None:
+            return
+        sx, sy, _k = sp
+        off = self.icon_px + 6
+        w, h = b.width(), b.height()
+        right = self.width() - int(getattr(self, "right_inset", 0) or 0) - 8   # not under Layers
+        x = sx + off
+        if x + w > right:
+            x = sx - off - w
+        y = sy - h / 2
+        x = max(8, min(right - w, x))
+        y = max(8, min(self.height() - h - 8, y))
+        pos = (int(x), int(y))
+        if (b.x(), b.y()) != pos:
+            b.move(*pos)
+
     def stronghold_near(self, sx, sy, radius_px=14):
         best, bd = None, radius_px * radius_px
+        if self.dim != 0:                        # (18/10) overworld landmarks only
+            return None
         for (x, z) in self.engine.landmarks.get("strongholds", ()):
             ox, oy = self.to_screen(x, z)
             d = (ox - sx) ** 2 + (oy - sy) ** 2
@@ -1401,13 +1758,15 @@ class MapView(QWidget):
     def _legend_rows_struct(self):
         rows = []
         lm = self.engine.landmarks
-        if self.visible.get("__spawn") and lm.get("spawn"):
+        ow = self.dim == 0
+        if ow and self.visible.get("__spawn") and lm.get("spawn"):
             rows.append(("spawn", "Spawn", None))
-        if self.visible.get("__strongholds") and lm.get("strongholds"):
+        if ow and self.visible.get("__strongholds") and lm.get("strongholds"):
             rows.append(("stronghold", "Stronghold", self._struct_counts.get("stronghold", 0)))
-        zoomed_out = self.bpp > STRUCT_MAX_BPP
+        zoomed_out = self.bpp > _struct_max()
+        dim_types = cw.DIM_STRUCTURE_TYPES[self.dim]
         for key, on in self.visible.items():
-            if not on or key.startswith("__") or key not in cw.STRUCTURE_TYPES:
+            if not on or key.startswith("__") or key not in dim_types:
                 continue
             if not self.world.structure_available(key):
                 continue
@@ -1419,7 +1778,10 @@ class MapView(QWidget):
             if key == "igloo":
                 rows.append(("igloo_basement", struct_icons.label("igloo_basement"),
                              None if zoomed_out else self._struct_counts.get("igloo_basement", 0)))
-        for key in ("lava_lake", "dungeon"):              # (10/10)
+            if key == "end_city":
+                rows.append(("end_city_ship", struct_icons.label("end_city_ship"),
+                             None if zoomed_out else self._struct_counts.get("end_city_ship", 0)))
+        for key in (("lava_lake", "dungeon") if ow else ()):     # (10/10)
             if self.visible.get(key) and self.world.structure_available(key):
                 far = self.bpp > self.f116_max_bpp(key)
                 lo, hi = self.f116_yrange()
@@ -1708,7 +2070,7 @@ class MapView(QWidget):
         return QColor(int(r * 255), int(g * 255), int(b * 255))
 
     def _paint_arrows(self, p: QPainter):
-        if not (self.ov["arrows"] and self.ov["noise"] in CLIMATE):
+        if not (self.ov["arrows"] and self.ov["noise"] in CLIMATE) or self.dim != 0:
             return
         if self._arrows is None:
             self._arrow_timer.start()
@@ -1806,6 +2168,12 @@ class MapView(QWidget):
             vx, vz = (pos.x() - lp.x()) / dt, (pos.y() - lp.y()) / dt
             ovx, ovz = self._vel
             self._vel = (0.6 * vx + 0.4 * ovx, 0.6 * vz + 0.4 * ovz)
+            try:                                       # (17/10) Settings: no inertia
+                from . import prefs as _pf
+                if not _pf.get("inertia"):
+                    self._vel = (0.0, 0.0)
+            except Exception:
+                pass
             self._last_move = (pos, now)
             self._view_changed()
         self._hover_pos = pos
@@ -1839,8 +2207,15 @@ class MapView(QWidget):
                 self.update()
                 return
         if e.button() == Qt.MouseButton.LeftButton and self._drag is not None:
+            start = self._drag[0]
             self._drag = None
             self.setCursor(Qt.CursorShape.CrossCursor)
+            d = e.position() - start
+            if abs(d.x()) + abs(d.y()) < 5 and not self.measuring:
+                # (18/10) a click (not a drag): select the structure under it
+                self.select_structure(self.icon_hit_at(e.position().x(), e.position().y()))
+                self._vel = (0.0, 0.0)
+                return
             if time.perf_counter() - self._last_move[1] > 0.08:   # stopped before release
                 self._vel = (0.0, 0.0)
             if abs(self._vel[0]) > 40 or abs(self._vel[1]) > 40:
@@ -1870,13 +2245,22 @@ class MapView(QWidget):
             self.update()
             return
         if d:
-            self.zoom_smooth(0.8 ** (d / 120.0), e.position())
+            try:
+                from . import prefs as _pf
+                sp = max(0.25, min(3.0, float(_pf.get("zoom_speed"))))
+            except Exception:
+                sp = 1.0
+            self.zoom_smooth(0.8 ** (d / 120.0 * sp), e.position())
 
     def leaveEvent(self, _e):
         self._readout.hide()
 
     def keyPressEvent(self, e):
         k = e.key()
+        if k == Qt.Key.Key_Escape and getattr(self, "selected", None) is not None \
+                and self._pick is None and not self.measuring:
+            self.select_structure(None)
+            return
         if k == Qt.Key.Key_Escape and self._pick is not None:
             self.cancel_pick()
             return
@@ -1930,6 +2314,13 @@ class MapView(QWidget):
             return
         x, z = (int(math.floor(v)) for v in self.to_world(e.pos().x(), e.pos().y()))
         m = QMenu(self)
+        # (18/10) a structure under the cursor: its bubble only (no menu as well:
+        # two bubbles at once, Édouard) — the /tp are copied from the bubble
+        shit = self.icon_hit_at(e.pos().x(), e.pos().y())
+        if shit is not None:
+            self.select_structure(shit)
+            return
+        s_acts = {}
         # (10/10) a 1.16 dungeon / lava lake under the cursor
         ft = self.feature116_at(e.pos().x(), e.pos().y())
         a_ftp = a_fck = a_fall = None
@@ -1944,14 +2335,19 @@ class MapView(QWidget):
             a_fall = m.addAction(f"Check the {min(n_vis, 300)} unsure dungeons / lava lakes on screen "
                                  "with Minecraft")
             m.addSeparator()
-        sh = self.stronghold_near(e.pos().x(), e.pos().y()) if self.visible.get("__strongholds") else None
+        sh = (self.stronghold_near(e.pos().x(), e.pos().y())
+              if self.visible.get("__strongholds") and self.dim == 0 else None)
         a_sh = a_all = None
         if sh is not None:
             a_sh = m.addAction(struct_icons.icon("stronghold", 16), f"Stronghold details  ({sh[0]}, {sh[1]})…")
             a_all = m.addAction("All strongholds of this seed…")
             m.addSeparator()
+        a_clim = None
+        if self.dim == 0 and self.world.mc >= cw.MC_VERSIONS["Java 1.18"]:   # (19/10)
+            a_clim = m.addAction(f"Climate requirements of {self._biome_at(x, z)}…")
+            m.addSeparator()
         a1 = m.addAction(f"Copy coordinates   {x}, {z}")
-        a2 = m.addAction("Copy /tp command")
+        a2 = m.addAction("Copy /tp command" + {-1: "  (Nether)", 1: "  (End)"}.get(self.dim, ""))
         m.addSeparator()
         a3 = m.addAction("Centre map here")
         a4 = m.addAction("Go to coordinates…\tCtrl+G")
@@ -1969,6 +2365,12 @@ class MapView(QWidget):
         if self.pin is not None:
             a_pin = m.addAction(icons.icon("pin", 16), "Remove the pin")
         act = m.exec(e.globalPos())
+        if act is not None and act is a_clim:
+            self.show_biome_climate(x, z)
+            return
+        if act is not None and act in s_acts:
+            QGuiApplication.clipboard().setText(s_acts[act])
+            return
         if act is not None and act is a5:
             w = self.window()
             if hasattr(w, "paste_seed_coords"):
@@ -1999,11 +2401,27 @@ class MapView(QWidget):
         if act is a1:
             cb.setText(f"{x} {z}")
         elif act is a2:
-            cb.setText(f"/tp @s {x} ~ {z}")
+            cb.setText(self.tp_command(x, z))
         elif act is a3:
             self.center_on(x, z)
         elif act is a4:
             self.goto_dialog()
+
+    def show_biome_climate(self, x=None, z=None):
+        """(19/10) the climate requirements of every biome; at (x, z): that
+        biome, with the spot's values."""
+        from .biome_climate_dialog import BiomeClimateDialog
+        pt = bid = None
+        where = ""
+        if x is not None:
+            pt = self.climate_point(x, z)
+            try:
+                bid = self._ui_lib(0).get_biome_at(x, z, scale=1, y=320)
+            except Exception:
+                bid = None
+            where = f"X {x}  Z {z}"
+        dlg = BiomeClimateDialog(self.world.mc, biome=bid, point=pt, where=where, parent=self)
+        dlg.exec(); dlg.deleteLater()
 
     def goto_dialog(self):
         txt, ok = QInputDialog.getText(self, "Go to coordinates", "X, Z  (blocks):",
@@ -2018,22 +2436,28 @@ class MapView(QWidget):
         self.center_on(x, z)
 
     # ── read-out ────────────────────────────────────────────────────────────
-    def _ui_lib(self):
-        key = (self.world.key, "lib")
+    def _ui_lib(self, dim=0):
+        key = (self.world.key, "lib", dim)
         lib = self._ui_libs.get(key)
         if lib is None:
             lib = cw.make_worker_lib()
-            lib.setup_and_seed(self.world.mc, self.world.seed, large_biomes=self.world.large_biomes)
+            lib.setup_and_seed(self.world.mc, self.world.seed, large_biomes=self.world.large_biomes,
+                               dim=dim)
             self._ui_libs[key] = lib
         return lib
 
     def _biome_at(self, x, z):
-        scale = 1 if self.world.mc >= cw.MC_VERSIONS["Java 1.18"] else 4
+        dim = self.dim
+        scale = 1 if (dim or self.world.mc >= cw.MC_VERSIONS["Java 1.18"]) else 4
         try:
-            bid = self._ui_lib().get_biome_at(x, z, scale=scale)
+            bid = self._ui_lib(dim).get_biome_at(x, z, scale=scale, y=(0 if dim else 320))
         except Exception:
             return "?"
-        return cw.BIOME_NAMES.get(bid, f"biome {bid}")
+        try:                        # (17/10) the version's own name (Mountains in 1.16…)
+            from biome_catalog import biome_name_for
+            return biome_name_for(int(self.world.mc), int(bid))
+        except Exception:
+            return cw.BIOME_NAMES.get(bid, f"biome {bid}")
 
     def _noise_at(self, x, z):
         noise = self.ov["noise"]
@@ -2072,7 +2496,13 @@ class MapView(QWidget):
             return
         x, z = (int(math.floor(v)) for v in self.to_world(self._hover_pos.x(), self._hover_pos.y()))
         name = self._biome_at(x, z)
-        extra = self._noise_at(x, z) if self.ov["noise"] else ""
+        extra = self._noise_at(x, z) if (self.ov["noise"] and self.dim == 0) else ""
+        if self._end_height():              # (18/10) as cubiomes-viewer: « Y~n »
+            try:
+                y = float(self._ui_lib().end_height_grid(x, z, 1, 1, 1)[0, 0])
+                extra = f"Y~{int(math.floor(y))}" if y > 0 else "void"
+            except Exception:
+                extra = ""
         ft = self.feature116_at(self._hover_pos.x(), self._hover_pos.y())   # (10/10)
         if ft is not None:
             ok = getattr(self, "f116_checked", {}).get((self.world.seed, ft.kind, ft.x, ft.y, ft.z),
@@ -2083,10 +2513,42 @@ class MapView(QWidget):
                 "  ✓ exact terrain" if (ft.real and ok) else
                 (f"  ✓ in Minecraft" + (f", top lava Y {ry}" if ry is not None else ""))
                 if ok else ("  ✗ not generated" if ok is False else "  ? potential (not checked)"))
-        self._readout.setText(f"X {x}    Z {z}    ·    {name}" + (f"    ·    {extra}" if extra else ""))
+        base = f"X {x}    Z {z}    ·    {name}" + (f"    ·    {extra}" if extra else "")
+        clim = self._climate_readout(x, z)
+        if clim:
+            # (19/10) the 5 climate noises of the spot, small, whatever the layer
+            import html as _html
+            self._readout.setTextFormat(Qt.TextFormat.RichText)
+            self._readout.setText(
+                f"<span style='white-space:pre'>{_html.escape(base)}</span>"
+                f"<span style='white-space:pre; color:{theme.TEXT3}; font-size:8pt'>"
+                f"      {_html.escape(clim)}</span>")
+        else:
+            self._readout.setTextFormat(Qt.TextFormat.PlainText)
+            self._readout.setText(base)
         self._readout.show()
         self._place_readout()
         self.hover.emit(x, z, name)
+
+    def climate_point(self, x, z):
+        """(19/10) [T, H, C, E, D, W] ×10000 at (x, z) — overworld 1.18+ only,
+        depth taken as the surface (0) — or None."""
+        if self.dim != 0 or self.world.mc < cw.MC_VERSIONS["Java 1.18"]:
+            return None
+        try:
+            r = self._ui_lib(0).climate_at(x, z, 320)
+        except Exception:
+            return None
+        if r is None:
+            return None
+        np6 = list(r[1]); np6[4] = 0
+        return np6
+
+    def _climate_readout(self, x, z):
+        p = self.climate_point(x, z)
+        if p is None:
+            return ""
+        return "  ".join(f"{k} {p[i]:+d}" for k, i in (("T", 0), ("H", 1), ("C", 2), ("E", 3), ("W", 5)))
 
     def _update_readout(self, pos):          # kept for tests / external callers
         self._hover_pos = pos

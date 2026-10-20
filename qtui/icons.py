@@ -264,6 +264,21 @@ def _draw(name: str, p: QPainter, c: QColor):
         path.cubicTo(7, 15, 5.5, 12.5, 5.5, 9.5); path.cubicTo(5.5, 5.8, 8.4, 3, 12, 3)
         path.cubicTo(15.6, 3, 18.5, 5.8, 18.5, 9.5); path.cubicTo(18.5, 12.5, 17, 15, 12, 21)
         p.drawPath(path); p.drawEllipse(QPointF(12, 9.5), 2.4, 2.4)
+    elif name == "gear":             # settings (17/10): a cog with 8 teeth
+        import math
+        path = QPainterPath()
+        for i in range(16):
+            a0 = (i - 0.5) * math.pi / 8.0
+            r = 9.0 if i % 2 == 0 else 6.8
+            for k in (0, 1):
+                a = a0 + k * math.pi / 8.0
+                pt = QPointF(12 + r * math.cos(a), 12 + r * math.sin(a))
+                if i == 0 and k == 0:
+                    path.moveTo(pt)
+                else:
+                    path.lineTo(pt)
+        path.closeSubpath()
+        p.drawPath(path); p.drawEllipse(QPointF(12, 12), 2.8, 2.8)
     else:                            # unknown → dot
         p.setBrush(c); p.drawEllipse(QPointF(12, 12), 3, 3)
 

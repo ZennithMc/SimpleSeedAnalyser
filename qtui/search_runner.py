@@ -28,6 +28,15 @@ FAMILY = 65536                     # seeds per 48-bit family
 # continue with a 10× higher limit, up to SAFETY_MAX.
 SAFETY_FIRST = 100_000
 SAFETY_MAX = 10_000_000
+
+
+def safety_first() -> int:
+    """The first automatic pause (Settings, 17/10; default SAFETY_FIRST)."""
+    try:
+        from . import prefs
+        return max(SAFETY_FIRST, min(SAFETY_MAX, int(prefs.get("safety_first"))))
+    except Exception:
+        return SAFETY_FIRST
 M48 = (1 << 48) - 1
 U64 = 1 << 64
 EFF = {0: "inc", 1: "fam48", 2: "blocks"}   # engine's effective mode codes
@@ -66,6 +75,11 @@ class SearchRunner(QObject):
         self._seen = set()
         self.found = 0
         self.safety_limit = SAFETY_FIRST
+        # (17/10) known before any search: the autosave of a session restored
+        # with its statistics read them (AttributeError in v1.0.0's console.log)
+        self._done_before = 0
+        self._elapsed_before = 0.0
+        self.base_start = 0
         self._timer = QTimer(self, interval=80, timeout=self._pump)
         self._rate = []                    # (t, done) samples for the speed
         self.can_pause = True
@@ -103,7 +117,7 @@ class SearchRunner(QObject):
         if not _resume:
             self._seen.clear()
             self.found = 0
-            self.safety_limit = SAFETY_FIRST
+            self.safety_limit = safety_first()
             self.base_start = int(start)
             self._elapsed_before = 0.0
             self._done_before = 0

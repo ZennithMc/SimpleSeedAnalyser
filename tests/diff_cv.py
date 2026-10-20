@@ -128,15 +128,28 @@ def main():
         tmp, b = cv_on(S, seeds)
         try:
             a = run_ssa(tmp, seeds, mco)
+            stale = 0
+            if a != b and len(a ^ b) <= 300:
+                # (18/10) cubiomes-viewer keeps state from the PREVIOUS seed in a
+                # few cases (End city terrain after an End biome check, climate
+                # octaves after a Nether / End condition): each differing seed is
+                # asked again ALONE; its own answer is the reference
+                for sd in sorted(a ^ b):
+                    alone = run_cv(tmp, [sd])
+                    if (sd in alone) == (sd in a):
+                        stale += 1
+                        b = (b | {sd}) if sd in a else (b - {sd})
         finally:
             os.unlink(tmp)
         if name.startswith("path#"):
             accepted[tuple(S)] = sorted(b)
-        tag = "OK  " if a == b else "DIFF"
+        tag = ("OK* " if stale else "OK  ") if a == b else "DIFF"
         if a != b:
             bad += 1
         print(f"{tag} {name:14s} n={len(S):3d} seeds={len(seeds):5d}  SSA={len(a):4d} CV={len(b):4d}  onlySSA={len(a-b):3d} onlyCV={len(b-a):3d}"
-              + (f"  e.g. {sorted(b-a)[:2] or sorted(a-b)[:2]}" if a != b else ""), flush=True)
+              + (f"  e.g. {sorted(b-a)[:2] or sorted(a-b)[:2]}" if a != b else "")
+              + (f"  ({stale} seed(s) where CV used the previous seed's state)" if stale else ""),
+              flush=True)
     print("MISMATCHING SUBSETS:", bad)
 
 

@@ -48,7 +48,19 @@ def noise_range(noise):
 
 
 # ── thread-local engines ────────────────────────────────────────────────────
-def _thread_lib(world_key):
+def _thread_lib(world_key, dim=0):
+    if dim in (-1, 1):                  # (18/10) Nether / End: their own instance
+        libs = getattr(_TLS, "dim_libs", None)
+        if libs is None:
+            libs = _TLS.dim_libs = {}
+        got = libs.get(dim)
+        if got is None or got[1] != world_key:
+            lib = got[0] if got is not None else cw.make_worker_lib()
+            seed, mc, large = world_key
+            lib.setup_and_seed(mc, seed, large_biomes=large, dim=dim)
+            libs[dim] = (lib, world_key)
+            return lib
+        return got[0]
     lib = getattr(_TLS, "lib", None)
     if lib is None:
         lib = cw.make_worker_lib()
@@ -114,12 +126,40 @@ def _eye_pool():
         return _EYE_POOL
 
 
+_LOC_POOL = None
+
+
+def loc_pool_workers():
+    import os
+    return max(1, min(16, (os.cpu_count() or 4) - 2))
+
+
+def _loc_pool():
+    """(18/10) Helper processes for the automatic location of the results:
+    as many as the CPU allows (2 left for the UI and the map); the eye pool
+    (2 processes) stays free for the map and the clicked result."""
+    global _LOC_POOL
+    with _EYE_POOL_LOCK:
+        if _LOC_POOL is None:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            _LOC_POOL = ProcessPoolExecutor(max_workers=loc_pool_workers(),
+                                            mp_context=mp.get_context("spawn"))
+        return _LOC_POOL
+
+
 def shutdown_eye_pool():
     """Called when the window closes: stop the helper processes cleanly (no
     'leaked semaphore' warnings at exit)."""
-    global _EYE_POOL
+    global _EYE_POOL, _LOC_POOL
     with _EYE_POOL_LOCK:
         pool, _EYE_POOL = _EYE_POOL, None
+        lpool, _LOC_POOL = _LOC_POOL, None
+    if lpool is not None:                 # (18/10) don't wait for a long location
+        try:
+            lpool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
     if pool is not None:
         try:
             pool.shutdown(wait=True, cancel_futures=True)
@@ -162,8 +202,35 @@ def biome_lut(palette: str) -> np.ndarray:
         for bid, rgb in colors.items():
             if 0 <= bid < len(lut):
                 lut[bid] = rgb
+        # (18/10) a palette made for the overworld may leave the Nether / End
+        # biomes almost black (True Colors: #0e0606…): the cubiomes colours then
+        for ids in ((8, 170, 171, 172, 173), (9, 40, 41, 42, 43)):
+            if all(int(lut[i].astype(np.int32).sum()) < 120 for i in ids):
+                for i in ids:
+                    lut[i] = cw.BIOME_COLORS.get(i, cw.DEFAULT_COLOR)
         _LUTS[palette] = lut
     return lut
+
+
+END_Y0, END_Y1 = 30.0, 80.0    # End height colour index 0 … 255 ↔ Y 30 … 80 (the islands)
+
+
+def _end_height_lut(palette: str) -> np.ndarray:
+    """(20/10) The End height colours. The height palettes are made for the
+    Overworld: a sharp step at the sea level (Y 62 → 64), right in the middle
+    of the End islands (Y ≈ 40–75), so ONE block changed the colour from
+    grey-blue to sand. Here: the palette's colours from Y −30 to 110 spread
+    over the End island heights Y 30 … 80, smoothed (the sea step becomes a
+    gradient of a few blocks). Index i = (Y − 30) · 255 / 50; the void and
+    anything below Y 30 = 0, the darkest."""
+    base = noise_lut("Height", palette)
+    lo, hi = npal.DISPLAY_RANGES["Height"]
+    vy = np.linspace(-30.0, 110.0, 256 + 60)
+    idx = np.rint(np.asarray(npal.u_from_pos((vy - lo) / (hi - lo), "Height")) * 255.0)
+    cols = np.asarray(base, np.float64)[np.clip(idx, 0, 255).astype(int)]
+    k = np.ones(31) / 31.0                                     # moving average
+    sm = np.stack([np.convolve(cols[:, c], k, mode="same") for c in range(3)], axis=1)
+    return np.clip(np.rint(sm[30:30 + 256]), 0, 255).astype(np.uint8)
 
 
 def noise_lut(noise: str, palette: str) -> np.ndarray:
@@ -172,6 +239,8 @@ def noise_lut(noise: str, palette: str) -> np.ndarray:
     own colours (custom palettes with stops out there)."""
     key = ("noise", noise, palette)
     lut = _LUTS.get(key)
+    if lut is None and noise == "End height":
+        lut = _LUTS[key] = _end_height_lut(palette)
     if lut is None:
         en = npal.editor_noise(noise)
         if palette == "Grayscale" and en == "Height":
@@ -287,6 +356,7 @@ class MapEngine(QObject):
         self.structs: dict = {}
         self.struct_pending: set = set()
         self.zombies: dict = {}             # village block key → frozenset of abandoned (x, z)
+        self.ships: dict = {}               # (18/10) end city block key → frozenset with a ship
         self.landmarks: dict = {}
         self.wanted: set = set()                 # keys needed by the last frame
         self._single_range: dict = {}
@@ -312,7 +382,7 @@ class MapEngine(QObject):
         self.epoch += 1
         self.tiles.clear(); self.pending.clear(); self.previews.clear()
         self.noise_raw.clear(); self.noise_pix.clear()
-        self.structs.clear(); self.struct_pending.clear(); self.zombies = {}
+        self.structs.clear(); self.struct_pending.clear(); self.zombies = {}; self.ships = {}
         self.basements = {}
         self.sh_pieces = {}; self.pieces_pending = set()
         self.landmarks = {}
@@ -324,7 +394,9 @@ class MapEngine(QObject):
             self.tiles.clear()
             self.previews.clear()
 
-    def min_scale(self) -> int:
+    def min_scale(self, dim=0) -> int:
+        if dim in (-1, 1):                  # Nether / End noise: 1:1 in every version
+            return 1
         return 1 if self.world.mc >= cw.MC_VERSIONS["Java 1.18"] else 4
 
     def pending_count(self) -> int:
@@ -346,8 +418,8 @@ class MapEngine(QObject):
             self.failed.clear()
 
     # ── biome tiles ─────────────────────────────────────────────────────────
-    def tile(self, scale, tx, tz, priority=5, fetch=True):
-        key = (self.epoch, "b", self.palette, scale, tx, tz)
+    def tile(self, scale, tx, tz, priority=5, fetch=True, dim=0):
+        key = (self.epoch, "b", self.palette, scale, tx, tz, dim)
         pm = self.tiles.get(key)
         if pm is not None:
             self.tiles.move_to_end(key)
@@ -363,7 +435,7 @@ class MapEngine(QObject):
                 if not self._still_wanted(key):
                     self.bus.skipped.emit(key)
                     return
-                lib = _thread_lib(wk)
+                lib = _thread_lib(wk, dim)
                 ids = np.frombuffer(lib.gen_biomes_region(tx * TILE, tz * TILE, TILE, TILE, scale),
                                     dtype=np.int32).reshape(TILE, TILE)
                 lut = biome_lut(pal)
@@ -377,7 +449,7 @@ class MapEngine(QObject):
                 def pjob(key=key, wk=wk, pal=pal, ps=ps):
                     if key in self.tiles or not self._still_wanted(key):
                         return
-                    lib = _thread_lib(wk)
+                    lib = _thread_lib(wk, dim)
                     n = TILE // 4
                     ids = np.frombuffer(lib.gen_biomes_region(tx * n, tz * n, n, n, ps),
                                         dtype=np.int32).reshape(n, n)
@@ -386,9 +458,9 @@ class MapEngine(QObject):
                 self.pool.start(_Job(pjob), priority + 3)
         return None
 
-    def preview(self, scale, tx, tz):
+    def preview(self, scale, tx, tz, dim=0):
         """Quick coarse version of a biome tile still generating (or None)."""
-        return self.previews.get((self.epoch, "b", self.palette, scale, tx, tz))
+        return self.previews.get((self.epoch, "b", self.palette, scale, tx, tz, dim))
 
     def _on_preview(self, key, img):
         if key[0] != self.epoch or key[2] != self.palette or key in self.tiles:
@@ -398,8 +470,8 @@ class MapEngine(QObject):
             self.previews.popitem(last=False)
         self.tileReady.emit()
 
-    def cached_tile(self, scale, tx, tz):
-        return self.tiles.get((self.epoch, "b", self.palette, scale, tx, tz))
+    def cached_tile(self, scale, tx, tz, dim=0):
+        return self.tiles.get((self.epoch, "b", self.palette, scale, tx, tz, dim))
 
     def _on_tile(self, key, img):
         self.pending.discard(key)
@@ -477,6 +549,13 @@ class MapEngine(QObject):
             elif noise == "Approx height":
                 arr = self._height_tile(wk, scale, tx, tz)
                 vmin, vmax = HEIGHT_RANGE
+            elif noise == "End height":                         # (18/10)
+                arr = self._end_height_tile(wk, scale, tx, tz)
+                # (20/10) its own colour scale (see _end_height_lut)
+                raw = np.clip(np.rint((np.asarray(arr, np.float32) - END_Y0)
+                                      * (255.0 / (END_Y1 - END_Y0))), 0, 255).astype(np.uint8)
+                self.bus.noise.emit(rkey, raw)
+                return
             elif int(wk[1]) in (19, 20):                        # Exact Y 1.16 (10/10 bis)
                 # the exact 1.16.1 terrain (chunks rebuilt): every block at 1:1
                 # (MapView._tile_scale allows 1:1 for this layer), 32 samples a
@@ -512,6 +591,23 @@ class MapEngine(QObject):
                                np.maximum(raw, sk + 1)).astype(np.uint8)
             self.bus.noise.emit(rkey, raw)
         return job
+
+    def _end_height_tile(self, wk, scale, tx, tz):
+        """(18/10) The End surface (cubiomes-viewer's height view there):
+        every pixel up to 1:8 (mapEndSurfaceHeight + mapEndIslandHeight);
+        coarser tiles sample 64 × 64 points at 1:8 and are interpolated (one
+        point costs ≈ 0.3 ms: a full 1:16 tile would take 20 s)."""
+        lib = _thread_lib(wk)
+        if scale <= 8:
+            a = lib.end_height_grid(tx * TILE, tz * TILE, TILE, TILE, scale)
+        else:
+            n = 64
+            step = TILE // n                              # tile cells per sample
+            small = lib.end_height_grid(tx * n, tz * n, n + 1, n + 1, scale * step)
+            a = None if small is None else _bilinear_up(np.asarray(small, np.float32), n, TILE)
+        if a is None:
+            return np.zeros((TILE, TILE), np.float32)
+        return np.asarray(a, np.float32)
 
     def _height_tile(self, wk, scale, tx, tz):
         hm = _thread_height(wk)
@@ -567,18 +663,25 @@ class MapEngine(QObject):
             return v
         if key not in self.struct_pending:
             self.struct_pending.add(key)
-            stype = cw.STRUCTURE_TYPES[skey]
+            stype = cw.ALL_STRUCTURE_TYPES[skey]
+            sdim = cw.STRUCTURE_DIM.get(skey, 0)     # (18/10) its dimension's generator
             wk = self.world.key
             B = self.STRUCT_BLOCK
 
             def job(key=key, wk=wk):
-                lib = _thread_lib(wk)
+                lib = _thread_lib(wk, sdim)
                 pts = lib.find_structures_in_box(stype, bx * B, bz * B, bx * B + B - 1, bz * B + B - 1,
                                                  verify_biome=not sv, max_count=100000)
                 if skey == "igloo" and pts:          # igloos with a basement: own icon
                     try:
                         self.basements[key] = frozenset(
                             q for q in pts if lib.get_variant_basement(stype, q[0], q[1]))
+                    except Exception:
+                        pass
+                if skey == "end_city" and pts:       # (18/10) cities with a ship: own icon
+                    try:
+                        self.ships[key] = frozenset(
+                            q for q, f in zip(pts, lib.end_city_ships(pts)) if f)
                     except Exception:
                         pass
                 if skey == "village" and pts and not sv:
@@ -660,6 +763,12 @@ class MapEngine(QObject):
         it depends on the seed only, so the structure-seed view has it too."""
         key = (self.epoch, "igloo", bx, bz) + (("seed",) if self.seed_view else ())
         return self.basements.get(key, frozenset())
+
+    def with_ship(self, bx: int, bz: int):
+        """End cities with a ship of a structure block (empty until computed);
+        the ship depends on the seed only (structure-seed view too)."""
+        key = (self.epoch, "end_city", bx, bz) + (("seed",) if self.seed_view else ())
+        return self.ships.get(key, frozenset())
 
     def abandoned(self, bx: int, bz: int):
         """Abandoned villages of a structure block (empty until computed)."""

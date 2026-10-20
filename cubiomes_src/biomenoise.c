@@ -1716,6 +1716,34 @@ int getBiomeLeafLimits(int mc, int biome, int (*out)[12], int max)
     return leaf_limits(lb, biome, out, max);
 }
 
+/* SSA (19/10): the raw leaves of the climate tree for 'biome' — the game's
+ * own parameter points (OverworldBiomeBuilder): out[i] = {Tlo, Thi, Hlo, Hhi,
+ * Clo, Chi, Elo, Ehi, Dlo, Dhi, Wlo, Whi} (×10000). Returns their number,
+ * -1 when unsupported. */
+int getBiomeLeafBoxes(int mc, int biome, int (*out)[12], int max)
+{
+    const BiomeTree *bt = ssa_btree(mc);
+    if (!bt || mc < 0 || mc >= 64)
+        return -1;
+    while (__atomic_exchange_n(&g_bli_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    const LeafBoxes *lb = leaf_boxes(mc, bt);
+    __atomic_store_n(&g_bli_lock, 0, __ATOMIC_RELEASE);
+    int n = 0;
+    for (int i = 0; i < lb->n && n < max; i++)
+    {
+        if (lb->id[i] != biome)
+            continue;
+        for (int k = 0; k < 6; k++)
+        {
+            out[n][2*k] = lb->lo[i][k];
+            out[n][2*k+1] = lb->hi[i][k];
+        }
+        n++;
+    }
+    return n;
+}
+
 /* per-biome reduced leaf data, computed once and shared by all threads */
 static const BiomeLeafInfo *g_bli[64][256];
 

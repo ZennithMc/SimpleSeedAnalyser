@@ -453,6 +453,7 @@ class StrongholdPage(QWidget):
         outer.addWidget(split, 1)
         split.addWidget(self._build_left())
         self.map = MapView(world, link=link)
+        self.map.set_dims_allowed(False)          # (18/10) strongholds: the overworld
         split.addWidget(self.map)
         split.addWidget(self._build_results())
         split.setStretchFactor(1, 1)
@@ -779,6 +780,7 @@ class StrongholdPage(QWidget):
         row.addLayout(self.start_src.layout(sw, "First seed (Incremental) or first 48-bit value "
                                                 "(48-bit family)."))
         self.threads = QSpinBox(); self.threads.setRange(1, max(1, min(61, os.cpu_count() or 4)))
+        self.threads.setAlignment(Qt.AlignmentFlag.AlignCenter)   # (17/10) centred number
         self.threads.setValue(max(1, (os.cpu_count() or 4) - 1))
         labeled("Processes", self.threads, "Worker processes (every one is used).")
         self.rule_kind = QComboBox()

@@ -1250,6 +1250,10 @@ _EYE_SURFACE_INDEX = {   # mc -> stronghold index within SURFACE_STRUCTURES (1.1
     25: 19,   # 1.20.x   (UNVERIFIED)
     26: 19,   # 1.21.1   (UNVERIFIED)
     28: 19,   # 1.21.4   (UNVERIFIED)
+    # (18/10) 26.3 adds 18 SURFACE_STRUCTURES structures abandoned_camp_<biome>
+    # (one per biome, read from the 26.3 jar), all sorted before "stronghold":
+    # the stronghold moves to index 37 (eye counts were wrong in 26.3)
+    35: 37,   # 26.3 (jar-verified list of the step)
 }
 
 
@@ -1259,6 +1263,8 @@ def _eye_feature_offset(mc_version: int) -> int:
     1.19+ uses SURFACE_STRUCTURES (+40000 + registry index)."""
     if mc_version <= 22:               # 1.18.0/1.18.1: STRONGHOLDS step (5), idx 0
         return 50000
+    if mc_version >= 35:               # 26.3+: 18 abandoned_camp_* before stronghold
+        return 40000 + 37
     return 40000 + _EYE_SURFACE_INDEX.get(mc_version, 19)
 
 

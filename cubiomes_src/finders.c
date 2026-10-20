@@ -85,7 +85,7 @@ int getStructureConfig(int structureType, int mc, StructureConfig *sconf)
     s_ancient_city          = { 20083232, 24, 16, Ancient_City,     0,0},
     s_trail_ruins           = { 83469867, 34, 26, Trail_Ruins,      0,0},
     s_trial_chambers        = { 94251327, 34, 22, Trial_Chambers,   0,0},
-    s_abandoned_camp        = { 91231127, 34, 26, Abandoned_Camp,   0,0},
+    s_abandoned_camp        = { 91231127, 37, 29, Abandoned_Camp,   0,0}, // 26.3 jar: spacing 37, separation 8
     s_treasure              = { 10387320,  1,  1, Treasure,         0,0},
     s_mineshaft             = {        0,  1,  1, Mineshaft,        0,0},
     s_desert_well_115       = {    30010,  1,  1, Desert_Well,      0, 1.f/1000},
@@ -830,6 +830,7 @@ int isStrongholdBiome(int mc, int id)
         return mc <= MC_1_15 || mc >= MC_1_18;
     case mangrove_swamp:
     case deep_dark:
+    case dappled_forest:    // (18/10) not in #stronghold_biased_to (26.3 jar)
         return 0;
     default:
         return 1;
@@ -1660,7 +1661,36 @@ int isViableStructurePos(int structureType, Generator *g, int x, int z, uint32_t
         goto L_feature;
     case Abandoned_Camp:
         if (g->mc < MC_26_3) goto L_not_viable;
-        goto L_feature;
+        {   // (18/10) checked against the 26.3 jar: a jigsaw structure whose
+            // biome test is done at the centre of the start tent, placed at the
+            // chunk origin with a random rotation. The 18 biome variants share
+            // the structure set and all have the same 10-tent start pool
+            // (tents #2 and #7 are 6x8, the others 8x8), so the centre does not
+            // depend on the variant: the camp exists iff that biome is one of
+            // the 18 camp biomes.
+            uint64_t rng = chunkGenerateRnd(g->seed, (int)chunkX, (int)chunkZ);
+            int rot = nextInt(&rng, 4);
+            int t = nextInt(&rng, 10);
+            int sx = (t == 2 || t == 7) ? 6 : 8, sz = 8;
+            int x0, x1, z0, z1;
+            switch (rot) {
+            case 0:  x0 = 0;       x1 = sx-1; z0 = 0;       z1 = sz-1; break; // none
+            case 1:  x0 = -(sz-1); x1 = 0;    z0 = 0;       z1 = sx-1; break; // cw 90
+            case 2:  x0 = -(sx-1); x1 = 0;    z0 = -(sz-1); z1 = 0;    break; // 180
+            default: x0 = 0;       x1 = sz-1; z0 = -(sx-1); z1 = 0;    break; // ccw 90
+            }
+            int64_t bx = chunkX * 16, bz = chunkZ * 16;
+            int64_t cx = (2*bx + x0 + x1) / 2;   // Java int division (towards 0)
+            int64_t cz = (2*bz + z0 + z1) / 2;
+            if (g->mc <= MC_1_17)
+                g->entry = &g->ls.layers[L_RIVER_MIX_4];
+            sampleX = (int)(cx >> 2);
+            sampleZ = (int)(cz >> 2);
+            id = viableBiomeAt(g, structureType, 0, 0, sampleX, 319>>2, sampleZ);
+            if (id < 0 || !isViableFeatureBiome(g->mc, structureType, id))
+                goto L_not_viable;
+            goto L_viable;
+        }
     case Ocean_Ruin:
     case Shipwreck:
     case Treasure:
@@ -2595,7 +2625,12 @@ int genTower(PieceEnv *env, Piece *current, int depth)
             if (!next(env->rng, 1))
                 continue;
             int brot = (rot + binfo[i][0]) & 3;
-            Piece *bridge = addEndCityPiece(env, base, brot,
+            // (SSA 18/10) the bridges hang from the chosen FLOOR piece, as the
+            // game (EndCityPieces TOWER_GENERATOR: addPiece(floor, ...), read in
+            // the 26.3 jar) -- was the top tower piece: the bridges, the ship
+            // and the houses behind them came out 4 blocks per floor too high,
+            // and their collisions (so the city's shape) differed
+            Piece *bridge = addEndCityPiece(env, floor, brot,
                 binfo[i][1], binfo[i][2], binfo[i][3], BRIDGE_END);
             genPiecesRecusively(genBridge, env, bridge, depth+1);
         }

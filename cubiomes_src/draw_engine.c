@@ -690,6 +690,40 @@ EXPORT int dengine_run(void *h, int64_t start, int64_t count, int n_threads,
     return complete;
 }
 
+/* (19/10) The same over a LIST of seeds (Draw on a seed list). */
+EXPORT int dengine_run_list(void *h, const int64_t *seeds, int64_t count, int n_threads,
+                            volatile int *stop)
+{
+    DEng *e = (DEng *)h;
+    if (!e || !seeds || count <= 0) return 1;
+    int complete = 1;
+#ifdef _OPENMP
+    if (n_threads > 0) omp_set_num_threads(n_threads);
+#endif
+    #pragma omp parallel
+    {
+        Work *wk = work_new(e);
+        int64_t lt = 0, lr = 0;
+        #pragma omp for schedule(dynamic, 16)
+        for (int64_t k = 0; k < count; k++) {
+            if (!wk || (stop && *stop)) { complete = 0; continue; }
+            uint64_t seed = (uint64_t)seeds[k];
+            lt++;
+            int ox, oz;
+            double thr = threshold(e);
+            double sc = eval_seed(e, wk, seed, thr, &ox, &oz);
+            if (sc > -1.5) lr++;
+            if (sc >= 0) add_result(e, (int64_t)seed, sc, ox, oz);
+        }
+        #pragma omp atomic
+        e->tested += lt;
+        #pragma omp atomic
+        e->refined += lr;
+        work_free(wk);
+    }
+    return complete;
+}
+
 /* Diagnostics (tests / tuning): out[0] = best few-octave coarse score,
  * out[1] = best full-octave coarse score, out[2] = exact best score. */
 EXPORT void dengine_stages(void *h, int64_t seed, double *out)

@@ -98,10 +98,16 @@ def _crash_log():
                     _r.seek(seen)
                     _new = [ln.strip() for ln in _r.read().splitlines()]
                 _n = sum(1 for ln in _new if ln.startswith("--- ") and ln.endswith(" ---"))
+                _fatal = next((ln for ln in _new if "fatal exception" in ln.lower()), "")
                 _last = next((ln for ln in reversed(_new)
-                              if ln and not ln.startswith(("---", "File ", "~", "^", "(same"))), "")
-                _msg = (f"{_n or 'An'} error{'s' if _n != 1 else ''} recorded during the "
-                        f"previous session (last: {_last[:120]}) — details in {path}")
+                              if ln and ":" in ln and not ln.startswith(
+                                  ("---", "File ", "~", "^", "(same", "Thread ", "Current ",
+                                   "=====", "<"))), "")
+                if _n == 0 and _fatal:      # (17/10) a crash, no Python error
+                    _msg = (f"SSA closed unexpectedly last time ({_fatal}) — details in {path}")
+                else:
+                    _msg = (f"{_n or 'One'} error{'s' if _n > 1 else ''} recorded during the "
+                            f"previous session (last: {(_last or _fatal)[:120]}) — details in {path}")
                 print("[SSA] " + _msg)
                 os.environ["SSA_CRASH_NOTICE"] = _msg      # shown in the status bar too
         except OSError:
@@ -184,6 +190,11 @@ def main():
                 except Exception:
                     pass
         qInstallMessageHandler(qt_msg)
+    try:                                       # (17/10) Settings: scale, GPU switch
+        from qtui import prefs as _prefs
+        _prefs.apply_startup_env()
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     app.setApplicationName("SimpleSeedAnalyser")
     _gc_in_gui_thread(app)

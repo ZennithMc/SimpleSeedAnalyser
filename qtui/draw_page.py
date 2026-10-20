@@ -269,6 +269,7 @@ class DrawPage(QWidget):
         self.search = None                # DrawSearch while running
         self.engine = None                # its DrawEngine
         self.sinfo = None                 # dict: search parameters / progress bookkeeping
+        self.seed_list = None             # (19/10) SeedListSource searched instead of a range
         self.rows = []                    # results (seed, score, ox, oz), best first
         self._recent = []
         self._spd = None
@@ -670,7 +671,13 @@ class DrawPage(QWidget):
                                       self.start_src.edited(self.start_seed.text())))
         self.start_src.bind_dice(dice)
         row.addLayout(self.start_src.layout(sw, "First seed of the search."))
+        # (19/10) search a seed list instead of a range (as on the Sessions page)
+        self.list_btn = QPushButton("Seed list…")
+        self.list_btn.setToolTip("Search the seeds of a list (.txt / .seeds / .csv) instead of a range.")
+        self.list_btn.clicked.connect(self._seed_list)
+        labeled("Source", self.list_btn)
         self.threads = QSpinBox(); self.threads.setRange(1, max(1, os.cpu_count() or 4))
+        self.threads.setAlignment(Qt.AlignmentFlag.AlignCenter)   # (17/10) centred number
         self.threads.setValue(max(1, (os.cpu_count() or 4) - 1))
         labeled("Threads", self.threads)
         self.rule_kind = QComboBox()
@@ -1007,6 +1014,10 @@ class DrawPage(QWidget):
         n = m.painted()
         tot = m.W * m.H
         lines = []
+        if not modern:
+            lines.append(f"<span style='color:{theme.DANGER}'><b>Draw needs Java 1.18 or newer</b> "
+                         f"({self.world.version_name} selected): choose a 1.18+ version in the top "
+                         f"bar.</span>")
         if not n:
             lines.append(f"<span style='color:{theme.WARN}'>Nothing painted yet — choose a class "
                          f"and paint over the map.</span>")
@@ -1159,12 +1170,49 @@ class DrawPage(QWidget):
 
     def _resumable(self):
         s = self.sinfo
+        cur = self.seed_list.path if self.seed_list is not None else None
         return (s is not None and self.state in ("paused",) and s.get("sig") == _sig_hash(self.model)
-                and s.get("mc") == int(self.world.mc) and s.get("large") == bool(self.world.large_biomes))
+                and s.get("mc") == int(self.world.mc) and s.get("large") == bool(self.world.large_biomes)
+                and s.get("list") == cur)
 
     def _refresh_resume(self):
         if self.state in ("running", "pausing"):
             return
+        self._run_state(self.state)
+
+    def _seed_list(self):
+        """(19/10) Choose / drop the seed list searched instead of the range."""
+        if self.state in ("running", "pausing"):
+            return
+        if self.seed_list is not None:
+            self.seed_list = None
+            self.list_btn.setText("Seed list…")
+            self.list_btn.setToolTip("Search the seeds of a list (.txt / .seeds / .csv) instead of a range.")
+            self._run_state(self.state)
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Seed list", user_path(),
+                                              "Seed lists (*.txt *.seeds *.csv);;All files (*.*)")
+        if not path:
+            return
+        remember_path(path)
+        try:
+            from .tools_dialogs import maybe_convert
+            path = maybe_convert(self, path)
+        except Exception:
+            pass
+        try:
+            from seedlist_io import SeedListSource
+            src = SeedListSource(path)
+            n = len(src)
+        except Exception as e:                           # noqa: BLE001
+            QMessageBox.critical(self, "Seed list", f"Could not read the list:\n{e}")
+            return
+        self._set_seed_list(src)
+
+    def _set_seed_list(self, src):
+        self.seed_list = src
+        self.list_btn.setText(f"{os.path.basename(src.path)} · {fmt_int(len(src))}  ✕")
+        self.list_btn.setToolTip(f"{src.path}\nClick to go back to a seed range.")
         self._run_state(self.state)
 
     def _start_clicked(self):
@@ -1174,6 +1222,9 @@ class DrawPage(QWidget):
             self._launch(resume=False)
 
     def _launch(self, resume):
+        if int(self.world.mc) < cw.MC_VERSIONS["Java 1.18"]:
+            QMessageBox.information(self, "Draw", "Draw needs Java 1.18 or newer: choose a 1.18+ "
+                                    "version in the top bar."); return
         if not self.model.painted():
             QMessageBox.information(self, "Search", "Paint something first."); return
         try:
@@ -1194,8 +1245,11 @@ class DrawPage(QWidget):
             self.rows = []
             self.results.set_rows([])
             self.sinfo = dict(sig=_sig_hash(self.model), mc=spec.mc, large=spec.large, start=start,
-                              done=0, elapsed=0.0, tested=0, passed=0)
-            self.start_src.search_started()
+                              done=0, elapsed=0.0, tested=0, passed=0,
+                              list=(self.seed_list.path if self.seed_list is not None else None),
+                              list_n=(len(self.seed_list) if self.seed_list is not None else 0))
+            if self.seed_list is None:
+                self.start_src.search_started()
         s = self.sinfo
         try:
             eng = de.DrawEngine(spec, min_score=p["min_score"], top_k=p["top_k"])
@@ -1211,7 +1265,14 @@ class DrawPage(QWidget):
                 self._run_state("done"); return
         self.engine = eng
         self.thumbs.set_spec(spec, s["sig"] + f"|{spec.mc}|{spec.large}")
-        self.search = de.DrawSearch(eng, s["start"] + s["done"], count, p["threads"])
+        if s.get("list"):
+            if self.seed_list is None or self.seed_list.path != s["list"]:
+                QMessageBox.warning(self, "Search", "This search ran on a seed list that is no "
+                                    "longer chosen."); return
+            self.search = de.DrawSearch(eng, 0, 0, p["threads"], seed_list=self.seed_list,
+                                        skip=int(s["done"]))
+        else:
+            self.search = de.DrawSearch(eng, s["start"] + s["done"], count, p["threads"])
         self._run_t0 = time.perf_counter()
         self._spd = None
         self._last_rate_pt = (time.perf_counter(), 0)
@@ -1262,7 +1323,9 @@ class DrawPage(QWidget):
             self._count()
         rule = s.get("rule") or ["never", 0]
         frac = None
-        if rule[0] == "seeds":
+        if s.get("list") and rule[0] in ("never", "seeds"):
+            frac = done / max(1, int(s.get("list_n") or 1))
+        elif rule[0] == "seeds":
             frac = done / max(1, rule[1])
         elif rule[0] == "time":
             frac = elapsed / max(1, rule[1])
@@ -1315,30 +1378,43 @@ class DrawPage(QWidget):
         if s is None:
             return
         st = {"paused": "Paused", "done": "Done", "stopped": "Stopped"}.get(self.state, "")
+        nxt = ""
+        if self.state == "paused":
+            nxt = (f"  ·  {fmt_int(s['done'])} / {fmt_int(s.get('list_n') or 0)} of the list"
+                   if s.get("list") else f"  ·  next {s['start'] + s['done']}")
         self.stat.setText(f"{st}  ·  {fmt_int(s['done'])} seeds  ·  {fmt_int(len(self.rows))} kept  ·  "
-                          f"{fmt_time(s['elapsed'])}" + (f"  ·  next {s['start'] + s['done']}"
-                                                         if self.state == "paused" else ""))
+                          f"{fmt_time(s['elapsed'])}" + nxt)
 
     def _run_state(self, st):
         prev = self.state
         self.state = st
         running = st in ("running", "pausing")
         if prev in ("running", "pausing") and st in ("done", "stopped", "paused") \
-                and self.sinfo is not None:
+                and self.sinfo is not None and not self.sinfo.get("list"):
             # a search from the Saved start moves it on (paused: the field keeps
             # the paused search's start, the Saved value already moves on)
             v = (int(self.sinfo["start"]) + int(self.sinfo["done"])) % (1 << 64)
             v = v - (1 << 64) if v >= 1 << 63 else v
             self.start_src.search_ended(v, move_field=(st != "paused"))
-        self.start_src.set_enabled(not running)
+        self.start_src.set_enabled(not running and self.seed_list is None)
+        if prev == "running" and st == "done":          # (17/10) Settings: notify
+            from . import prefs as _pf
+            _pf.notify_done(self.window())
         can_resume = self._resumable()
-        self.b_start.setEnabled(not running)
+        # (17/10) Draw is for Java 1.18+ only (its classes and the map preview
+        # follow the 1.18 climate generation)
+        from .widgets import explain_disabled as _xd
+        _modern = int(self.world.mc) >= cw.MC_VERSIONS["Java 1.18"]
+        _xd(self.b_start, (not running) and _modern,
+            "" if _modern else f"Draw needs Java 1.18 or newer ({self.world.version_name} selected).")
         self.b_start.setText("  Resume" if can_resume else "  Start")
         icons.bind(self.b_start, "play", 16, "#ffffff", "#ffffff")
         self.b_pause.setEnabled(st == "running")
         self.b_stop.setEnabled(running or st == "paused")
-        for w in (self.start_seed, self.threads, self.rule_kind, self.rule_stack):
+        for w in (self.threads, self.rule_kind, self.rule_stack):
             w.setEnabled(not running)
+        self.start_seed.setEnabled(not running and self.seed_list is None)
+        self.list_btn.setEnabled(not running)
         self.min_score.setEnabled(not running); self.top_k.setEnabled(not running)
         self.engine_chip.setProperty("state", "ok" if running else "off")
         self.engine_chip.style().unpolish(self.engine_chip); self.engine_chip.style().polish(self.engine_chip)
@@ -1370,6 +1446,7 @@ class DrawPage(QWidget):
                     done=s["done"], elapsed=round(s["elapsed"], 2), tested=s.get("tested", 0),
                     passed=s.get("passed", 0), min_score=s.get("min_score"), top_k=s.get("top_k"),
                     threads=s.get("threads"), rule=s.get("rule"),
+                    list=s.get("list"), list_n=s.get("list_n", 0),
                     results=[[int(a), float(b), int(c), int(d)] for a, b, c, d in self.rows])
 
     def to_dict(self):
@@ -1406,7 +1483,14 @@ class DrawPage(QWidget):
                               start=int(s.get("start", 0)), done=int(s.get("done", 0)),
                               elapsed=float(s.get("elapsed", 0)), tested=int(s.get("tested", 0)),
                               passed=int(s.get("passed", 0)), min_score=s.get("min_score"),
-                              top_k=s.get("top_k"), threads=s.get("threads"), rule=s.get("rule"))
+                              top_k=s.get("top_k"), threads=s.get("threads"), rule=s.get("rule"),
+                              list=s.get("list"), list_n=int(s.get("list_n") or 0))
+            if s.get("list") and os.path.exists(s["list"]):     # (19/10) its seed list again
+                try:
+                    from seedlist_io import SeedListSource
+                    self._set_seed_list(SeedListSource(s["list"]))
+                except Exception:
+                    pass
             if s.get("min_score"):
                 self.min_score.setValue(int(round(float(s["min_score"]) * 100)))
             if s.get("top_k"):

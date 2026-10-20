@@ -282,6 +282,7 @@ int climLazyGet(ClimLazy *cl, DoublePerlinNoise *view, uint64_t seed,
  * prove that none of the 'alive' candidates of 'bp' can be the result, else
  * exactly the biome sampleBiomeNoise would return. */
 int getBiomeLeafLimits(int mc, int biome, int (*out)[12], int max);
+int getBiomeLeafBoxes(int mc, int biome, int (*out)[12], int max);   /* SSA 19/10 */
 
 typedef struct {
     int hull[12];

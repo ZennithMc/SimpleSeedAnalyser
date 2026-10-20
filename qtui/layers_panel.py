@@ -63,10 +63,27 @@ class LayersPanel(QWidget):
         scroll.setWidget(bodyw)
         outer.addWidget(scroll, 1)
 
+        # ── (18/10) dimension ──────────────────────────────────────────
+        lay.addWidget(section_title("Dimension"))
+        self.dim_seg = Segmented(["Overworld", "Nether", "End"], "Overworld")
+        self.dim_seg.setToolTip("Dimension of the map  (Ctrl+1 / Ctrl+2 / Ctrl+3)\n"
+                                "Overworld ↔ Nether keeps the same place (coordinates ÷ 8 / × 8).")
+        self.dim_seg.changed.connect(
+            lambda n: self.map.set_dim({"Overworld": 0, "Nether": -1, "End": 1}[n]))
+        lay.addWidget(self.dim_seg)
+        lay.addSpacing(10)
+
+        def _box():
+            w = QWidget(); bl = QVBoxLayout(w)
+            bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(4)
+            return w, bl
+
         # ── landmarks & structures ──────────────────────────────────────
-        lay.addWidget(section_title("Landmarks"))
+        self._lm_box, lml = _box()
+        lay.addWidget(self._lm_box)
+        lml.addWidget(section_title("Landmarks"))
         for key, label, ikey in LANDMARKS:
-            lay.addWidget(self._toggle(key, label, ikey))
+            lml.addWidget(self._toggle(key, label, ikey))
             if key == "__strongholds":
                 sh = QPushButton("All 128 strongholds · eyes, top Y…")
                 sh.setProperty("kind", "ghost")
@@ -75,8 +92,8 @@ class LayersPanel(QWidget):
                               "corruptible portal. Right-click / double-click a stronghold on the map\n"
                               "for its details.")
                 sh.clicked.connect(lambda: self.map.show_all_strongholds())
-                lay.addWidget(sh)
-        lay.addSpacing(10)
+                lml.addWidget(sh)
+        lml.addSpacing(10)
         row = QHBoxLayout(); row.setSpacing(4)
         row.addWidget(section_title("Structures")); row.addStretch(1)
         for txt, val in (("All", True), ("None", False)):
@@ -86,6 +103,8 @@ class LayersPanel(QWidget):
             row.addWidget(b)
         lay.addLayout(row)
         from condition_types import DISABLED_TYPES
+        self._sboxes = {}
+        sb0, sl0 = _box(); lay.addWidget(sb0); self._sboxes[0] = sb0
         for key in SURFACE:
             if key in DISABLED_TYPES:            # temporarily hidden (abandoned camp, 01/10)
                 self.map.visible[key] = False
@@ -96,10 +115,27 @@ class LayersPanel(QWidget):
                 if key == "village":             # abandoned villages: own icon, same switch (01/10)
                     tg.setToolTip("Also shows abandoned (zombie) villages, ≈ 2 % of villages,\n"
                                   "with their own icon.")
-                lay.addWidget(tg)
-        lay.addWidget(body("Structures appear when zoomed in (≤ 48 blocks per pixel).",
+                sl0.addWidget(tg)
+        for d in (-1, 1):                        # (18/10) Nether / End structures
+            sbd, sld = _box(); lay.addWidget(sbd); self._sboxes[d] = sbd
+            for key in cw.DIM_STRUCTURE_TYPES[d]:
+                tg = self._toggle(key, struct_icons.label(key), key)
+                if key == "end_city":
+                    tg.setToolTip("Only where the island is high enough (as the game).\n"
+                                  "Cities with an end ship have their own icon.")
+                elif key == "fortress":
+                    tg.setToolTip("From 1.16 a fortress only exists where no bastion\n"
+                                  "took the place.")
+                elif key == "end_gateway":
+                    tg.setToolTip("Scattered return gateways of the outer islands (not the\n"
+                                  "20 that appear when the dragon dies).")
+                sld.addWidget(tg)
+        lay.addWidget(body("Structures appear when zoomed in (Settings → Map sets how far).",
                            muted=True, small=True))
         # (10/10) 1.16 dungeons / lava lakes, with a Y range
+        self._f116_box, f116l = _box()
+        lay.addWidget(self._f116_box)
+        _outer_lay, lay = lay, f116l                   # (18/10) overworld only: own box
         lay.addSpacing(6)
         lay.addWidget(section_title("1.16 features"))
         for key, tip in (("dungeon", "The dungeons that really generate: SSA rebuilds the 1.16.1 terrain\n"
@@ -145,34 +181,12 @@ class LayersPanel(QWidget):
         yrow.addWidget(self.f116_lo); yrow.addWidget(body("to", muted=True)); yrow.addWidget(self.f116_hi)
         yrow.addStretch(1)
         lay.addLayout(yrow)
-        self.f116_ground = QCheckBox("Attempts below the ground only (Alt+S view)")
-        self.f116_ground.setChecked(bool(self.map.ov.get("f116_ground", True)))
-        self.f116_ground.setToolTip("Structure-seed view (48 bits, no terrain): hides the dungeon attempts\n"
-                                    "more than 10 blocks above the approximate ground.")
-
-        def _gr(on):
-            self.map.ov["f116_ground"] = bool(on)
-            self.map.update(); self.changed.emit()
-        self.f116_ground.toggled.connect(_gr)
-        lay.addWidget(self.f116_ground)
-        # (10/10) what the map shows are the places the game TRIES: zoomed in,
-        # they are checked with the real Minecraft 1.16.1 by themselves
-        for key, txt, tip in (
-                ("f116_auto", "Check the unsure ones with Minecraft",
-                 "Zoomed in (icons), the « ? » dungeons / lava lakes on screen (near a village,\n"
-                 "or every one with an older library) are sent to the real Minecraft 1.16.1\n"
-                 "a moment after the map stops: ✓ real, ✗ not generated."),
-                ("f116_only_real", "Hide the ones Minecraft does not have",
-                 "Removes the ✗ ones (most dungeon attempts: no cave next to them).")):
-            cb = QCheckBox(txt)
-            cb.setChecked(bool(self.map.ov.get(key, True)))
-            cb.setToolTip(tip)
-
-            def _set(on, key=key):
-                self.map.ov[key] = bool(on)
-                self.map.update(); self.changed.emit()
-            cb.toggled.connect(_set)
-            lay.addWidget(cb)
+        lay = _outer_lay
+        # (17/10) the 3 options of the 1.16 features (attempts below the ground,
+        # Minecraft check of the unsure ones, hide the ones it does not have) are
+        # no longer in the panel: always on, as they were by default
+        for key in ("f116_ground", "f116_auto", "f116_only_real"):
+            self.map.ov[key] = True
         # coordinate grid (like cubiomes-viewer), 01/10
         grow = QHBoxLayout(); grow.setSpacing(6)
         self.grid = QCheckBox("Grid")
@@ -211,6 +225,10 @@ class LayersPanel(QWidget):
 
         # ── noise overlay ──────────────────────────────────────────────
         lay.addWidget(section_title("Noise overlay"))
+        self.noise_dim_note = body("Climate noises and heights are the Overworld's: back to it "
+                                   "to see them (Ctrl+1).", muted=True, small=True)
+        self.noise_dim_note.setVisible(False)
+        lay.addWidget(self.noise_dim_note)
         self.noise = QComboBox(); self.noise.addItems(NOISE_CHOICES)
         for i, name in enumerate(NOISE_CHOICES):
             self.noise.setItemData(i, f"{name}  ({NOISE_KEYS[name]})" if name != "Off"
@@ -325,9 +343,35 @@ class LayersPanel(QWidget):
         self._apply_era_palette()
         theme.signals.changed.connect(self._crunch_info)      # colour baked in its style
         self.map.overlayChanged.connect(self._crunch_current)
+        self.map.overlayChanged.connect(self._sync_dim)
         self._refresh_availability()
         self._on_noise("Off")
         self._crunch_refresh()
+        self._sync_dim()
+
+    def _sync_dim(self):
+        """(18/10) Show the layers of the map's dimension."""
+        d = self.map.dim
+        self.dim_seg.blockSignals(True)
+        self.dim_seg.set_value({0: "Overworld", -1: "Nether", 1: "End"}[d])
+        self.dim_seg.blockSignals(False)
+        self._lm_box.setVisible(d == 0)
+        self._f116_box.setVisible(d == 0)
+        for k, w in self._sboxes.items():
+            w.setVisible(k == d)
+        # (18/10) the End has its height view (Approx height = the islands'
+        # surface, as cubiomes-viewer); the climate noises are the Overworld's
+        self.noise.setEnabled(d in (0, 1))
+        self.noise_box.setEnabled(d in (0, 1))
+        cur = self.noise.currentText()
+        if d == 1:
+            self.noise_dim_note.setText("End: « Approx height » shows the islands' surface "
+                                        "(cubiomes-viewer's height view). The climate noises "
+                                        "are the Overworld's (Ctrl+1).")
+        else:
+            self.noise_dim_note.setText("Climate noises and heights are the Overworld's: back to it "
+                                        "to see them (Ctrl+1).")
+        self.noise_dim_note.setVisible(d == -1 or (d == 1 and cur not in ("Off", "Approx height")))
 
     # ── crunchiness ────────────────────────────────────────────────────────
     def _crunch_refresh(self):
@@ -466,8 +510,9 @@ class LayersPanel(QWidget):
         self.changed.emit()
 
     def _set_all(self, on):
+        d = self.map.dim                                  # (18/10) the dimension shown
         for key, cb in self.boxes.items():
-            if not key.startswith("__") and cb.isEnabled():
+            if not key.startswith("__") and cb.isEnabled() and cw.STRUCTURE_DIM.get(key, 0) == d:
                 cb.setChecked(on)
 
     # default biome colours by era (03/10): Cooler & Brighter before 1.18, True
@@ -533,6 +578,8 @@ class LayersPanel(QWidget):
         if noise in CLIMATE:
             self._fill_octaves(noise)
         self.map.set_overlay(noise=noise, octave=self._octave_spec() if noise in CLIMATE else None)
+        if hasattr(self, "dim_seg"):
+            self._sync_dim()
 
     def _fill_octaves(self, noise):
         self.oct_list.blockSignals(True)

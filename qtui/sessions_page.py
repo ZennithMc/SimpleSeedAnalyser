@@ -406,6 +406,7 @@ class ResultsModel(QAbstractTableModel):
         super().__init__(parent)
         self.rows = []                                # (seed, details)
         self.loc = {}                                 # seed -> (x, z) | "…" (being located)
+        self.loc_sig = {}                             # seed -> conditions it was located with
         self.mcs = {}                                 # seed -> (text, tip): Minecraft check
         self._mono = theme.mono_font(9.5)
 
@@ -493,7 +494,8 @@ class ResultsModel(QAbstractTableModel):
         self.endInsertRows()
 
     def clear(self):
-        self.beginResetModel(); self.rows = []; self.loc = {}; self.mcs = {}; self._rows_idx = None
+        self.beginResetModel(); self.rows = []; self.loc = {}; self.loc_sig = {}; self.mcs = {}
+        self._rows_idx = None
         self.endResetModel()
 
     def remove_rows(self, rows):
@@ -672,6 +674,9 @@ class SessionsPage(QWidget):
         self.world.changed.connect(self._world_seed_changed)
         self.runner.engine.connect(self._engine)
         self.runner.stateChanged.connect(self._run_state)
+        # (18/10) results loaded / added while no search runs get located too
+        self.results.rowsInserted.connect(lambda *_a: self._autoloc_kick())
+        self.world.changed.connect(lambda *_a: self._autoloc_kick(1500))   # version / large biomes
         self.runner.message.connect(self._run_message)
         self.runner.failed.connect(self._run_failed)
         # the end-of-search summary (seeds searched, time…) stays until the
@@ -988,6 +993,7 @@ class SessionsPage(QWidget):
         self._sync_saved_for_mode()
         self._sync_fam_opts()
         self.threads = QSpinBox(); self.threads.setRange(1, os.cpu_count() or 4)
+        self.threads.setAlignment(Qt.AlignmentFlag.AlignCenter)   # (17/10) centred number
         self.threads.setValue(max(1, (os.cpu_count() or 4) // 2))
         labeled("Threads", self.threads, "CPU threads. Can be changed while paused.")
         # stop rule: never / N seeds searched / N results / a duration
@@ -1051,6 +1057,7 @@ class SessionsPage(QWidget):
 
     def _model_changed(self):
         self.tree._check = None                      # ✓/✗ were for the old conditions
+        self._autoloc_kick(1500)                     # (18/10) re-locate for the new tree
         if hasattr(self, "opt_struct"):
             self._sync_fam_opts()
         if hasattr(self, "b_undo"):
@@ -1140,7 +1147,7 @@ class SessionsPage(QWidget):
             _xd(b, has, "select a condition in the list first.")
         self.act_add_child.setEnabled(has)
         if self._editing_uid is None:
-            self._show_zones()
+            self._show_zones(follow=True)
 
     def _tree_restructured(self, order):
         pos = {u: i for i, (u, _p) in enumerate(order)}
@@ -1347,13 +1354,16 @@ class SessionsPage(QWidget):
         rmax = int(c.get("rmax", 0) or 0)
         col = color or type_color(t)
         lab = label if label is not None else display_name(c)
+        from condition_types import cond_dim
+        dm = cond_dim(c)                  # (18/10) drawn on the map of its dimension
         if rmax > 0:
-            return dict(shape="circle", cx=ax, cz=az, r=rmax - 1, color=col, label=lab, active=active)
+            return dict(shape="circle", cx=ax, cz=az, r=rmax - 1, color=col, label=lab, active=active,
+                        dim=dm)
         if abs(int(c.get("x2", 0)) - int(c.get("x1", 0))) >= 20_000_000:
             return None
         return dict(shape="rect", x1=ax + int(c.get("x1", 0)), z1=az + int(c.get("z1", 0)),
                     x2=ax + int(c.get("x2", 0)), z2=az + int(c.get("z2", 0)),
-                    color=col, label=lab, active=active)
+                    color=col, label=lab, active=active, dim=dm)
 
     # ── what a clicked result shows on the map: Off / Simple / Detailed ──────
     HIT_MODES = ("Off", "Simple", "Detailed")
@@ -1418,7 +1428,7 @@ class SessionsPage(QWidget):
         m = self.HIT_MODES
         self._set_hit_mode(m[(m.index(self._hit_mode) + 1) % len(m)])
 
-    def _show_zones(self):
+    def _show_zones(self, follow=False):
         """Selected condition's zone (relative ones drawn at the origin, dashed),
         or — when a result is explained — every active condition at its real
         place, numbered #1… like the condition tree."""
@@ -1436,8 +1446,12 @@ class SessionsPage(QWidget):
                     col = type_color(t)
                     name = display_name(c)
                     p = pos[i]
+                    from condition_types import cond_dim
+                    dm = cond_dim(c)
+                    # a « Scale to Nether » hands Nether coordinates to its children
+                    tag = {-1: "Nether ", 1: "End "}.get(-1 if t == "scale_to_nether" else dm, "")
                     legend.append(dict(num=n, name=name, color=col,
-                                       where=(f"{p[0]}, {p[1]}" if p is not None else
+                                       where=(f"{tag}{p[0]}, {p[1]}" if p is not None else
                                               ("✓" if ok and t in CONTAINERS else "—"))))
                     if p is None and t not in CONTAINERS:
                         continue
@@ -1455,13 +1469,31 @@ class SessionsPage(QWidget):
                             fy = self._feature_y_at(c, p[0], p[1])
                             if fy:
                                 det += "   ·   " + fy
+                        if dm:
+                            det = {-1: "Nether  ", 1: "End  "}[dm] + det
                         markers.append(dict(x=p[0], z=p[1], num=n, color=col, label=name,
-                                            detail=det))
-            # the condition selected in the tree is always drawn, highlighted, at
-            # its place for this seed (08/10: with a result shown, selecting a
-            # condition showed nothing — e.g. to see a "within 800 blocks" circle)
-            k = self._selected_active_index(active)
-            if k is not None:
+                                            detail=det, dim=dm))
+            # the conditions selected in the tree are drawn, highlighted, at their
+            # place for this seed (08/10: with a result shown, selecting a
+            # condition showed nothing — e.g. to see a "within 800 blocks" circle).
+            # (18/10) every selected one (before: nothing as soon as several
+            # were selected), and nothing at all in Off (they stayed drawn)
+            sel = self._selected_active_indices(active) if mode != "Off" else []
+            # (19/10) a selected NOT / OR shows what it holds (its children, through
+            # nested gates); the map follows the dimension of the condition clicked
+            more, todo = [], list(sel)
+            while todo:
+                j = todo.pop(0)
+                if active[j].get("type") in ("logic_or", "logic_not"):
+                    for m_, c_ in enumerate(active):
+                        if int(c_.get("relative", 0) or 0) == j + 1 and m_ not in sel + more:
+                            more.append(m_); todo.append(m_)
+            if follow and sel:
+                from condition_types import eff_dim
+                d_ = eff_dim(active, sel[0])
+                if d_ != self.map.dim:
+                    self.map.set_dim(d_)
+            for k in sel + more:
                 c = active[k]
                 if anchors[k] is not None:
                     hit = next((z for z in zones if z.get("num") == k + 1), None)
@@ -1471,6 +1503,7 @@ class SessionsPage(QWidget):
                         z = self._zone_of(c, anchors[k], label=f"#{k + 1} {display_name(c)}",
                                           active=True)
                         if z:
+                            z["num"] = k + 1
                             zones.append(z)
                 else:
                     z = self._zone_of(c, (0, 0), active=True,
@@ -1487,9 +1520,31 @@ class SessionsPage(QWidget):
                 self._legend_key = key
                 self.map.legend_reset()
         else:
-            uid = self.tree.current_uid()
-            c = self.model.get(uid) if uid else None
-            if c:
+            # (18/10) every condition selected in the tree (before: the current
+            # one only, i.e. nothing new when several were selected)
+            # Off = nothing drawn (except the condition being edited)
+            uids = self._selected_uids()
+            if getattr(self, "_hit_mode", "Detailed") == "Off" and self._editing_uid is None:
+                uids = []
+            # (19/10) a selected NOT / OR: what it holds is drawn too
+            uids = list(uids)
+            todo = list(uids)
+            while todo:
+                g_ = self.model.get(todo.pop(0))
+                if g_ and g_.get("type") in ("logic_or", "logic_not"):
+                    for c_ in self.model.conds:
+                        if c_.get("_parent") == g_["_uid"] and c_["_uid"] not in uids \
+                                and c_.get("enabled", True):
+                            uids.append(c_["_uid"]); todo.append(c_["_uid"])
+            first_dim = True
+            for uid in uids:
+                c = self.model.get(uid)
+                if not c:
+                    continue
+                if first_dim and c.get("type") not in ("logic_or", "logic_not", "spiral",
+                                                       "scale_to_nether", "scale_to_overworld"):
+                    first_dim = False
+                    self._follow_dim(c)
                 exp = self.model.export(only={uid})[0]
                 rel = bool(c.get("_parent", 0))
                 exp["relative"] = 1 if rel else 0
@@ -1532,10 +1587,29 @@ class SessionsPage(QWidget):
         except Exception:
             return None
 
-    def _selected_active_index(self, active):
+    def _selected_uids(self):
+        """(18/10) The conditions selected in the tree, current one first (the
+        current one alone when the selection is empty)."""
+        cur = self.tree.current_uid()
+        sel = [u for u in self.tree.selected_uids() if u]
+        if cur and (cur in sel or not sel):
+            sel = [cur] + [u for u in sel if u != cur]
+        return sel
+
+    def _selected_active_indices(self, active):
+        """Positions, in the explained `active` list, of the selected conditions."""
+        out = []
+        for uid in self._selected_uids():
+            k = self._selected_active_index(active, uid)
+            if k is not None and k not in out:
+                out.append(k)
+        return out
+
+    def _selected_active_index(self, active, uid=None):
         """Position, in the explained `active` list, of the condition selected in
         the tree (None: none selected, disabled, or the tree changed since)."""
-        uid = self.tree.current_uid()
+        if uid is None:
+            uid = self.tree.current_uid()
         if not uid:
             return None
         conds = self.model.conds
@@ -1561,7 +1635,19 @@ class SessionsPage(QWidget):
             return None
         return k
 
+    def _follow_dim(self, c):
+        """(18/10) The map shows the dimension of the condition being looked
+        at / edited (its zone is drawn in that dimension's coordinates)."""
+        from condition_types import cond_dim
+        t = c.get("type", "")
+        if t in ("scale_to_nether", "scale_to_overworld", "logic_or", "logic_not", "spiral"):
+            return
+        d = cond_dim(c)
+        if d != self.map.dim:
+            self.map.set_dim(d)
+
     def _form_preview(self, cond):
+        self._follow_dim(cond)
         parent = int(getattr(self.form, "parent_uid", 0) or 0)
         c = dict(cond); c["relative"] = 1 if parent else 0
         z = self._zone_of(c, (0, 0), active=True,
@@ -1692,6 +1778,7 @@ class SessionsPage(QWidget):
         self.results.add([(sd, "") for sd in seeds])
         self._run_confirm = "unset"
         self._restore_mc_status(st.get("mc_status"), seeds)
+        self._restore_locations(st.get("locations"), st.get("location_dims"))
         self._mcc_rejected = int(st.get("mc_rejected", 0) or 0)
         pend = st.get("mc_pending") or []
         cp = self._confirm_params(self.model.export(), force=True) if pend else None
@@ -1917,6 +2004,22 @@ class SessionsPage(QWidget):
         if self.results.mcs:                  # the Minecraft checks (03/10)
             st["mc_status"] = {str(k): list(v) for k, v in
                                list(self.results.mcs.items())[:200000]}
+        # (18/10) the located spots, for these very conditions: reopening the
+        # session no longer locates every result again
+        cur = self._loc_key()
+        locs = {}
+        for sd, _d in self.results.rows:
+            v = self.results.loc.get(sd)
+            if self.results.loc_sig.get(sd) == cur and v is not None and v != "locating…":
+                locs[str(sd)] = list(v) if isinstance(v, tuple) else str(v)
+                if len(locs) >= 200000:
+                    break
+        if locs:
+            st["locations"] = locs
+            ld = self.results.__dict__.get("loc_dim") or {}
+            dims = {str(k): int(v) for k, v in ld.items() if v and str(k) in locs}
+            if dims:
+                st["location_dims"] = dims
         if self._mcc_pending:                 # candidates still waiting for Minecraft
             st["mc_pending"] = [[str(k), v] for k, v in list(self._mcc_pending.items())[:200000]]
         if self._mcc_rejected:
@@ -1926,6 +2029,39 @@ class SessionsPage(QWidget):
             st["profile"] = dict(rows=prof[0], total=prof[1], seeds=int(self.runner._done_before),
                                  n=len(prof[0]))
         return st
+
+    def _loc_key(self, conds=None):
+        """(18/10) What a located spot depends on: the conditions (the
+        _explain_cache key part, before the NUL), the version, large biomes."""
+        if conds is None:
+            conds = self.model.export()
+        return f"{self._sig(conds)}\x00{self._mc()}\x00{int(bool(self.world.large_biomes))}"
+
+    def _restore_locations(self, locs, dims=None):
+        """(18/10) The spots saved with the session (see _session_state)."""
+        if not locs:
+            return
+        cur = self._loc_key()
+        rows = self.results._row_of()
+        ld = self.results.__dict__.setdefault("loc_dim", {})
+        for k, v in locs.items():
+            try:
+                sd = int(k)
+            except (TypeError, ValueError):
+                continue
+            if sd not in rows:
+                continue
+            if isinstance(v, (list, tuple)) and len(v) == 2:
+                v = (int(v[0]), int(v[1]))
+            elif not isinstance(v, str):
+                continue
+            self.results.loc[sd] = v
+            self.results.loc_sig[sd] = cur
+            if dims and str(k) in dims:
+                ld[sd] = int(dims[str(k)])
+        if self.results.rows:
+            self.results.dataChanged.emit(self.results.index(0, 1),
+                                          self.results.index(len(self.results.rows) - 1, 2))
 
     def _write_args(self, state):
         """Everything the session file needs, read from the widgets NOW (the
@@ -2080,7 +2216,15 @@ class SessionsPage(QWidget):
         if not active:
             QMessageBox.information(self, "Start", "Add at least one enabled condition.")
             return
-        if self._topy_family_ok(active) and self.mode.value() != "48-bit family":
+        from . import prefs as _prefs
+        _tp = _prefs.get("topy_family")
+        if self._topy_family_ok(active) and self.mode.value() != "48-bit family" and _tp == "switch":
+            self.mode.set_value("48-bit family")
+            try:
+                self.mode.changed.emit("48-bit family")
+            except Exception:
+                pass
+        if self._topy_family_ok(active) and self.mode.value() != "48-bit family" and _tp == "ask":
             box = QMessageBox(self)
             box.setWindowTitle("Top Y")
             box.setIcon(QMessageBox.Icon.Question)
@@ -2159,12 +2303,18 @@ class SessionsPage(QWidget):
             b_old = box.addButton("Resume the paused search", QMessageBox.ButtonRole.AcceptRole)
             box.addButton(QMessageBox.StandardButton.Cancel)
             box.setDefaultButton(b_new)
-            box.exec()
-            if box.clickedButton() is b_new:
+            from . import prefs as _prefs
+            _ans = _prefs.get("resume_space_changed")          # (17/10) Settings
+            if _ans == "ask":
+                box.exec()
+                clicked_sp = box.clickedButton()
+            else:
+                clicked_sp = b_new if _ans == "new" else b_old
+            if clicked_sp is b_new:
                 self.runner.stop()
                 self._start_or_resume()
                 return
-            if box.clickedButton() is not b_old:
+            if clicked_sp is not b_old:
                 return
             # back to the paused search's settings (version / large biomes too:
             # resuming a 1.21 search while the map shows 1.16 mixed two worlds)
@@ -2195,8 +2345,13 @@ class SessionsPage(QWidget):
             b_restart = box.addButton("Restart from the start seed", QMessageBox.ButtonRole.DestructiveRole)
             box.addButton(QMessageBox.StandardButton.Cancel)
             box.setDefaultButton(b_check)
-            box.exec()
-            clicked = box.clickedButton()
+            from . import prefs as _prefs
+            _ans = _prefs.get("resume_conditions_changed")     # (17/10) Settings
+            if _ans == "ask":
+                box.exec()
+                clicked = box.clickedButton()
+            else:
+                clicked = {"recheck": b_check, "keep": b_keep, "restart": b_restart}[_ans]
             if clicked is b_restart:
                 self.runner.stop()
                 self._start_or_resume()
@@ -2452,6 +2607,8 @@ class SessionsPage(QWidget):
         _xd(self.b_engine, not running, busy)
         self.engine_chip.setProperty("state", "ok" if running else "off")
         self.engine_chip.style().unpolish(self.engine_chip); self.engine_chip.style().polish(self.engine_chip)
+        if not running:
+            self._autoloc_kick()                     # (18/10) locate the results
         if st == "idle":
             self.stat.setText("Idle")
         if not running and self.prog.maximum() == 0:     # unlimited: stop the busy bar
@@ -3072,6 +3229,16 @@ class SessionsPage(QWidget):
             return
         seed = self.results.rows[cur.row()][0]
         self.world.set(seed=seed)
+        # (18/10) the spot is already known (located automatically, or saved
+        # with the session): the map goes there AT ONCE — the full check (zones,
+        # ✓ / ✗) follows; it took ~3 s on a heavy session before the map moved
+        loc = self.results.loc.get(seed)
+        self._pre_centered = None
+        if isinstance(loc, tuple) and self.results.loc_sig.get(seed) == self._loc_key():
+            fdim = int((self.results.__dict__.get("loc_dim") or {}).get(seed, 0) or 0)
+            self._set_map_dim(fdim)
+            self.map.center_on(loc[0], loc[1])
+            self._pre_centered = (seed, int(loc[0]), int(loc[1]))
         self._explain_seed(seed)
 
     def _world_seed_changed(self):
@@ -3090,6 +3257,132 @@ class SessionsPage(QWidget):
             return
         self.table.clearSelection()
         self._explain_seed(int(self.world.seed), check=True)
+
+    def _loc_value(self, res):
+        """(18/10) What the Location column shows for a check_seed result: the
+        spot (it matches), « ✗ #n » (it fails the CURRENT conditions at #n —
+        e.g. a condition added after the search; before: the 0, 0 of a
+        crunchiness), « — » (nothing located)."""
+        if not res or res[0] == "err":
+            return "—"
+        ok, active, anchors, pos = res[:4]
+        if not ok:
+            reached, passed = (res[4], res[5]) if len(res) >= 6 else (None, None)
+            st = self._check_status(active, anchors, pos, reached, passed, ok)
+            cul = [n for n, v in st.items() if v == "culprit"]
+            return f"✗ #{cul[0]}" if cul else "✗"
+        f = self.focus_of(active, pos)
+        return "—" if f is None else (int(f[0]), int(f[1]))
+
+    # ── (18/10) locate every result in the background while no search runs ──
+    AUTOLOC_MAX = 5000                   # results located automatically (first ones)
+
+    def _autoloc_kick(self, delay=600):
+        t = self.__dict__.get("_autoloc_timer")
+        if t is None:
+            from PySide6.QtCore import QTimer
+            t = self._autoloc_timer = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._autoloc_step)
+        if not t.isActive():
+            t.start(delay)
+
+    def _autoloc_step(self):
+        """(18/10) Hands the results still to locate to the helper processes:
+        batches of seeds (one C array per batch, ≈ 0.5 s each), as many in
+        flight as there are helpers — before: one seed at a time, CPU idle."""
+        conds = self.model.export()
+        if not cs_active(conds):
+            return
+        from .map_engine import _loc_pool, loc_pool_workers
+        nw = loc_pool_workers()
+        if self.runner.state in ("running", "pausing", "stopping"):
+            # (18/10) the new results are located DURING the search too, by one
+            # helper: a match costs about what the search spent on that seed
+            # (they are rare), the search keeps the other cores
+            if self.runner.state != "running":
+                return
+            nw = 1
+        inflight = self.__dict__.setdefault("_autoloc_inflight", set())
+        st = self.__dict__.setdefault("_autoloc_st", {"tasks": 0, "batch": 16})
+        if st["tasks"] >= nw:
+            return
+        sig = self._loc_key(conds)
+        mc = self._mc()
+        rs = self.results
+        sigs = rs.loc_sig
+        cache = self.__dict__.setdefault("_explain_cache", {})
+        todo = []
+        for sd, _d in rs.rows[:self.AUTOLOC_MAX]:
+            if sigs.get(sd) == sig or sd in inflight or rs.loc.get(sd) == "locating…":
+                continue
+            key = (sd, mc, sig.split("\x00")[0])
+            if key in cache:                          # located by a click
+                rs.loc_sig[sd] = sig
+                rs.set_location(sd, self._loc_value(cache[key]))
+                continue
+            todo.append(sd)
+            if len(todo) >= (nw - st["tasks"]) * st["batch"]:
+                break
+        if not todo:
+            return
+        sig_obj = self.__dict__.get("_autoloc_sigobj")
+        if sig_obj is None:
+            sig_obj = self._autoloc_sigobj = _Explain(self)
+            sig_obj.done.connect(self._autoloc_done)
+        b = max(1, st["batch"])
+        # spread over every free helper (a short list: smaller batches)
+        b = max(1, min(b, -(-len(todo) // max(1, nw - st["tasks"]))))
+        pool = _loc_pool()
+        for i in range(0, len(todo), b):
+            part = todo[i:i + b]
+            inflight.update(part)
+            st["tasks"] += 1
+
+            def work(part=part):
+                import time as _t
+                t0 = _t.perf_counter()
+                try:
+                    import custom_search as cs
+                    out = pool.submit(cs.check_seeds, conds, part, mc).result()
+                except Exception as e:                # noqa: BLE001
+                    out = [(sd, ("err", f"{type(e).__name__}: {e}")) for sd in part]
+                sig_obj.done.emit(None, (sig, mc, out, _t.perf_counter() - t0, part))
+            threading.Thread(target=work, daemon=True).start()
+
+    def _autoloc_done(self, _none, payload):
+        sig, mc, out, dt, part = payload
+        st = self._autoloc_st
+        st["tasks"] = max(0, st["tasks"] - 1)
+        self._autoloc_inflight.difference_update(part)
+        if dt > 0.05 and part:                        # ~0.5 s per batch
+            st["batch"] = max(1, min(4096, int(len(part) * 0.5 / dt)))
+        rs = self.results
+        cur = self._loc_key()
+        cache = self.__dict__.setdefault("_explain_cache", {})
+        rows = rs._row_of()
+        csig = sig.split("\x00")[0]
+        ld = rs.__dict__.setdefault("loc_dim", {})
+        from condition_types import eff_dim
+        for sd, res in out:
+            if res and res[0] != "err":
+                cache[(sd, mc, csig)] = res
+            if sd in rows:
+                rs.loc_sig[sd] = sig                  # an error is not retried in a loop
+                if sig == cur and res and res[0] != "err":
+                    rs.set_location(sd, self._loc_value(res))
+                    fi = self.focus_index(res[1], res[3]) if res[0] else None
+                    ld[sd] = eff_dim(res[1], fi) if fi is not None else 0
+        self._autoloc_kick(10)
+
+    def _set_map_dim(self, fdim):
+        if self.map.dim != fdim:
+            self.map.ov["dim"] = fdim
+            for v in (self.map.link.views if self.map.link is not None else [self.map]):
+                v._sync_dim_bar(); v.update()
+            self.map.overlayChanged.emit()
+            if self.map.link is not None:
+                self.map.link.overlay_changed(self.map)
 
     def _explain_seed(self, seed, check=False):
         conds = self.model.export()
@@ -3111,8 +3404,10 @@ class SessionsPage(QWidget):
         def work():
             try:
                 import custom_search as cs
-                from .map_engine import _eye_pool
-                res = _eye_pool().submit(cs.check_seed, conds, seed, mc).result()
+                # (18/10) the location pool, not the map's eye pool: a seed change
+                # queues the 128 strongholds' eyes there, the check waited behind
+                from .map_engine import _loc_pool
+                res = _loc_pool().submit(cs.check_seed, conds, seed, mc).result()
                 cache[key] = res
                 self._explain.done.emit(seed, res)
             except Exception as e:
@@ -3131,11 +3426,24 @@ class SessionsPage(QWidget):
                 seen.add(r); d += 1
                 r = int(active[r - 1].get("relative", 0) or 0)
             return d
+        best = SessionsPage.focus_index(active, pos)
+        return None if best is None else tuple(pos[best])
+
+    @staticmethod
+    def focus_index(active, pos):
+        """Index of the condition focus_of() picks (None: nothing located)."""
+        def depth(i):
+            d, seen = 0, set()
+            r = int(active[i].get("relative", 0) or 0)
+            while r and r not in seen and 1 <= r <= len(active):
+                seen.add(r); d += 1
+                r = int(active[r - 1].get("relative", 0) or 0)
+            return d
         best = None
         for i, p in enumerate(pos):
             if p is not None and (best is None or depth(i) >= depth(best)):
                 best = i
-        return None if best is None else tuple(pos[best])
+        return best
 
     def _on_explained(self, seed, res):
         if seed != self.world.seed:
@@ -3160,20 +3468,35 @@ class SessionsPage(QWidget):
                                  f"red ✗ in the conditions")
             else:
                 self.status.emit(f"Seed {seed} does not match the current conditions.")
+        self.results.set_location(seed, self._loc_value(res))
+        self.results.loc_sig[seed] = self._loc_key()
         if focus is None:
-            self.results.set_location(seed, "—")
             return
         fx, fz = int(focus[0]), int(focus[1])
-        self.results.set_location(seed, (fx, fz))
+        # (18/10) the map shows the dimension of that spot (a Nether / End
+        # condition: its coordinates are of that dimension)
+        # (19/10) a gate (NOT / OR) or a spiral sits at its parent's spot: the
+        # dimension of its PARENT (before: the Overworld — a NOT over a fortress
+        # put the Nether result on the Overworld map)
+        from condition_types import eff_dim
+        fi = self.focus_index(active, pos)
+        fdim = eff_dim(active, fi) if fi is not None else 0
+        self.results.__dict__.setdefault("loc_dim", {})[seed] = fdim
+        pre = getattr(self, "_pre_centered", None)
+        already = pre is not None and pre == (seed, fx, fz)   # see _result_selected
+        self._set_map_dim(fdim)
         # frame the conditions around that spot only (parents millions of blocks
         # away — the spiral's origin — would otherwise zoom the map out to nothing)
-        near = [p for p in pos if p is not None and abs(p[0] - fx) <= 4096 and abs(p[1] - fz) <= 4096]
+        near = [p for i, p in enumerate(pos) if p is not None and eff_dim(active, i) == fdim
+                and abs(p[0] - fx) <= 4096 and abs(p[1] - fz) <= 4096] or [(fx, fz)]
         xs = [p[0] for p in near]; zs = [p[1] for p in near]
         cx, cz = (min(xs) + max(xs)) / 2, (min(zs) + max(zs)) / 2
-        self.map.center_on(cx, cz)            # the current zoom is kept (27/09)
+        if not already:                       # (18/10) not moved twice
+            self.map.center_on(cx, cz)        # the current zoom is kept (27/09)
         far = max(abs(fx), abs(fz))
         if ok:
-            self.status.emit(f"Seed {seed} matches ✓   X {fx}  Z {fz}"
+            self.status.emit(f"Seed {seed} matches ✓   "
+                             + {-1: "Nether ", 1: "End "}.get(fdim, "") + f"X {fx}  Z {fz}"
                              + (f"  ({far:,} blocks from 0, 0)".replace(",", " ") if far > 100_000 else ""))
 
     @staticmethod
@@ -3225,7 +3548,9 @@ class SessionsPage(QWidget):
                  if self._mc() in (19, 20) and any(
                      c.get("enabled", True) and c.get("type") in ("dungeon", "lava_lake")
                      for c in self.model.export()) else None)
-        a_tp = m.addAction(f"Copy /tp {loc[0]} ~ {loc[1]}") if has_loc else None
+        _ldim = getattr(self.results, "loc_dim", {}).get(seeds[0], 0) if has_loc else 0
+        a_tp = m.addAction(f"Copy /tp {loc[0]} ~ {loc[1]}"
+                           + {-1: "  (Nether)", 1: "  (End)"}.get(_ldim, "")) if has_loc else None
         a_go = m.addAction("Centre the map on the location") if has_loc else None
         a_map = m.addAction("Open on the Map page") if len(seeds) == 1 else None
         cp = self._confirm_params(self.model.export(), force=True)
@@ -3274,8 +3599,12 @@ class SessionsPage(QWidget):
         if act is a_copy:
             QGuiApplication.clipboard().setText("\n".join(str(s) for s in seeds))
         elif act is not None and act is a_tp:
-            QGuiApplication.clipboard().setText(f"/tp @s {loc[0]} ~ {loc[1]}")
+            _cmd = {-1: "/execute in minecraft:the_nether run tp @s",
+                    1: "/execute in minecraft:the_end run tp @s"}.get(_ldim, "/tp @s")
+            QGuiApplication.clipboard().setText(f"{_cmd} {loc[0]} ~ {loc[1]}")
         elif act is not None and act is a_go:
+            if self.map.dim != _ldim:                 # (18/10) its dimension's map
+                self.map.set_dim(_ldim)
             self.map.center_on(loc[0], loc[1])
         elif act is not None and act is a_map:
             self.world.set(seed=seeds[0])

@@ -38,6 +38,15 @@ CONDITION_TYPES = [
             # stored in BLOCKS like cubiomes-viewer (position = cell × step);
             # « step_unit » only chooses how the editor shows it (01/10)
             "step": {"type": "spiral_step", "label": "Step", "default": 16},
+            # (19/10) ring_gpu: the positions scanned on the GPU (top-level spiral,
+            # with a crunchiness ticked GPU; climate tests under it)
+            "use_gpu": {"type": "bool", "label": "GPU CUDA: scan the positions on the GPU",
+                        "default": False,
+                        "tip": "Top-level spiral of a session with a crunchiness ticked GPU: "
+                               "the GPU tests every position against the climate tests under "
+                               "the spiral (point tests and « at least N » ORs of climate / "
+                               "biome boxes) and the CPU checks the whole session at the "
+                               "positions it keeps only. Same results, much faster."},
         },
     },
 
@@ -88,9 +97,10 @@ CONDITION_TYPES = [
          "y_range": {"type": "dual_height_slider", "label": "Lava Y", "default": (0, 255),
                      "min": 0, "max": 255},
          "use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
-    {"key": "abandoned_camp",   "name": "Abandoned camp",    "category": "Structures", "icon": "⛺", "desc": "",
-     "disabled": "Abandoned camps are temporarily disabled: their generation changes with "
-                 "almost every small Minecraft version, so the positions are not reliable.",
+    {"key": "abandoned_camp",   "name": "Abandoned camp",    "category": "Structures", "icon": "⛺",
+     "desc": "Java 26.3+. Abandoned camps: spacing 37 / separation 8 chunks, in forests, taigas, "
+             "jungles, savanna, meadow, cherry grove, swamp, pale garden, wooded badlands "
+             "(checked against the 26.3 game files, 18/10).",
      "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {
         "key": "igloo",
@@ -124,8 +134,80 @@ CONDITION_TYPES = [
             "use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False},
         },
     },
-    # Nether/End structures (fortress, bastion, end_city) retirées : SSA ne
-    # couvre pas le Nether/End.
+    # ── Nether / End (18/10): the cubiomes-viewer conditions, same rules
+    # (positions in the coordinates of THEIR dimension: put a « Scale to
+    # Nether » before a Nether condition linked to an overworld one) ──
+    {"key": "fortress", "name": "Nether fortress", "category": "Nether", "icon": "🏯",
+     "desc": "Nether fortress start positions (Nether coordinates). From 1.16 a fortress "
+             "only exists where no bastion took the place.",
+     "params": {
+         "variant": {"type": "choice", "label": "Layout",
+                     "options": ["any", "dense"],
+                     "labels": {"any": "Any", "dense": "Dense crossings"},
+                     "segmented": True, "default": "any",
+                     "tip": "Dense: the start and its bridge crossings form a 2×2 block "
+                            "(cubiomes-viewer « dense bridge crossings »). The position "
+                            "becomes the centre of that block."},
+         "use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False},
+     }},
+    {"key": "bastion", "name": "Bastion remnant", "category": "Nether", "icon": "🏰",
+     "desc": "Bastion remnant positions (Nether coordinates).",
+     "params": {
+         "starts": {"type": "multi_choice", "label": "Type",
+                    "options": ["units", "hoglin_stable", "treasure", "bridge"],
+                    "labels": {"units": "Housing units", "hoglin_stable": "Hoglin stables",
+                               "treasure": "Treasure room", "bridge": "Bridge"},
+                    "default": [],
+                    "tip": "None ticked = any bastion. Ticked = only these types "
+                           "(cubiomes-viewer start pieces)."},
+         "use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False},
+     }},
+    {"key": "ruined_portal_nether", "name": "Ruined portal (Nether)", "category": "Nether",
+     "icon": "🌀", "desc": "Ruined portals of the Nether (Nether coordinates).",
+     "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
+    {"key": "nether_biomes", "name": "Nether at scale", "category": "Nether", "icon": "🔥",
+     "desc": "Nether biomes sampled on a grid over the area (Nether coordinates), like "
+             "cubiomes-viewer « Nether at scale ».",
+     "params": {
+         "biomes_incl": {"type": "biome_list", "label": "Biomes", "dim": -1, "default": []},
+         "biomes_excl": {"type": "biome_list", "label": "Excluded biomes", "dim": -1,
+                         "default": [], "empty_text": "None"},
+         "match_any":   {"type": "bool", "label": "Any of the biomes is enough (else all)",
+                         "default": False},
+         "scale":       {"type": "choice", "label": "Scale",
+                         "options": [("1:1 (block)", 1), ("1:4", 4), ("1:16 (chunk)", 16),
+                                     ("1:64", 64), ("1:256", 256)],
+                         "default": 4},
+     }},
+    {"key": "end_city", "name": "End city", "category": "End", "icon": "🏙",
+     "desc": "End city positions (End coordinates), with the terrain check (the city needs "
+             "a high enough island).",
+     "params": {
+         "variant": {"type": "choice", "label": "End ship",
+                     "options": ["any", "with_ship", "without_ship"],
+                     "labels": {"any": "Any", "with_ship": "With a ship",
+                                "without_ship": "Without"},
+                     "segmented": True, "default": "any"},
+         "use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False},
+     }},
+    {"key": "end_gateway", "name": "End gateway", "category": "End", "icon": "🌌",
+     "desc": "Scattered return gateways of the outer islands (End coordinates). Not the 20 "
+             "gateways that appear when the dragon is killed.",
+     "params": {}},
+    {"key": "end_biomes", "name": "End at scale", "category": "End", "icon": "🌑",
+     "desc": "End biomes sampled on a grid over the area (End coordinates), like "
+             "cubiomes-viewer « End at scale ».",
+     "params": {
+         "biomes_incl": {"type": "biome_list", "label": "Biomes", "dim": 1, "default": []},
+         "biomes_excl": {"type": "biome_list", "label": "Excluded biomes", "dim": 1,
+                         "default": [], "empty_text": "None"},
+         "match_any":   {"type": "bool", "label": "Any of the biomes is enough (else all)",
+                         "default": False},
+         "scale":       {"type": "choice", "label": "Scale",
+                         "options": [("1:1 (block)", 1), ("1:4", 4), ("1:16 (chunk)", 16),
+                                     ("1:64", 64)],
+                         "default": 16},
+     }},
 
     # ── Biomes ──
     {
@@ -429,7 +511,12 @@ CONDITION_TYPES = [
      "params": {}},
 
     # ── Helpers ──
-    {"key": "logic_or",           "name": "OR logic gate",      "category": "Helpers", "icon": "∨", "desc": "", "params": {}},
+    {"key": "logic_or",           "name": "OR logic gate",      "category": "Helpers", "icon": "∨",
+     "desc": "Passes when one of its conditions passes — or, with « At least » above 1, "
+             "when that many of them pass (e.g. cherry in 6 of 8 directions). "
+             "cubiomes-viewer reads it as a plain OR.",
+     "params": {"min_pass": {"type": "int", "label": "At least … of its conditions", "default": 1,
+                             "min": 1, "max": 64}}},
     {"key": "logic_not",          "name": "NOT logic gate",     "category": "Helpers", "icon": "¬", "desc": "", "params": {}},
     {"key": "scale_to_nether",    "name": "Scale to Nether",    "category": "Helpers", "icon": "↘", "desc": "", "params": {}},
     {"key": "scale_to_overworld", "name": "Scale to Overworld", "category": "Helpers", "icon": "↗", "desc": "", "params": {}},
@@ -441,6 +528,8 @@ CONDITION_TYPES = [
 CATEGORY_COLORS = {
     "Iterators":  "#5fb3ff",
     "Structures": "#26d96b",
+    "Nether":     "#ff6b35",
+    "End":        "#c9a0ff",
     "Biomes":     "#5dd4a0",
     "World":      "#5dd4d4",
     "Helpers":    "#cccccc",
@@ -474,6 +563,10 @@ TYPE_COLORS = {
     "fortress":          "#ff6b35",
     "bastion":           "#e05020",
     "end_city":          "#d4a0ff",
+    "ruined_portal_nether": "#b84bd6",
+    "end_gateway":       "#7fe0d0",
+    "nether_biomes":     "#d0503a",
+    "end_biomes":        "#b8a8e8",
     "spawn":             "#5dd4d4",
     "slime":             "#78d850",
     "scale_to_nether":   "#ff9050",
@@ -625,3 +718,120 @@ def _build_octave_options(climate_name: str, large: bool = False):
 
 # types hidden for now (kept in the code, see « disabled » above)
 DISABLED_TYPES = {t["key"]: t["disabled"] for t in CONDITION_TYPES if t.get("disabled")}
+
+
+# ── (18/10) dimension of each condition: where its positions are ────────────
+# 0 = overworld (default), -1 = Nether, 1 = End. A Nether / End condition reads
+# and writes coordinates of its own dimension (cubiomes-viewer convention).
+NETHER_TYPES = {"fortress", "bastion", "ruined_portal_nether", "nether_biomes"}
+END_TYPES = {"end_city", "end_gateway", "end_biomes"}
+DIM_NAMES = {0: "Overworld", -1: "Nether", 1: "End"}
+
+
+def cond_dim(cond_or_type) -> int:
+    """Dimension of a condition (dict) or condition type (str). An imported
+    cubiomes-viewer biome filter keeps its own `dim` parameter."""
+    if isinstance(cond_or_type, dict):
+        t = cond_or_type.get("type", "")
+        if t == "biome_filter":
+            d = (cond_or_type.get("params") or {}).get("dim", "overworld")
+            return {"nether": -1, "end": 1}.get(d, 0)
+    else:
+        t = cond_or_type
+    if t in NETHER_TYPES:
+        return -1
+    if t in END_TYPES:
+        return 1
+    return 0
+
+
+# (19/10) conditions without a place of their own: they work at their parent's
+# spot (a gate, a spiral), so they are in their parent's dimension
+DIM_NEUTRAL = {"logic_or", "logic_not", "spiral"}
+
+
+def eff_dim(active, i) -> int:
+    """Dimension of the coordinates of active[i] (0-based) in an engine-format
+    list (« relative » = 1-based parent). A gate / spiral takes its parent's
+    (a « Scale to Nether » parent: the Nether); a root one, its children's."""
+    seen = set()
+    k = i
+    while 0 <= k < len(active) and k not in seen:
+        seen.add(k)
+        c = active[k]
+        t = c.get("type", "")
+        if t == "scale_to_nether" and k != i:
+            return -1
+        if t == "scale_to_overworld" and k != i:
+            return 0
+        if t not in DIM_NEUTRAL:
+            return cond_dim(c)
+        k = int(c.get("relative", 0) or 0) - 1
+    # a root gate: the first child (any depth) that has a dimension
+    todo = [i]
+    while todo:
+        j = todo.pop(0)
+        for m, c in enumerate(active):
+            if int(c.get("relative", 0) or 0) == j + 1 and m not in seen:
+                seen.add(m)
+                if c.get("type", "") in DIM_NEUTRAL:
+                    todo.append(m)
+                elif c.get("type", "") == "scale_to_nether":
+                    return -1
+                else:
+                    return cond_dim(c)
+    return 0
+
+
+# cubiomes-viewer start-piece table (search.cpp g_start_pieces), in its order:
+# bit i of a condition's « varstart » = entry i. (structure key, piece name)
+START_PIECES = [
+    ("village", "plains_fountain_01"),
+    ("village", "plains_meeting_point_1"),
+    ("village", "plains_meeting_point_2"),
+    ("village", "plains_meeting_point_3"),
+    ("village", "desert_meeting_point_1"),
+    ("village", "desert_meeting_point_2"),
+    ("village", "desert_meeting_point_3"),
+    ("village", "savanna_meeting_point_1"),
+    ("village", "savanna_meeting_point_2"),
+    ("village", "savanna_meeting_point_3"),
+    ("village", "savanna_meeting_point_4"),
+    ("village", "taiga_meeting_point_1"),
+    ("village", "taiga_meeting_point_2"),
+    ("village", "snowy_meeting_point_1"),
+    ("village", "snowy_meeting_point_2"),
+    ("village", "snowy_meeting_point_3"),
+    ("bastion", "units"),
+    ("bastion", "hoglin_stable"),
+    ("bastion", "treasure"),
+    ("bastion", "bridge"),
+    ("ruined_portal", "giant_ruined_portal_1"),
+    ("ruined_portal", "giant_ruined_portal_2"),
+    ("ruined_portal", "giant_ruined_portal_3"),
+    ("ruined_portal", "ruined_portal_1"),
+    ("ruined_portal", "ruined_portal_2"),
+    ("ruined_portal", "ruined_portal_3"),
+    ("ruined_portal", "ruined_portal_4"),
+    ("ruined_portal", "ruined_portal_5"),
+    ("ruined_portal", "ruined_portal_6"),
+    ("ruined_portal", "ruined_portal_7"),
+    ("ruined_portal", "ruined_portal_8"),
+    ("ruined_portal", "ruined_portal_9"),
+    ("ruined_portal", "ruined_portal_10"),
+]
+
+
+def start_bits(stype_key: str, names) -> int:
+    """varstart bits of the start pieces `names` of a structure."""
+    bits = 0
+    for i, (k, n) in enumerate(START_PIECES):
+        if k == stype_key and n in set(names or ()):
+            bits |= 1 << i
+    return bits
+
+
+def start_names(stype_key: str, bits: int) -> list:
+    """Start-piece names of a structure encoded in varstart `bits`."""
+    return [n for i, (k, n) in enumerate(START_PIECES) if k == stype_key and bits >> i & 1]
+

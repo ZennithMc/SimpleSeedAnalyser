@@ -157,15 +157,15 @@ F_TO_SSA: Dict[int, Optional[str]] = {
     F_FORTRESS:         "fortress",
     F_BASTION:          "bastion",
     F_ENDCITY:          "end_city",
-    F_BIOME_NETHER:     "biome_filter",
-    F_BIOME_NETHER_4:   "biome_filter",
-    F_BIOME_NETHER_16:  "biome_filter",
-    F_BIOME_NETHER_64:  "biome_filter",
-    F_BIOME_NETHER_256: "biome_filter",
-    F_BIOME_END:        "biome_filter",
-    F_BIOME_END_4:      "biome_filter",
-    F_BIOME_END_16:     "biome_filter",
-    F_BIOME_END_64:     "biome_filter",
+    F_BIOME_NETHER:     "nether_biomes",          # (18/10) own condition types
+    F_BIOME_NETHER_4:   "nether_biomes",
+    F_BIOME_NETHER_16:  "nether_biomes",
+    F_BIOME_NETHER_64:  "nether_biomes",
+    F_BIOME_NETHER_256: "nether_biomes",
+    F_BIOME_END:        "end_biomes",
+    F_BIOME_END_4:      "end_biomes",
+    F_BIOME_END_16:     "end_biomes",
+    F_BIOME_END_64:     "end_biomes",
     F_PORTALN:          "ruined_portal_nether",   # before: skipped on import
     F_GATEWAY:          "end_gateway",
     F_MINESHAFT:        "mineshaft",
@@ -574,7 +574,7 @@ def _parse_condition_hex(hex_str: str):
     invert = bool(flags & 0x0040)   # FLG_INVERT
 
     # ── Per-type parameter mapping ─────────────────────────────────
-    if ssa_key == "biome_filter":
+    if ssa_key in ("biome_filter", "nether_biomes", "end_biomes"):
         # current cubiomes-viewer: type F_BIOME / F_BIOME_NETHER / F_BIOME_END
         # and the scale in `step` (1, 4, 16, 64, 256). Before, `step` was
         # ignored → every 1:4 biome filter was imported at 1:1 (16× the work,
@@ -590,6 +590,8 @@ def _parse_condition_hex(hex_str: str):
             "match_any": bool(flags & 0x0010),  # FLG_MATCH_ANY
             "approx":    bool(flags & 0x0001),  # FLG_APPROX (was lost)
         }
+        if ssa_key != "biome_filter":           # the type says the dimension
+            cond["params"].pop("dim", None)
 
     elif ssa_key == "biome_sample":
         cond["params"] = {
@@ -727,6 +729,12 @@ def _parse_condition_hex(hex_str: str):
             "count":   max(1, int(count) if count > 0 else 1),
             "variant": _decode_variant(ssa_key, varflags),
         }
+        # (18/10) cubiomes-viewer start pieces (VAR_WITH_START + varstart)
+        _sk = {"bastion": "bastion", "ruined_portal": "ruined_portal",
+               "village": "village"}.get(ssa_key)
+        if _sk and (varflags & 0x0001):
+            from condition_types import start_names
+            cond["params"]["starts"] = start_names(_sk, int(varstart))
 
     else:
         # Fallback: empty params, count
@@ -802,11 +810,13 @@ def _decode_variant(ssa_key: str, varflags: int) -> Optional[str]:
     # vocabulary of the engine / editor (before: "zombie" / "with_basement",
     # which the engine did not know → the variant was silently ignored)
     if ssa_key == "village" and (varflags & 0x0002):
-        return "abandoned"
+        return "not_abandoned" if (varflags & 0x0010) else "abandoned"      # VAR_NOT
     if ssa_key == "end_city" and (varflags & 0x0004):
-        return "with_ship"
+        return "without_ship" if (varflags & 0x0010) else "with_ship"     # VAR_NOT
+    if ssa_key == "fortress" and (varflags & 0x0008):
+        return "dense"
     if ssa_key == "igloo" and (varflags & 0x0020):
-        return "basement"
+        return "no_basement" if (varflags & 0x0010) else "basement"         # VAR_NOT
     return None
 
 

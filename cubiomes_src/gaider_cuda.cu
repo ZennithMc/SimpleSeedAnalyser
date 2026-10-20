@@ -280,7 +280,8 @@ __device__ inline void compute_first_stronghold_chunk(uint64_t world_seed,
 //   1.18.0/1.18.1 (mc<=22): STRONGHOLDS step(5) idx0 -> +50000.
 //   1.19+ (mc>=24): SURFACE_STRUCTURES step(4) idx19 (default, UNVERIFIED) -> +40019.
 __device__ inline uint64_t eye_offset_xrsr_d(int mc_version) {
-    return (mc_version <= 22) ? 50000ULL : (mc_version == 23) ? 40008ULL : 40019ULL;
+    return (mc_version <= 22) ? 50000ULL : (mc_version == 23) ? 40008ULL
+         : (mc_version >= 35) ? 40037ULL : 40019ULL;   /* 26.3+: 18 abandoned_camp_* first */
 }
 
 // Test if seed gives 12/12 at given chunk via Gaider matrix.
@@ -1121,6 +1122,114 @@ extern "C" EXPORT int gaider_cuda_crunchiness_filter_w(
         ck.begin();
         k_crunchiness_w<<<(cur + bs - 1) / bs, bs>>>(
             seed_start + off, cur, P, threshold, eps, mode_flag,
+            d_seeds.as<int64_t>(), d_count.as<int32_t>(), max_results);
+        SSA_CK_LAUNCH();
+        ck.end();
+        off += cur;
+    }
+    int32_t h_count = 0;
+    SSA_CK(cudaMemcpy(&h_count, d_count.p, sizeof(int32_t), cudaMemcpyDeviceToHost));
+    int32_t actual = h_count < max_results ? h_count : max_results;
+    if (actual > 0) {
+        SSA_CK(cudaMemcpy(out_seeds, d_seeds.p, (size_t)actual * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    }
+    return h_count;
+}
+
+// ── (18/10) several crunchiness conditions at once (AND) ─────────────────────
+// A session often has one crunchiness condition per climate noise (T, H, C,
+// E, W), all at the top of the tree: the GPU kept only the seeds of the FIRST
+// one and the CPU re-tested every survivor of it (16 % of the seeds for a
+// 0.1 threshold) — that re-test was 70 % of the search time. Here every
+// condition is tested on the GPU, the first failing one rejects the seed;
+// each keeps its eps margin, so the result is still a superset of the CPU's.
+#define CRUNCH_MULTI_MAX 8
+struct CrunchMulti {
+    int32_t k;
+    CrunchW c[CRUNCH_MULTI_MAX];
+    float   thr[CRUNCH_MULTI_MAX];
+    int32_t mode[CRUNCH_MULTI_MAX];
+};
+
+__device__ inline float crunch_score_w(uint64_t seed, const CrunchW &P) {
+    uint64_t pxr_lo, pxr_hi;
+    cr_set_seed(&pxr_lo, &pxr_hi, seed);
+    uint64_t xlo = cr_next_long(&pxr_lo, &pxr_hi);
+    uint64_t xhi = cr_next_long(&pxr_lo, &pxr_hi);
+    uint64_t nr_lo = xlo ^ P.c_lo;
+    uint64_t nr_hi = xhi ^ P.c_hi;
+    uint64_t a_lo = cr_next_long(&nr_lo, &nr_hi);
+    uint64_t a_hi = cr_next_long(&nr_lo, &nr_hi);
+    uint64_t b_lo = cr_next_long(&nr_lo, &nr_hi);
+    uint64_t b_hi = cr_next_long(&nr_lo, &nr_hi);
+    float score = 0.0f;
+    for (int i = 0; i < P.n; i++) {
+        if (P.wa[i] != 0.0f) {
+            float y = cr_octave_yfrac(a_lo, a_hi, P.oct_lo[i], P.oct_hi[i]);
+            score += P.wa[i] * fabsf(y - 0.5f);
+        }
+        if (P.wb[i] != 0.0f) {
+            float y = cr_octave_yfrac(b_lo, b_hi, P.oct_lo[i], P.oct_hi[i]);
+            score += P.wb[i] * fabsf(y - 0.5f);
+        }
+    }
+    return score;
+}
+
+__global__ void k_crunchiness_multi(
+        int64_t seed_start, int32_t n, CrunchMulti M, float eps,
+        int64_t *out_seeds, int32_t *out_count, int32_t max_results) {
+    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    uint64_t seed = (uint64_t)((int64_t)seed_start + idx);
+    for (int j = 0; j < M.k; j++) {
+        float score = crunch_score_w(seed, M.c[j]);
+        bool keep = (M.mode[j] == 0) ? (score <= M.thr[j] + eps)
+                                     : (score >= M.thr[j] - eps);
+        if (!keep) return;
+    }
+    int32_t pos = atomicAdd(out_count, 1);
+    if (pos < max_results)
+        out_seeds[pos] = (int64_t)seed;
+}
+
+// k conditions; per condition j: climate hash c_lo[j]/c_hi[j], n_oct[j] pairs,
+// octave hashes / weights in rows j*6 … j*6+5, threshold thr[j], mode[j].
+extern "C" EXPORT int gaider_cuda_crunchiness_multi(
+        int64_t seed_start, int32_t n, int32_t k,
+        const uint64_t *c_lo, const uint64_t *c_hi, const int32_t *n_oct,
+        const uint64_t *oct_lo, const uint64_t *oct_hi,
+        const float *wa, const float *wb,
+        const float *thr, const int32_t *mode, float eps,
+        int64_t *out_seeds, int32_t max_results) {
+    if (n <= 0) return 0;
+    if (k < 1 || k > CRUNCH_MULTI_MAX) return -1;
+    if (max_results < 1) max_results = 1;
+    CrunchMulti M;
+    memset(&M, 0, sizeof(M));
+    M.k = k;
+    for (int j = 0; j < k; j++) {
+        CrunchW &P = M.c[j];
+        P.c_lo = c_lo[j]; P.c_hi = c_hi[j];
+        P.n = n_oct[j] < 0 ? 0 : (n_oct[j] > 6 ? 6 : n_oct[j]);
+        for (int i = 0; i < P.n; i++) {
+            P.oct_lo[i] = oct_lo[j * 6 + i]; P.oct_hi[i] = oct_hi[j * 6 + i];
+            P.wa[i] = wa[j * 6 + i]; P.wb[i] = wb[j * 6 + i];
+        }
+        M.thr[j] = thr[j];
+        M.mode[j] = mode[j];
+    }
+    SsaDevBuf d_seeds, d_count;
+    SSA_CK(d_seeds.alloc((size_t)max_results * sizeof(int64_t)));
+    SSA_CK(d_count.alloc(sizeof(int32_t)));
+    SSA_CK(cudaMemset(d_count.p, 0, sizeof(int32_t)));
+    static SsaChunker ck(1 << 22, 1 << 14, 1 << 27);
+    const int bs = 512;
+    for (int32_t off = 0; off < n; ) {
+        int32_t cur = (int32_t)((int64_t)(n - off) < ck.chunk ? (n - off) : ck.chunk);
+        ck.begin();
+        k_crunchiness_multi<<<(cur + bs - 1) / bs, bs>>>(
+            seed_start + off, cur, M, eps,
             d_seeds.as<int64_t>(), d_count.as<int32_t>(), max_results);
         SSA_CK_LAUNCH();
         ck.end();

@@ -403,13 +403,22 @@ def _config_path() -> str:
     return os.path.join(d, "themes.json")
 
 
-def user_themes() -> dict:
+def _raw_config() -> dict:
     try:
         with open(_config_path(), encoding="utf-8") as f:
             data = json.load(f)
-        return {k: v for k, v in data.items() if k in EDITABLE and isinstance(v, dict)}
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _write_config(data: dict) -> None:
+    with open(_config_path(), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def user_themes() -> dict:
+    return {k: v for k, v in _raw_config().items() if k in EDITABLE and isinstance(v, dict)}
 
 
 def theme_tokens(name: str) -> dict:
@@ -422,17 +431,15 @@ def theme_tokens(name: str) -> dict:
 def save_user_theme(name: str, tokens: dict) -> None:
     if name not in EDITABLE:
         return
-    data = user_themes()
+    data = _raw_config()                 # (17/10) keeps the image themes too
     data[name] = {k: tokens[k] for k, _ in TOKEN_LABELS if k in tokens}
-    with open(_config_path(), "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _write_config(data)
 
 
 def reset_user_theme(name: str) -> None:
-    data = user_themes()
+    data = _raw_config()
     data.pop(name, None)
-    with open(_config_path(), "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _write_config(data)
 
 
 def set_theme(name: str, tokens: dict | None = None) -> None:
@@ -826,3 +833,132 @@ def _saved_theme_name() -> str:
 def remember_theme(name: str) -> None:
     from PySide6.QtCore import QSettings
     QSettings("SSA", "SimpleSeedAnalyser").setValue("ui/theme", name)
+
+
+# ── themes made from the user's own picture (17/10) ─────────────────────────
+# Stored in themes.json under "__images": name -> {path (a copy of the picture
+# in the configuration folder), tokens, accent2, light}. The picture is the
+# window backdrop (backdrops.image), the colours are derived from it.
+IMAGE_KEY = "__images"
+
+
+def image_themes() -> dict:
+    d = _raw_config().get(IMAGE_KEY, {})
+    return d if isinstance(d, dict) else {}
+
+
+def is_image_theme(name: str) -> bool:
+    return bool(EXTRAS.get(name, {}).get("custom_image"))
+
+
+def _register_image_themes() -> None:
+    for name, d in image_themes().items():
+        try:
+            if not os.path.exists(d["path"]):
+                continue
+            BUILTIN[name] = dict(d["tokens"])
+            EXTRAS[name] = dict(desc="Your picture" + (" — light" if d.get("light") else ""),
+                                accent2=d.get("accent2"), panel=float(d.get("panel", 0.82)),
+                                custom_image=True,
+                                backdrop=dict(kind="image", path=d["path"],
+                                              stamp=int(d.get("stamp", 0)),
+                                              light=bool(d.get("light"))))
+        except Exception:
+            continue
+
+
+def _image_colours(path: str):
+    """(average colour, accent colour, mean lightness 0..1) of a picture."""
+    from PySide6.QtGui import QImage
+    img = QImage(path)
+    if img.isNull():
+        raise ValueError("This file is not a picture SSA can read.")
+    small = img.scaled(64, 40)
+    tot = [0.0, 0.0, 0.0]; n = 0
+    best, best_w = None, -1.0
+    buckets: dict = {}
+    for y in range(small.height()):
+        for x in range(small.width()):
+            c = QColor(small.pixel(x, y))
+            tot[0] += c.red(); tot[1] += c.green(); tot[2] += c.blue(); n += 1
+            h, s_, v, _a = c.getHsvF()
+            if h < 0 or s_ < 0.25 or v < 0.25:
+                continue
+            k = int(h * 18) % 18
+            b = buckets.setdefault(k, [0.0, 0.0, 0.0, 0.0, 0])
+            w = s_ * v
+            b[0] += c.red() * w; b[1] += c.green() * w; b[2] += c.blue() * w; b[3] += w; b[4] += 1
+    avg = QColor(int(tot[0] / n), int(tot[1] / n), int(tot[2] / n))
+    for b in buckets.values():                 # the most present vivid hue
+        if b[3] * (1 + 0.02 * b[4]) > best_w:
+            best_w = b[3] * (1 + 0.02 * b[4])
+            best = QColor(int(b[0] / b[3]), int(b[1] / b[3]), int(b[2] / b[3]))
+    return avg, best, avg.lightnessF()
+
+
+def _mix_hex(a: str, b: str, t: float) -> str:
+    ca, cb = QColor(a), QColor(b)
+    return QColor(int(ca.red() + (cb.red() - ca.red()) * t), int(ca.green() + (cb.green() - ca.green()) * t),
+                  int(ca.blue() + (cb.blue() - ca.blue()) * t)).name()
+
+
+def create_image_theme(src: str, name: str | None = None) -> str:
+    """New theme from a picture: copies it to the configuration folder and
+    derives the colours (dark or light from its brightness, tinted with its
+    average colour, accent = its most present vivid colour). Returns the name."""
+    import shutil
+    avg, acc, light = _image_colours(src)
+    is_light = light > 0.62
+    base = dict(BUILTIN["Daylight" if is_light else "Slate"])
+    tint = 0.10 if is_light else 0.22
+    t = {}
+    for k, v in base.items():
+        if k in ("ok", "warn", "danger", "accent", "text"):
+            t[k] = v
+        else:
+            t[k] = _mix_hex(v, avg.name(), tint)
+    if acc is not None:
+        a = QColor(acc)
+        h, s_, v, _x = a.getHsvF()
+        a.setHsvF(max(h, 0), min(1.0, max(s_, 0.55)), 0.62 if is_light else 0.95)
+        t["accent"] = a.name()
+    t["accent"] = readable(t["accent"], t["text"], [t["bg1"], t["bg2"]], 3.0)
+    d = os.path.join(os.path.dirname(_config_path()), "theme_images")
+    os.makedirs(d, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(src))[0][:28] or "Picture"
+    if not name:
+        name = stem.replace("_", " ").strip().title() or "My picture"
+        base_name, i = name, 2
+        while name in BUILTIN and not is_image_theme(name) or name in image_themes():
+            name = f"{base_name} {i}"; i += 1
+    ext = os.path.splitext(src)[1].lower() or ".png"
+    dst = os.path.join(d, f"{abs(hash((name, os.path.getsize(src)))) & 0xffffffff:08x}{ext}")
+    shutil.copyfile(src, dst)
+    data = _raw_config()
+    imgs = data.get(IMAGE_KEY) if isinstance(data.get(IMAGE_KEY), dict) else {}
+    imgs[name] = dict(path=dst, tokens=t, accent2=_shade(t["accent"], 1.25), light=is_light,
+                      panel=0.86 if is_light else 0.82, stamp=int(os.path.getmtime(dst)))
+    data[IMAGE_KEY] = imgs
+    _write_config(data)
+    _register_image_themes()
+    return name
+
+
+def delete_image_theme(name: str) -> None:
+    data = _raw_config()
+    imgs = data.get(IMAGE_KEY) if isinstance(data.get(IMAGE_KEY), dict) else {}
+    d = imgs.pop(name, None)
+    data[IMAGE_KEY] = imgs
+    _write_config(data)
+    BUILTIN.pop(name, None); EXTRAS.pop(name, None)
+    if d:
+        try:
+            os.remove(d["path"])
+        except OSError:
+            pass
+
+
+try:
+    _register_image_themes()
+except Exception:
+    pass

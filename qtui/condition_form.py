@@ -33,8 +33,10 @@ from .widgets import DecimalSpin, Segmented, body, hline, section_title
 # Large biomes; = ssa_crunch_n_octaves): T, H, C, E, W
 CRUNCH_OCTAVES = {0: 2, 1: 2, 2: 6, 3: 4, 5: 3}
 
-CATEGORIES = ["Structures", "Biomes", "World", "Iterators", "Helpers"]
+CATEGORIES = ["Structures", "Nether", "End", "Biomes", "World", "Iterators", "Helpers"]
 CAT_HINT = {"Structures": "Positions of generated structures",
+            "Nether": "Nether structures and biomes (Nether coordinates)",
+            "End": "End structures and biomes (End coordinates)",
             "Biomes": "Biomes, climate noises, terrain height",
             "World": "Spawn, slime chunks",
             "Iterators": "Try many positions (children must pass at one of them)",
@@ -129,6 +131,9 @@ class TypePicker(QWidget):
 
     # (family, condition keys or None = every other non-structure one, icon key)
     GROUPS = [("Structures", "structures", "village"),
+              ("Nether", ["fortress", "bastion", "ruined_portal_nether", "nether_biomes"],
+               "fortress"),
+              ("End", ["end_city", "end_gateway", "end_biomes"], "end_city"),
               ("Biomes", ["biome_filter", "biome_sample", "biome_center"], "biome_filter"),
               ("Climate", ["climate_minmax", "climate_center", "noise_sample", "crunchiness",
                            "height", "precise_y"], "climate_center"),
@@ -147,7 +152,8 @@ class TypePicker(QWidget):
             by = {t["key"]: t for t in live}
             return [by[k] for k in keys if k in by]
         named = {k for _n, ks, _i in cls.GROUPS if isinstance(ks, list) for k in ks}
-        return [t for t in live if t["category"] != "Structures" and t["key"] not in named]
+        return [t for t in live if t["category"] not in ("Structures", "Nether", "End")
+                and t["key"] not in named]
 
     def __init__(self, mc_ok=None, parent=None):
         super().__init__(parent)
@@ -272,9 +278,9 @@ class BiomePicker(QDialog):
     toggle on click, a search that keeps the families, a running total.
     single=True: one biome, a click selects it, a double-click confirms."""
 
-    def __init__(self, selected, single=False, mc=28, parent=None):
+    def __init__(self, selected, single=False, mc=28, dim=0, parent=None):
         super().__init__(parent)
-        from biome_catalog import BIOME_MIN_MC, OVERWORLD_BIOMES_ORDERED, biome_swatch_hex
+        from biome_catalog import biome_display_name, biome_swatch_hex, dim_biomes_for
         from .widgets import FlowLayout
         self.setWindowTitle("Choose a biome" if single else "Choose biomes")
         self.resize(760, 640)
@@ -305,8 +311,17 @@ class BiomePicker(QDialog):
         grid.setHorizontalSpacing(10); grid.setVerticalSpacing(10)
         self.chips = []                     # (button, bid, search key, card)
         self.cards = []                     # (card, title label, chips)
+        self.mc = mc
         groups, cur = [], None
-        for bid, name in OVERWORLD_BIOMES_ORDERED:
+        listed = dim_biomes_for(mc, dim)           # (17/10) the biomes of THIS version
+        if dim:                                    # (18/10) Nether / End: small dialog
+            self.resize(560, 300)
+        have = {b for b, _n in listed if b is not None}
+        gone = [b for b in sel if isinstance(b, int) and b not in have]
+        if gone:                                   # chosen before, absent from this version
+            listed = list(listed) + [(None, "Not in this version")] + \
+                [(b, biome_display_name(b)) for b in gone]
+        for bid, name in listed:
             if bid is None:
                 cur = (name, []); groups.append(cur)
                 continue
@@ -339,7 +354,7 @@ class BiomePicker(QDialog):
                 b = QPushButton(_round_swatch(biome_swatch_hex(bid), 12), " " + name)
                 b.setObjectName("BiomeChip"); b.setCheckable(True)
                 b.setCursor(Qt.CursorShape.PointingHandCursor)
-                ok = mc >= BIOME_MIN_MC.get(bid, 0)
+                ok = bid in have
                 if not ok:
                     b.setEnabled(False)
                     b.setToolTip(f"{name}\nUnavailable: not generated in this Minecraft version.")
@@ -389,7 +404,7 @@ class BiomePicker(QDialog):
         if self.single:
             cur = self.value()
             from biome_catalog import biome_display_name
-            self.count.setText(biome_display_name(int(cur)) if cur is not None else "none")
+            self.count.setText(biome_display_name(int(cur), self.mc) if cur is not None else "none")
         else:
             self.count.setText(f"{n} selected")
 
@@ -531,6 +546,11 @@ class ConditionForm(QWidget):
             lay.addLayout(_field("Related to", pc))
         if info.get("desc"):
             lay.addWidget(body(info["desc"], muted=True, small=True))
+        dim_hint = self._dim_hint(c)
+        if dim_hint:                           # (18/10) Nether / End coordinates
+            warn = body(dim_hint, small=True)
+            warn.setStyleSheet(f"color: {theme.WARN};")
+            lay.addWidget(warn)
         if info.get("disabled"):               # e.g. abandoned camp (temporarily hidden)
             warn = body(info["disabled"] + " This one is kept as it was loaded.", small=True)
             warn.setStyleSheet(f"color: {theme.WARN};")
@@ -674,6 +694,31 @@ class ConditionForm(QWidget):
         par = self._parent_cond()
         t = self.cond.get("type")
         return bool(par is not None and t in STRUCTURE_KEYS and par.get("type") == t)
+
+    def _dim_hint(self, c):
+        """A Nether / End condition linked to a parent whose positions are of
+        another dimension (or the reverse): say how cubiomes-viewer handles it."""
+        from condition_types import DIM_NAMES, cond_dim
+        from .session_model import coord_dim
+        if not self.parent_uid or self.parent_lookup is None:
+            return ""
+        try:
+            pd = coord_dim(self.parent_lookup, self.parent_uid)
+        except Exception:
+            return ""
+        me = cond_dim(c)
+        if pd is None or pd == me or c.get("type") in ("scale_to_nether", "scale_to_overworld",
+                                                       "logic_or", "logic_not", "spiral"):
+            return ""
+        if {pd, me} == {0, -1}:
+            fix = ("put a « Scale to Nether » (÷ 8) between them" if me == -1 else
+                   "put a « Scale to Overworld » (× 8) between them")
+            return (f"Its parent gives {DIM_NAMES[pd]} coordinates and this condition uses "
+                    f"{DIM_NAMES[me]} ones: the same numbers are used as they are (like "
+                    f"cubiomes-viewer). To link the two places through a portal, {fix}.")
+        return (f"Its parent gives {DIM_NAMES[pd]} coordinates and this condition uses "
+                f"{DIM_NAMES[me]} ones: the same numbers are used as they are (like "
+                f"cubiomes-viewer).")
 
     def _parent_cond(self):
         if not self.parent_uid or self.parent_lookup is None:
@@ -971,7 +1016,21 @@ class ConditionForm(QWidget):
                 # a few named choices (igloo basement, abandoned village…): one click
                 wd = _SegChoice(spec.get("options", []), spec.get("labels", {}), val)
                 wd.changed.connect(lambda _v, k=key: self._choice_changed(k))
-                lay.addLayout(_field(label, wd))
+                lay.addLayout(_field(label, wd, spec.get("tip")))
+            elif typ == "multi_choice":
+                # (18/10) several named options at once (bastion types): none = any
+                from .widgets import FlowLayout
+                box = QWidget(); fl = FlowLayout(box, h_spacing=10, v_spacing=4)
+                chosen = set(val or [])
+                wd = {}
+                names = spec.get("labels", {})
+                for o in spec.get("options", []):
+                    cb = QCheckBox(names.get(o, str(o)))
+                    cb.setChecked(o in chosen)
+                    cb.toggled.connect(self._changed)
+                    fl.addWidget(cb)
+                    wd[o] = cb
+                lay.addLayout(_field(label, box, spec.get("tip")))
             elif typ == "choice":
                 wd = QComboBox()
                 names = spec.get("labels", {})
@@ -1157,20 +1216,20 @@ class ConditionForm(QWidget):
         typ, wd, spec = self.pw[key]
         val = wd.property("value")
         if typ == "biome_single":
-            wd.setText(biome_display_name(int(val)) if val is not None else "Choose…")
+            wd.setText(biome_display_name(int(val), self.mc) if val is not None else "Choose…")
         else:
             ids = list(val or [])
             if not ids:
-                wd.setText("Choose biomes…")
+                wd.setText(spec.get("empty_text") or "Choose biomes…")
             elif len(ids) <= 2:
-                wd.setText(", ".join(biome_display_name(int(b)) for b in ids))
+                wd.setText(", ".join(biome_display_name(int(b), self.mc) for b in ids))
             else:
                 wd.setText(f"{len(ids)} biomes")
 
     def _pick_biomes(self, key):
         typ, wd, spec = self.pw[key]
         dlg = BiomePicker(wd.property("value") or [], single=(typ == "biome_single"),
-                          mc=self.mc, parent=self)
+                          mc=self.mc, dim=int(spec.get("dim", 0) or 0), parent=self)
         if dlg.exec():
             v = dlg.value()
             if typ == "biome_single" and v is None:
@@ -1276,6 +1335,8 @@ class ConditionForm(QWidget):
                 params[key] = int(wd.value())
             elif typ == "choice":
                 params[key] = wd.currentData()
+            elif typ == "multi_choice":
+                params[key] = [o for o, cb in wd.items() if cb.isChecked()]
             elif typ == "range":
                 vals = []
                 for e in wd:
@@ -1324,6 +1385,12 @@ class ConditionForm(QWidget):
         # semantic checks (same rules as the classic editor, plus a few)
         if t in ("biome_filter", "biome_sample") and not params.get("biomes_incl"):
             raise ValueError("Choose at least one biome.")
+        if t in ("nether_biomes", "end_biomes"):
+            inc, exc = set(params.get("biomes_incl") or []), set(params.get("biomes_excl") or [])
+            if not inc and not exc:
+                raise ValueError("Choose at least one biome (to find or to exclude).")
+            if inc & exc:
+                raise ValueError("A biome cannot be both wanted and excluded.")
         if t == "climate_center":
             r = params.get("range") or (None, None)
             if all(v is None or str(v).strip() == "" for v in r):

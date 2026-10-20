@@ -172,6 +172,8 @@ def load_cuda(unit: str):
 
 
 def _load_cuda_impl(unit: str):
+    if os.environ.get("SSA_NO_GPU") == "1":     # (17/10) turned off in Settings
+        return None, "GPU turned off in Settings (searches run on the CPU)"
     state, why = build_state(unit)
     if state in ("stale", "unknown", "missing") and dev_autobuild_allowed():
         ok, msg = _run_build(unit)

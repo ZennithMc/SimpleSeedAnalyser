@@ -24,9 +24,7 @@ _uid = itertools.count(1)
 TYPE_INFO = {t["key"]: t for t in CONDITION_TYPES}
 # types that exist in imported cubiomes-viewer sessions but have no editor form
 IMPORTED_TYPES = {
-    "stronghold": "Stronghold (any)", "fortress": "Nether fortress", "bastion": "Bastion",
-    "ruined_portal_nether": "Ruined portal (Nether)", "end_gateway": "End gateway",
-    "end_city": "End city", "mineshaft": "Mineshaft", "desert_well": "Desert well",
+    "stronghold": "Stronghold (any)", "mineshaft": "Mineshaft", "desert_well": "Desert well",
     "climate_noise": "Climate noise (ranges)",
 }
 # types that take dependent conditions (children) meaningfully
@@ -35,6 +33,7 @@ NO_AREA = {"scale_to_nether", "scale_to_overworld", "logic_or", "logic_not", "cr
 NO_INSTANCES = {"spawn_feature116", "spiral", "scale_to_nether", "scale_to_overworld", "crunchiness", "logic_or",
                 "logic_not", "first_stronghold", "spawn", "climate_minmax", "climate_center",
                 "climate_noise", "climate_extreme", "noise_sample", "biome_filter",
+                "nether_biomes", "end_biomes",
                 "biome_sample", "height", "precise_y"}
 
 
@@ -68,7 +67,28 @@ def icon_type(c: dict) -> str:
         return "zombie_village"
     if t == "igloo" and (c.get("params") or {}).get("variant") == "basement":
         return "igloo_basement"
+    if t == "end_city" and (c.get("params") or {}).get("variant") == "with_ship":
+        return "end_city_ship"
     return t
+
+
+def coord_dim(get, uid, depth=0):
+    """Dimension of the coordinates a condition hands to its children (18/10):
+    a Nether / End condition gives positions of its dimension, « Scale to
+    Nether / Overworld » converts, gates and iterators pass their parent's.
+    get(uid) -> condition dict. None = the world origin (no dimension)."""
+    from condition_types import cond_dim
+    c = get(uid) if uid else None
+    if c is None or depth > 200:
+        return None
+    t = c.get("type", "")
+    if t == "scale_to_nether":
+        return -1
+    if t == "scale_to_overworld":
+        return 0
+    if t in ("logic_or", "logic_not", "spiral"):
+        return coord_dim(get, c.get("_parent", 0), depth + 1)
+    return cond_dim(c)
 
 
 def display_name(c: dict) -> str:
@@ -83,6 +103,8 @@ def area_text(c: dict) -> str:
     if t in NO_AREA:
         if t == "crunchiness":
             return f"score {'≤' if int(p.get('mode', 0)) == 0 else '≥'} {p.get('threshold', 0.1):g}"
+        if t == "logic_or" and int(p.get("min_pass", 1) or 1) > 1:     # (19/10)
+            return f"at least {int(p['min_pass'])} pass"
         return ""
     if t == "climate_center":                     # flood fill: size and scale
         sc = int(p.get("scale", 16) or 16)

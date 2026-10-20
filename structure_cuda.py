@@ -141,6 +141,16 @@ def build_jobs(conditions, lib, mc):
         n_struct+=1
         stype=STRUCT_TYPES[t]
         algo=raw.ssa_struct_gpu_algo(stype)
+        # (19/10) Nether complexes from 1.16.1: fortress and bastion share one
+        # random-spread grid (salt 30084232, 27 / 23 chunks) — the kernel's
+        # plain feature algorithm gives every candidate; which of the two (and
+        # the bastion's biome) is left to the CPU validation (a superset: safe).
+        # Before 1.16.1 the fortress has its own rules (not in the kernel). A
+        # « dense » fortress moves its position (to its crossing block): no job.
+        if t in ("fortress","bastion"):
+            if int(mc)<19 or (t=="fortress" and (c.get("params") or {}).get("variant")=="dense"):
+                all_sup=False; continue
+            algo=0
         __import__("native_libs").dbg(f"[GPU-DBG] build_jobs: type={t!r} stype={stype} algo={algo} use_gpu={c.get('params',{}).get('use_gpu')}")
         if algo<0: all_sup=False; continue
         salt=ctypes.c_int32(); rs=ctypes.c_int32(); cr=ctypes.c_int32()

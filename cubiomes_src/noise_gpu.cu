@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>      // malloc/free (used by the diagnostic) — needed on gcc/Linux
 #include "noise_gpu_kernel.cuh"
+#include "ring_gpu_kernel.cuh"   // (19/10) GPU scan of a spiral's positions
 #define SSA_UNIT "noise_gpu"
 #include "ssa_cuda_common.cuh"
 #include <mutex>
@@ -953,4 +954,127 @@ EXPORT int noise_gpu_climate_diag(int mc, int para,
     cudaFree(dxs); cudaFree(dzs); cudaFree(ds);
     cudaFree(sm); cudaFree(sx); cudaFree(sc); cudaFree(mm); cudaFree(mx); cudaFree(mc2);
     return mism;
+}
+
+
+// ===========================================================================
+// (19/10) RING / SPIRAL SCAN — the positions of a top-level spiral iterator
+// that may pass its climate tests (ring_gpu_kernel.cuh, validated on the CPU
+// by tests/ring_gpu_check.py through the same code). 1 block = 1 seed: the
+// 46 octaves in shared memory, the block's threads walk positions g0 .. g1.
+// Kept positions are appended (any order) to out_xz / out_sidx; *out_n counts
+// them all, also beyond cap (the caller then calls again with more room).
+// ===========================================================================
+#ifndef RG_BLOCK
+#define RG_BLOCK 256
+#endif
+__global__ void k_ringscan(const RgSpec* gspec, const uint64_t* seeds, int n, int sidx0,
+                           long long g0, long long g1,
+                           int32_t* out_xz, int32_t* out_sidx, int cap, unsigned int* out_n)
+{
+    // (19/10 bis) several blocks per seed (blockIdx.y = slice of the positions):
+    // one block per seed left most of the GPU idle (64 blocks → 32 M positions/s).
+    // The spec stays in global memory (read uniformly → cached broadcast), so the
+    // shared memory is just the seed's noise (~16 KB) → 6 blocks per SM.
+    extern __shared__ char smem[];
+    BiomeNoiseG* bn = (BiomeNoiseG*)smem;
+    OctSeedG*    os = (OctSeedG*)(smem + sizeof(BiomeNoiseG));
+    RgOctF*      of = (RgOctF*)(os + NG_OCT_TOTAL);
+    const RgSpec* __restrict__ sp = gspec;
+    int b = blockIdx.x;
+    if (b >= n) return;
+    if (threadIdx.x == 0) { bn->mc = 0; Ng_deriveOctaves(bn, seeds[b], os); }
+    __syncthreads();
+    for (int k = threadIdx.x; k < NG_OCT_TOTAL; k += blockDim.x)
+        Ng_perlinInitFrom(&bn->oct[k], &os[k]);
+    __syncthreads();
+    for (int k = threadIdx.x; k < NG_OCT_TOTAL; k += blockDim.x)
+        Rg_octF(bn, k, &of[k]);
+    __syncthreads();
+    RgN nz = { bn, of };
+    const long long stride = (long long)blockDim.x * gridDim.y;
+    for (long long g = g0 + (long long)blockIdx.y * blockDim.x + threadIdx.x; g < g1; g += stride) {
+        int x, z;
+        if (!Rg_pos(sp, g, &x, &z)) continue;
+        if (Rg_testPos(&nz, sp, x, z)) {
+            unsigned int k = atomicAdd(out_n, 1u);
+            if (k < (unsigned int)cap) {
+                out_xz[2 * k] = x; out_xz[2 * k + 1] = z; out_sidx[k] = sidx0 + b;
+            }
+        }
+    }
+}
+
+EXPORT int noise_gpu_ringscan_sizeof(void) { return (int)sizeof(RgSpec); }
+
+EXPORT int noise_gpu_ringscan(int mc, const RgSpec* spec_in, const uint64_t* seeds, int n,
+                              int32_t* out_xz, int32_t* out_sidx, int cap, int* n_out)
+{
+    std::lock_guard<std::mutex> _ng_guard(g_ng_lock);
+    cudaError_t e; int rc = 0;
+    static RgSpec* d_spec = nullptr;
+    static uint64_t* d_seeds = nullptr; static int d_seeds_cap = 0;
+    static int32_t* d_xz = nullptr; static int32_t* d_si = nullptr; static int d_cap = 0;
+    static unsigned int* d_n = nullptr;
+    static SsaChunker ck(1LL << 24, 1LL << 16, 1LL << 34);   // seed × position per launch
+    unsigned int h_n = 0;
+    RgSpec spec = *spec_in;
+    long long tot = 0;
+    size_t shmem = sizeof(BiomeNoiseG) + NG_OCT_TOTAL * (sizeof(OctSeedG) + sizeof(RgOctF));
+    (void)mc;
+    #define NG_CK(call) do{ e=(call); if(e!=cudaSuccess){ \
+        ssa_set_error(e, #call, __LINE__); rc=-1; goto done; } }while(0)
+    *n_out = 0;
+    Rg_prepare(&spec);
+    tot = (long long)spec.nx * spec.nz;
+    if (n <= 0 || tot <= 0) return 0;
+    if (!d_spec) { NG_CK(cudaMalloc(&d_spec, sizeof(RgSpec))); NG_CK(cudaMalloc(&d_n, sizeof(unsigned int))); }
+    if (d_seeds_cap < n) {
+        cudaFree(d_seeds); d_seeds = nullptr;
+        NG_CK(cudaMalloc(&d_seeds, (size_t)n * sizeof(uint64_t))); d_seeds_cap = n;
+    }
+    if (d_cap < cap) {
+        cudaFree(d_xz); cudaFree(d_si); d_xz = nullptr; d_si = nullptr;
+        NG_CK(cudaMalloc(&d_xz, (size_t)cap * 2 * sizeof(int32_t)));
+        NG_CK(cudaMalloc(&d_si, (size_t)cap * sizeof(int32_t))); d_cap = cap;
+    }
+    NG_CK(cudaFuncSetAttribute(k_ringscan, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem));
+    NG_CK(cudaMemcpy(d_spec, &spec, sizeof(RgSpec), cudaMemcpyHostToDevice));
+    NG_CK(cudaMemcpy(d_seeds, seeds, (size_t)n * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    NG_CK(cudaMemset(d_n, 0, sizeof(unsigned int)));
+    for (int off = 0; off < n; ) {
+        int cur = n - off;
+        if (cur > NG_CAP) cur = NG_CAP;
+        for (long long g0 = 0; g0 < tot; ) {
+            long long P = ck.chunk / cur;
+            if (P < 4096) P = 4096;
+            long long g1 = g0 + P < tot ? g0 + P : tot;
+            // blocks per seed: enough for ~8 blocks per SM, each with >= 8 192 positions
+            long long ys = (ng_min_seeds(1) * 4 + cur - 1) / cur;
+            long long ymax = (g1 - g0 + 8191) / 8192;
+            if (ys > ymax) ys = ymax;
+            if (ys < 1) ys = 1;
+            if (ys > 65535) ys = 65535;
+            ck.begin();
+            k_ringscan<<<dim3((unsigned)cur, (unsigned)ys), RG_BLOCK, shmem>>>(
+                d_spec, d_seeds + off, cur, off, g0, g1, d_xz, d_si, cap, d_n);
+            NG_CK(cudaGetLastError());
+            NG_CK(cudaDeviceSynchronize());
+            ck.end();
+            g0 = g1;
+        }
+        off += cur;
+    }
+    NG_CK(cudaMemcpy(&h_n, d_n, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    {
+        int m = (int)(h_n < (unsigned int)cap ? h_n : (unsigned int)cap);
+        if (m > 0) {
+            NG_CK(cudaMemcpy(out_xz, d_xz, (size_t)m * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            NG_CK(cudaMemcpy(out_sidx, d_si, (size_t)m * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        }
+        *n_out = (int)h_n;
+    }
+done:
+    return rc;
+    #undef NG_CK
 }

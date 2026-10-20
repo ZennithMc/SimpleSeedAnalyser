@@ -184,7 +184,18 @@ class MainWindow(QMainWindow):
         # the wheel scrolls panels, never changes a slider / combo / spin box
         from .widgets import WheelGuard
         self._wheel_guard = WheelGuard(self)
-        QApplication.instance().installEventFilter(self._wheel_guard)
+        # (17/10) on the widgets themselves, found by a light periodic scan of
+        # the open windows (forms and dialogs are built later), not on the
+        # whole application (see WheelGuard)
+        from PySide6.QtCore import QTimer as _QT
+
+        def _scan():
+            for top in QApplication.topLevelWidgets():
+                if top.isVisible():
+                    self._wheel_guard.guard(top)
+        self._wheel_scan = _QT(self, interval=700, timeout=_scan)
+        self._wheel_scan.start()
+        _QT.singleShot(0, _scan)
         # every map of the window shares engine, view and layers (map_link.py)
         self.link = MapLink(self.world, self)
         self.sessions = SessionsPage(self.world, link=self.link)
@@ -225,7 +236,9 @@ class MainWindow(QMainWindow):
         _tools = [("Tools", "tools", "Paste seed + coordinates · measure · seed-list converter · "
                                      "legend · fullscreen", None),
                   ("Keys", "keyboard", "Keyboard shortcuts  (F1)", self.show_shortcuts),
-                  ("Theme", "palette", "Appearance: themes and colours", self.open_theme)]
+                  ("Theme", "palette", "Appearance: themes and colours", self.open_theme),
+                  ("Settings", "gear", "Settings: what SSA does by itself instead of asking",
+                   self.open_settings)]
         if not getattr(sys, "frozen", False) and os.path.exists(os.path.join(APP_DIR, "main.py")):
             # (an .exe has no classic UI: sys.executable would just start SSA again)
             _tools.append(("Classic", "legacy", "Open the classic (Tk) interface", self.open_classic))
@@ -285,6 +298,9 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Alt+O"), self, activated=self._octave_mode_key)   # 08/10
         QShortcut(QKeySequence("Alt+Shift+G"), self, activated=self._arrow_mode_key)
         QShortcut(QKeySequence("Alt+S"), self, activated=self._seed_view_key)
+        # (18/10) dimension of the maps: Ctrl+1 Overworld, Ctrl+2 Nether, Ctrl+3 End
+        for _k, _d in (("Ctrl+1", 0), ("Ctrl+2", -1), ("Ctrl+3", 1)):
+            QShortcut(QKeySequence(_k), self, activated=lambda d=_d: self._dim_key(d))
         QShortcut(QKeySequence("F1"), self, activated=self.show_shortcuts)
         QShortcut(QKeySequence("F11"), self, activated=self.toggle_fullscreen)
         QShortcut(QKeySequence("Ctrl+Shift+V"), self, activated=self.paste_seed_coords)
@@ -302,7 +318,19 @@ class MainWindow(QMainWindow):
         # autosave (only when something changed) in case of a crash
         from PySide6.QtCore import QTimer
         from . import ui_state
-        _ui = ui_state.restore(self)         # window, world, map, layers, Stronghold page (03/10)
+        from . import prefs as _prefs
+        # window, world, map, layers, Stronghold page (03/10) — unless turned off
+        # in Settings (17/10)
+        _ui = ui_state.restore(self) if _prefs.get("restore_state") else None
+        for _pg in (self.sessions, self.strongholds, self.drawing):
+            _t = getattr(_pg, "threads", None)
+            if _t is not None:
+                _t.setValue(_prefs.threads_at_launch(_t.value()))
+        # a search that ends by itself flashes the taskbar (Settings)
+        for _pg in (self.sessions, self.strongholds):
+            _r = getattr(_pg, "runner", None)
+            if _r is not None:
+                _r.stateChanged.connect(lambda st, r=_r: self._search_ended(r, st))
         QTimer.singleShot(0, self.sessions.restore_autosave)
         QTimer.singleShot(0, self.drawing.restore_autosave)
         # the Draw page centres the shared map on its drawing: the saved view wins
@@ -324,6 +352,17 @@ class MainWindow(QMainWindow):
         w = self.pages.currentWidget()
         return w is not None and any(m.isVisible() for m in (self.map, self.sessions.map,
                                                              self.strongholds.map, self.drawing.map))
+
+    def _dim_key(self, d):
+        mp = self._current_map()
+        if mp is None:
+            return
+        if not mp.DIMS_ALLOWED:
+            self._flash("This page shows the Overworld only.")
+            return
+        mp.set_dim(d)
+        self._flash({0: "Overworld", -1: "Nether  (coordinates ÷ 8)", 1: "End"}[d]
+                    + f"   ·   Ctrl+{ {0: 1, -1: 2, 1: 3}[d] }")
 
     def _noise_key(self, name):
         if not self._page_has_map():
@@ -463,6 +502,8 @@ class MainWindow(QMainWindow):
             a_clear = m.addAction(f"Clear measurements ({len(mp.measures)})")
         m.addSeparator()
         a_conv = m.addAction(icons.icon("save", 16), "Convert a seed list to .seeds…")
+        a_clim = m.addAction("Biome climate requirements…")      # (19/10)
+        a_clim.setEnabled(self.world.mc >= 22)
         m.addSeparator()
         a_leg = m.addAction(icons.icon("legend", 16), "Structure legend on the map")
         a_leg.setCheckable(True); a_leg.setChecked(self.map.legend_on())
@@ -480,6 +521,9 @@ class MainWindow(QMainWindow):
             from .tools_dialogs import ConvertSeedsDialog
             dlg = ConvertSeedsDialog(self)
             dlg.exec(); dlg.deleteLater()
+        elif act is a_clim:
+            mp2 = mp if mp is not None else self.map
+            mp2.show_biome_climate()
         elif act is a_leg:
             self.layers.legend.setChecked(a_leg.isChecked())
         elif act is a_full:
@@ -546,6 +590,10 @@ class MainWindow(QMainWindow):
         self.status_left.setText(text)
 
     def closeEvent(self, e):
+        try:
+            self._wheel_scan.stop()
+        except Exception:
+            pass
         from . import ui_state
         ui_state.save(self)                  # everything comes back at the next launch (03/10)
         if self.strongholds.runner.state in ("running", "pausing", "stopping"):
@@ -578,6 +626,19 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         super().closeEvent(e)
+
+    def open_settings(self):
+        from .settings_dialog import SettingsDialog
+        SettingsDialog(self).exec()
+        for m in (self.map, self.sessions.map, self.strongholds.map, self.drawing.map):
+            m.update()                          # map settings apply at once
+
+    def _search_ended(self, runner, st):
+        prev = getattr(runner, "_ntf_prev", None)
+        runner._ntf_prev = st
+        if prev == "running" and (st == "done" or (st == "paused" and runner.auto_paused)):
+            from . import prefs
+            prefs.notify_done(self)
 
     def open_theme(self):
         from .theme_dialog import ThemeDialog

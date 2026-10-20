@@ -444,7 +444,7 @@ CUSTOM_PALETTES: dict = {}
 
 def editor_noise(map_noise: str) -> str:
     """Map overlay name → editor channel ('Approx height' / 'Exact Y' → 'Height')."""
-    return "Height" if map_noise in ("Approx height", "Exact Y", "Height") else map_noise
+    return "Height" if map_noise in ("Approx height", "Exact Y", "Height", "End height") else map_noise
 
 
 # ── extended axis (27/09): extremes are coloured too ──────────────────────────

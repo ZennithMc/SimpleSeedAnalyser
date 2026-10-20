@@ -165,19 +165,30 @@ class ThemeDialog(QDialog):
                   ("Retro & paper", ["Synthwave", "Blueprint", "Parchment",
                                      "Topographic"]))
         listed = {n for _g, ns in groups for n in ns}
-        extra = [n for n in theme.BUILTIN if n not in listed]
+        extra = [n for n in theme.BUILTIN if n not in listed and not theme.is_image_theme(n)]
         if extra:
             groups += (("More", extra),)
+        # (17/10) themes made from the user's own pictures
+        groups += (("Your pictures", [n for n in theme.BUILTIN if theme.is_image_theme(n)]),)
         for title, names in groups:
             iv.addWidget(section_title(title))
             g = QGridLayout(); g.setHorizontalSpacing(12); g.setVerticalSpacing(12)
             for i, n in enumerate(n for n in names if n in theme.BUILTIN):
-                c = ThemeCard(n)
-                c.clicked.connect(lambda _=False, n=n: self._select(n))
-                self.cards[n] = c
-                g.addWidget(c, i // 4, i % 4)
+                self._add_card(n, g, i)
             g.setColumnStretch(4, 1)
             iv.addLayout(g)
+            if title == "Your pictures":
+                self.pic_grid = g
+                prow = QHBoxLayout(); prow.setSpacing(8)
+                add = QPushButton("  Create a theme from a picture…"); add.setProperty("kind", "ghost")
+                add.setToolTip("Choose a picture (PNG, JPG…): it becomes the window background,\n"
+                               "and the colours of the theme are taken from it.")
+                add.clicked.connect(self._new_picture)
+                prow.addWidget(add)
+                self.pic_del = QPushButton("Delete this picture theme"); self.pic_del.setProperty("kind", "ghost")
+                self.pic_del.clicked.connect(self._delete_picture)
+                prow.addWidget(self.pic_del); prow.addStretch(1)
+                iv.addLayout(prow)
 
         # colour editor (custom themes only)
         self.edit_box = QWidget(); ev = QVBoxLayout(self.edit_box); ev.setContentsMargins(0, 8, 0, 0)
@@ -235,6 +246,46 @@ class ThemeDialog(QDialog):
         if c is not None:
             c.set_thumb(p)
 
+    def _add_card(self, n, grid, i):
+        c = ThemeCard(n)
+        c.clicked.connect(lambda _=False, n=n: self._select(n))
+        self.cards[n] = c
+        grid.addWidget(c, i // 4, i % 4)
+        return c
+
+    # ── picture themes (17/10) ──────────────────────────────────────────────
+    def _new_picture(self):
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        path, _f = QFileDialog.getOpenFileName(self, "Choose a picture", "",
+                                               "Pictures (*.png *.jpg *.jpeg *.bmp *.webp *.gif)")
+        if not path:
+            return
+        try:
+            name = theme.create_image_theme(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Picture theme", f"This picture could not be used:\n{e}")
+            return
+        if name not in self.cards:
+            n_pic = sum(1 for k in self.cards if theme.is_image_theme(k))
+            c = self._add_card(name, self.pic_grid, n_pic)
+            from .backdrops import backdrop_path
+            p = backdrop_path(theme.EXTRAS[name]["backdrop"])
+            if p:
+                c.set_thumb(p)
+        self._select(name)
+
+    def _delete_picture(self):
+        name = self.current
+        if not theme.is_image_theme(name):
+            return
+        c = self.cards.pop(name, None)
+        if c is not None:
+            c.setParent(None); c.deleteLater()
+        if self.original[0] == name:
+            self.original = (theme.DEFAULT_THEME, dict(theme.BUILTIN[theme.DEFAULT_THEME]))
+        theme.delete_image_theme(name)
+        self._select(theme.DEFAULT_THEME)
+
     # ── helpers ─────────────────────────────────────────────────────────────
     def _tokens(self, name):
         return self.edits.get(name) or theme.theme_tokens(name)
@@ -248,6 +299,8 @@ class ThemeDialog(QDialog):
         self.info.setText(f"{name} — {ex.get('desc', '')}"
                           + ("   ·   custom: its colours can be edited below" if editable else ""))
         self.edit_box.setVisible(editable)
+        if hasattr(self, "pic_del"):
+            self.pic_del.setVisible(theme.is_image_theme(name))
         toks = self._tokens(name)
         for key, (sw, hexlab) in self.swatches.items():
             sw.setStyleSheet(f"QPushButton#Swatch {{ background: {toks[key]}; border: 1px solid {theme.LINE2}; }}")
