@@ -325,6 +325,7 @@ void ms116_start_free(Ms116Start *s)
 }
 
 static int ms116_start_build(const T116 *t, int cx, int cz, int ty, Ms116Start *s);
+static int ms_build(uint64_t seed, int cx, int cz, int mesa, int min_y, int extra_double, Ms116Start *s);
 
 /* (10/10) the layout only depends on the 48 low bits (carver seed) and on the
  * type (mesa: no random vertical shift): cached per thread, so the 65 536
@@ -367,9 +368,23 @@ int ms116_start(const T116 *t, int cx, int cz, Ms116Start *s)
 
 static int ms116_start_build(const T116 *t, int cx, int cz, int ty, Ms116Start *s)
 {
-    s->cx = cx; s->cz = cz; s->mesa = ty == 2;
+    return ms_build(t->seed, cx, cz, ty == 2, 0, 0, s);
+}
+
+/* (29/10) 1.18+ normal mineshafts: the same layout, a nextDouble first (1.19+:
+ * the frequency test on the same random), moveBelowSeaLevel down to min_y */
+int ms118_start_normal(uint64_t seed, int cx, int cz, int extra_double, Ms116Start *s)
+{
+    memset(s, 0, sizeof(*s));
+    return ms_build(seed, cx, cz, 0, -64, extra_double, s);
+}
+
+static int ms_build(uint64_t seed, int cx, int cz, int mesa, int min_y, int extra_double, Ms116Start *s)
+{
+    s->cx = cx; s->cz = cz; s->mesa = mesa;
     uint64_t r;
-    setSeed(&r, carver_seed(t->seed, cx, cz));
+    setSeed(&r, carver_seed(seed, cx, cz));
+    if (extra_double) (void)nextDouble(&r);
     Lay L = { s, &r, 0 };
     Ms116Piece room;
     memset(&room, 0, sizeof room);
@@ -399,7 +414,7 @@ static int ms116_start_build(const T116 *t, int cx, int cz, int ty, Ms116Start *
         dy = SEA_LEVEL - bb.y1 + cy / 2 + 5;
     } else {
         int k = SEA_LEVEL - 10;
-        int l = cy + 1;
+        int l = cy + min_y + 1;
         if (l < k) l += nextInt(&r, k - l);
         dy = l - bb.y1;
     }
@@ -420,7 +435,18 @@ typedef struct {
     int x0, z0;
     short top[256];       /* OCEAN_FLOOR_WG heightmap (highest blocking y + 1), -1 unknown */
     uint64_t *r;
+    const Ms116Start *cur; /* (29/10) the start being placed (chest capture) */
 } W;
+
+/* (29/10) the chest minecarts placed while chunk (cx, cz) populates: (x, y, z,
+ * loot seed, start cx, start cz) per chest */
+static __thread struct { int on, cx, cz, n, max; int64_t *out; } ms_cap;
+void ms116_capture(int cx, int cz, int64_t *out, int max)
+{
+    ms_cap.on = out != NULL; ms_cap.cx = cx; ms_cap.cz = cz; ms_cap.n = 0;
+    ms_cap.max = max; ms_cap.out = out;
+}
+int ms116_capture_end(void) { ms_cap.on = 0; return ms_cap.n; }
 
 /* Material.blocksMovement() */
 static inline int blocks_movement(int b)
@@ -671,7 +697,12 @@ static void corridor_chest(W *w, const Ms116Piece *p, int x, int y, int z)
     if (box_has(&w->cb, X, Y, Z) && T116_IS_AIR(wget(w, X, Y, Z)) && !T116_IS_AIR(wget(w, X, Y - 1, Z))) {
         (void)next(w->r, 1);              /* rail shape */
         add_block(w, p, T116_RAIL, x, y, z);
-        (void)nextLong(w->r);             /* loot table seed */
+        int64_t ls = (int64_t)nextLong(w->r);     /* loot table seed */
+        if (ms_cap.on && (w->x0 >> 4) == ms_cap.cx && (w->z0 >> 4) == ms_cap.cz &&
+            ms_cap.n < ms_cap.max && w->cur) {
+            int64_t *o = ms_cap.out + 6 * ms_cap.n++;
+            o[0] = X; o[1] = Y; o[2] = Z; o[3] = ls; o[4] = w->cur->cx; o[5] = w->cur->cz;
+        }
     }
 }
 
@@ -697,12 +728,31 @@ static void corridor_web(W *w, const Ms116Piece *p, float f, int x, int y, int z
     if (under_sea(w, p, x, y, z)) add_random(w, p, f, x, y, z, T116_COBWEB);
 }
 
+/* (29/10) MineShaftCorridor.hasPlacedSpider is a field of the start's piece: once
+ * a chunk placed the spawner, the chunks generated afterwards skip its nextInt(3).
+ * ms116_spider_order: the pieces whose spawner a previous chunk placed (by box). */
+static __thread Ms116Box ms_spider_done[64];
+static __thread int ms_spider_n = 0, ms_spider_all = 0;
+void ms116_spider_reset(int all) { ms_spider_n = 0; ms_spider_all = all; }
+static int ms_spider_placed(const Ms116Piece *p)
+{
+    if (!p->webs) return 0;
+    if (ms_spider_all) return 1;
+    for (int i = 0; i < ms_spider_n; i++)
+        if (!memcmp(&ms_spider_done[i], &p->bb, sizeof(Ms116Box))) return 1;
+    return 0;
+}
+static void ms_spider_mark(const Ms116Piece *p)
+{
+    if (ms_spider_n < 64) ms_spider_done[ms_spider_n++] = p->bb;
+}
+
 static int gen_corridor(W *w, const Ms116Piece *p)
 {
     if (liquid_around(w, p)) return 0;
     const int A = T116_CAVE_AIR;
     int m = p->length * 5 - 1;
-    int has_spawner = 0;
+    int has_spawner = ms_spider_placed(p);   /* (29/10) already placed by a chunk before? */
     fill(w, p, 0, 0, 0, 2, 1, m, A, A, 0);
     fill_under_sea(w, p, 0.8f, 0, 2, 0, 2, 2, m, A, A, 0, 0);
     if (p->webs)
@@ -726,6 +776,7 @@ static int gen_corridor(W *w, const Ms116Piece *p)
         int X = tx(p, 1, q), Z = tz(p, 1, q);
         if (!box_has(&w->cb, X, Y, Z) || !under_sea(w, p, 1, 0, q)) continue;
         has_spawner = 1;
+        ms_spider_mark(p);
         wset(w, X, Y, Z, T116_SPAWNER);
     }
     for (int t = 0; t <= 2; ++t)
@@ -804,6 +855,41 @@ static int lset_add(LSet *s, uint64_t k)
     return 1;
 }
 
+/* (29/10) 1.16 / 1.17: StructureStart.placeInChunk REMOVES a piece whose
+ * postProcess fails (liquid on its faces) — every chunk generated afterwards
+ * skips it (no draws). Mode "removed": a piece is skipped when its faces touch
+ * a liquid in ANY of its chunks (their carved terrain), as when that chunk was
+ * generated first. */
+static __thread int ms_removed_mode = 0;
+static __thread T116Cache *ms_rm_cache = NULL;
+void ms116_removed_mode(int on) { ms_removed_mode = on; }
+
+static int ms_chunk_get(void *ctx, int x, int y, int z)
+{
+    const T116Chunk *c = ctx;
+    if (y < 0 || y > 255) return T116_AIR;
+    return T116_AT(c, x & 15, y, z & 15);
+}
+
+static int piece_removed(const T116 *t, const Ms116Piece *p, int cx, int cz)
+{
+    if (!ms_rm_cache) ms_rm_cache = t116_cache_new(48);
+    if (!ms_rm_cache) return 0;
+    for (int x = (p->bb.x0 - 1) >> 4; x <= (p->bb.x1 + 1) >> 4; x++)
+        for (int z = (p->bb.z0 - 1) >> 4; z <= (p->bb.z1 + 1) >> 4; z++) {
+            if (x == cx && z == cz) continue;          /* the chunk itself: checked as usual */
+            const T116Chunk *c = t116_cache_chunk(t, ms_rm_cache, x, z, 7);
+            if (!c) continue;
+            W w2;
+            memset(&w2, 0, sizeof w2);
+            w2.ctx = (void *)c; w2.get = ms_chunk_get;
+            w2.cb = (Ms116Box){ x << 4, 1, z << 4, (x << 4) + 15, 512, (z << 4) + 15 };
+            w2.x0 = x << 4; w2.z0 = z << 4;
+            if (liquid_around(&w2, p)) return 1;
+        }
+    return 0;
+}
+
 static int ms_populate_impl(const T116 *t, int cx, int cz, const int16_t *hm, W *w)
 {
     int bx = cx << 4, bz = cz << 4;
@@ -851,9 +937,11 @@ static int ms_populate_impl(const T116 *t, int cx, int cz, const int16_t *hm, W 
     int count = 0;
     for (int oi = 0; oi < no; oi++) {
         const Ms116Start *s = &st[order[oi]];
+        w->cur = s;
         for (int i = 0; i < s->n; i++) {
             const Ms116Piece *p = &s->p[i];
             if (!box_isect(&p->bb, &w->cb)) continue;
+            if (ms_removed_mode && piece_removed(t, p, cx, cz)) continue;
             int ok = 0;
             switch (p->type) {
             case MS116_ROOM:     ok = gen_room(w, s, p); break;

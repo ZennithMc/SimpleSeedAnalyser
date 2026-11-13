@@ -15,6 +15,9 @@ CASES = [
     (23, -4770284401290009883, [(-11529, -8466, 0), (4095, -7395, 2), (-13062, 11141, 1),
                                 (19590, 3769, 0), (-3457, 17001, 1), (18479, -10306, 1),
                                 (-20020, -272, 1), (-4639, -17565, 1)]),
+    # 26.2, seed 12345, 24/10: the storeroom crossing (type 2) next to the portal
+    # room has its chest in the portal's chunk (its type was always read as 0)
+    (34, 12345, [(-8702, 6445, 1)]),
 ]
 
 

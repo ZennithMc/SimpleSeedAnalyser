@@ -26,11 +26,14 @@ IS_WIN = sys.platform == "win32"
 if IS_WIN:
     REQUIRED_LIBS = ["libcubiomes.dll", "gaider_layouts.dll", "terrain.dll"]
     OPTIONAL_LIBS = ["gaider_cuda.dll", "structure_cuda.dll", "noise_gpu.dll",
-                     "terrain_gpu.dll", "topy_gpu.dll"]
+                     "terrain_gpu.dll", "topy_gpu.dll",
+                     "treecrack.dll", "tree_cuda.dll",          # (05/11) Seedcracking
+                     "lootvm.dll"]                              # (07/11) loot finder in C
 else:                                # Linux test build of the same spec
     REQUIRED_LIBS = ["libcubiomes.so", "libgaider_layouts.so", "libterrain.so"]
     OPTIONAL_LIBS = [ "terrain_gpu.so", "libgaider_cuda.so",
-                     "libstructure_cuda.so", "libnoise_gpu.so", "libtopy_gpu.so"]
+                     "libstructure_cuda.so", "libnoise_gpu.so", "libtopy_gpu.so",
+                     "libtreecrack.so", "libtree_cuda.so", "liblootvm.so"]
 
 binaries = []
 for name in REQUIRED_LIBS:
@@ -50,6 +53,8 @@ for name in OPTIONAL_LIBS:
 datas = [
     (os.path.join(ROOT, "colormaps"), "colormaps"),              # colormaps.py
     (os.path.join(ROOT, "ruined_footprints.json"), "."),         # ruined_portal.py
+    (os.path.join(ROOT, "assets"), "assets"),                     # (22/10) theme photos
+    (os.path.join(ROOT, "loot_tables"), "loot_tables"),           # (25/10) loot_engine.py
 ]
 # the Minecraft checker's Java source (mc_checker.py compiles it once with the JDK;
 # no Minecraft code is shipped: the jars come from the user's seed-checker setup)
@@ -83,6 +88,7 @@ hiddenimports = (
         "biome_catalog", "noise_palettes", "colormaps", "draw_engine",
         "topy_family", "topy_gpu", "lake_portals", "mc_checker", "session_confirm", "spawn_check",
         "feature116", "qtui.feature_confirm",
+        "loot_native", "loot_exact", "loot_finder", "ruined_portal_filter", "spawn_exact",
         # Qt: the stylesheet uses url(*.svg) → qsvg image-format plugin → Qt6Svg
         "PySide6.QtSvg",
         # map_engine noise resize
@@ -192,7 +198,7 @@ coll = COLLECT(
 
 # README / licences next to the executable (users see them; GPL + LGPL notices)
 import shutil
-for _f in ("README.md", "LICENSE", "THIRD_PARTY_LICENSES.txt"):
+for _f in ("README.md", "Updates.txt", "LICENSE", "THIRD_PARTY_LICENSES.txt"):
     _p = os.path.join(ROOT, _f)
     if os.path.isfile(_p):
         shutil.copy2(_p, os.path.join(DISTPATH, "SimpleSeedAnalyser", _f))

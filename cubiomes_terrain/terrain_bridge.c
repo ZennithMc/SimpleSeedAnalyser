@@ -25,7 +25,7 @@
   #define TLS    __thread
 #endif
 
-#define NCOL       (48 + 1)
+#define NCOL       ((48 + 1) * 5)      /* (24/10) 5 channels per corner level */
 #define CACHE_SIZE 4096          /* power of two; per-seed noise-column cache */
 
 typedef struct { int valid, cx, cz, caves; double col[NCOL]; } ColCache;
@@ -37,17 +37,26 @@ typedef struct {
     uint64_t seed;
     int      n_used;             /* entrées valides dans le cache */
     ColCache cache[CACHE_SIZE];
+    void    *cv;                 /* (24/10) cave118 context: aquifer-exact surface */
 } TBContext;
 
+void *cv_alloc(void);
+void cv_free(void *p);
+int cv_init(void *p, int mc, uint64_t seed);
+int cv_solid_top(void *p, int x, int z);
+
 EXPORT void *tb_alloc(void)      { return calloc(1, sizeof(TBContext)); }
-EXPORT void  tb_free(void *p)    { free(p); }
+EXPORT void  tb_free(void *p)    { if (p) cv_free(((TBContext *)p)->cv); free(p); }
 
 /* (re)initialise for a seed+version. Returns 1 on success, 0 on failure. */
 EXPORT int tb_init(void *p, int mc, uint64_t seed)
 {
     TBContext *c = (TBContext *)p;
     if (c->ready && c->mc == mc && c->seed == seed) return 1;
+    void *cv = c->cv;
     memset(c, 0, sizeof(*c));
+    c->cv = cv;
+    if (cv && !cv_init(cv, mc, seed)) { cv_free(cv); c->cv = NULL; }
     if (!setupTerrainNoise(&c->tn, mc, 0)) return 0;
     if (!initTerrainNoise(&c->tn, seed, DIM_OVERWORLD)) return 0;
     c->ready = 1; c->mc = mc; c->seed = seed;
@@ -92,6 +101,16 @@ EXPORT int tb_surface_y(void *p, int x, int z, int caves)
 {
     TBContext *c = (TBContext *)p;
     int cx = x >> 2, cz = z >> 2;
+    if (caves) {                 /* (24/10) the exact one: noise + aquifer barriers */
+        if (!c->cv) {
+            c->cv = cv_alloc();
+            if (c->cv && !cv_init(c->cv, c->mc, c->seed)) { cv_free(c->cv); c->cv = NULL; }
+        }
+        if (c->cv) {
+            int t = cv_solid_top(c->cv, x, z);
+            return t < -64 ? -64 : t + 1;
+        }
+    }
     /* copie immédiate de chaque colonne : un vidage du cache entre deux getcol ne
      * peut plus altérer une colonne déjà obtenue */
     double d00[NCOL], d01[NCOL], d10[NCOL], d11[NCOL];
@@ -138,12 +157,14 @@ EXPORT void tb_column(void *p, int x, int z, int *blocks_out)
  * search. We cache columns per seed (open-addressed hash, generation-tagged so a new
  * seed invalidates everything in O(1) with no memset). This is what lets a radial
  * search approach the per-seed re-seed ceiling (~90k sps) instead of collapsing. */
-#define BCACHE_SIZE 16384            /* power of two; covers ~16k distinct cells */
+#define BCACHE_SIZE 2048             /* power of two (24/10: 5-channel columns, 4 MB / thread) */
 typedef struct { uint32_t gen; int cx, cz, caves; double col[NCOL]; } BCacheEntry;
 typedef struct {
     TerrainNoise tn;
     uint32_t     gen;                /* current seed's generation tag */
     BCacheEntry  cache[BCACHE_SIZE];
+    int          mc;                 /* (31/10) the exact surface (caves = 1): cave118 */
+    void        *cv;
 } TBBatchCtx;
 
 /* start a new seed: bump the generation (all entries become stale instantly). On the
@@ -265,9 +286,25 @@ EXPORT void *tb_precise_y_alloc(int mc)
     TBBatchCtx *c = (TBBatchCtx *)calloc(1, sizeof(TBBatchCtx));   /* gens start at 0 */
     if (!c) return NULL;
     if (!setupTerrainNoise(&c->tn, mc, 0)) { free(c); return NULL; }
+    c->mc = mc;
     return c;
 }
-EXPORT void tb_precise_y_free(void *p) { if (p) free(p); }
+EXPORT void tb_precise_y_free(void *p) { if (p) { cv_free(((TBBatchCtx *)p)->cv); free(p); } }
+
+/* (31/10) the surface the search tests = the one the map and the seed check show
+ * (tb_surface_y): with caves, cave118's exact top (noise + aquifer barriers, after
+ * the carvers' level of detail of cv_solid_top) — before, the batch used the bare
+ * density (generateColumnFast): no aquifer barrier, so under a lake / the sea it saw
+ * the bottom of the water body, the check the barrier above it (results found by the
+ * search then failed their check: « no longer matches »). Highest SOLID world Y. */
+static int tb_batch_surface(TBBatchCtx *c, int x, int z, int caves, int cv_ok)
+{
+    if (caves && cv_ok) {
+        int t = cv_solid_top(c->cv, x, z);
+        return t < -64 ? -65 : t;
+    }
+    return tb_surface_y_cached(c, x, z, caves);
+}
 
 /* Filter n seeds with a CALLER-OWNED context `p`. Re-seeds the ctx per seed; scans
  * the disk of radius r around (at_x,at_z); mask[i]=1 if any sample's Y meets the test
@@ -282,6 +319,10 @@ EXPORT int tb_precise_y_filter_ctx(
     if (!ctx || n <= 0) return -1;
     if (sample_step < 1) sample_step = 1;
     long long r2 = (long long)r * (long long)r;
+    /* (31/10) the sampling grid is centred on (at_x, at_z): offsets k * step up to r.
+     * Before it started at at_x - r: with r < step (e.g. radius 1 at 1/4) no cell of
+     * the grid fell in the disk → every seed failed. */
+    int kr = (r / sample_step) * sample_step;
     int passed = 0, i;
 
     /* coverage-mode constants (same for every seed): Ntotal = #cells in the strided
@@ -291,8 +332,8 @@ EXPORT int tb_precise_y_filter_ctx(
     long long Ntotal = 0, Xpass = 1;
     if (cov_mode) {
         int sx, sz;
-        for (sz = at_z - r; sz <= at_z + r; sz += sample_step)
-            for (sx = at_x - r; sx <= at_x + r; sx += sample_step) {
+        for (sz = at_z - kr; sz <= at_z + kr; sz += sample_step)
+            for (sx = at_x - kr; sx <= at_x + kr; sx += sample_step) {
                 long long dx = sx - at_x, dz = sz - at_z;
                 if (dx*dx + dz*dz > r2) continue;
                 Ntotal++;
@@ -301,22 +342,29 @@ EXPORT int tb_precise_y_filter_ctx(
     }
 
     for (i = 0; i < n; i++) {
-        if (!initTerrainNoise(&ctx->tn, seeds[i], DIM_OVERWORLD)) { mask[i] = 0; continue; }
-        tb_batch_newseed(ctx);          /* invalidate the noise-column cache (O(1)) */
+        int cv_ok = 0;
+        if (caves) {
+            if (!ctx->cv) ctx->cv = cv_alloc();
+            cv_ok = ctx->cv && cv_init(ctx->cv, ctx->mc, seeds[i]);
+        }
+        if (!cv_ok) {
+            if (!initTerrainNoise(&ctx->tn, seeds[i], DIM_OVERWORLD)) { mask[i] = 0; continue; }
+            tb_batch_newseed(ctx);      /* invalidate the noise-column cache (O(1)) */
+        }
         int found = 0;
         if (r <= 0) {
             /* single point — coverage is meaningless */
-            int y = tb_surface_y_cached(ctx, at_x, at_z, caves);
+            int y = tb_batch_surface(ctx, at_x, at_z, caves, cv_ok);
             int in = (y >= y_min && y <= y_max);
             found = invert ? !in : in;
         } else if (!cov_mode) {
             /* any-match: pass as soon as ONE sampled cell is in the band (early exit) */
             int sx, sz;
-            for (sz = at_z - r; sz <= at_z + r && !found; sz += sample_step) {
-                for (sx = at_x - r; sx <= at_x + r; sx += sample_step) {
+            for (sz = at_z - kr; sz <= at_z + kr && !found; sz += sample_step) {
+                for (sx = at_x - kr; sx <= at_x + kr; sx += sample_step) {
                     long long dx = sx - at_x, dz = sz - at_z;
                     if (dx*dx + dz*dz > r2) continue;
-                    int y = tb_surface_y_cached(ctx, sx, sz, caves);
+                    int y = tb_batch_surface(ctx, sx, sz, caves, cv_ok);
                     int in = (y >= y_min && y <= y_max);
                     if (invert ? !in : in) { found = 1; break; }
                 }
@@ -326,12 +374,12 @@ EXPORT int tb_precise_y_filter_ctx(
              * scan + tb_coverage_pass (and the GPU/numpy reduction), just faster. */
             long long Xc = 0, processed = 0;
             int sx, sz, decided = 0;
-            for (sz = at_z - r; sz <= at_z + r && !decided; sz += sample_step) {
-                for (sx = at_x - r; sx <= at_x + r; sx += sample_step) {
+            for (sz = at_z - kr; sz <= at_z + kr && !decided; sz += sample_step) {
+                for (sx = at_x - kr; sx <= at_x + kr; sx += sample_step) {
                     long long dx = sx - at_x, dz = sz - at_z;
                     if (dx*dx + dz*dz > r2) continue;
                     processed++;
-                    int y = tb_surface_y_cached(ctx, sx, sz, caves);
+                    int y = tb_batch_surface(ctx, sx, sz, caves, cv_ok);
                     int in = (y >= y_min && y <= y_max);
                     if (invert ? !in : in) Xc++;
                     if (Xc >= Xpass) { found = 1; decided = 1; break; }

@@ -37,7 +37,7 @@ from .widgets import Segmented, body, section_title
 from .world import random_seed
 
 MODES = ("Eyes", "Top Y", "Broken portal")
-VERIFIED_EYE_VERSIONS = {20, 21, 26, 28}          # checked in game (1.16, 1.17, 1.21.x)
+VERIFIED_EYE_VERSIONS = {19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 32, 33, 34, 35}   # (29/10) servers
 
 
 def p_eyes_at_least(n: int) -> float:
@@ -730,9 +730,6 @@ class StrongholdPage(QWidget):
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._menu)
         v.addWidget(self.table, 1)
-        v.addWidget(body("Click a result: the seed is loaded and the map centred on the "
-                         "stronghold. Double-click it on the map for its details.",
-                         muted=True, small=True))
         return right
 
     def _build_runbar(self):

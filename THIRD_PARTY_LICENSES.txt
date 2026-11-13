@@ -63,8 +63,45 @@ SOFTWARE.
 https://github.com/Gaider10/12-eye
 ==============================================================================
 
-Stronghold piece generator used to simulate portal rooms. Used with credit;
-licence to be confirmed with the author before a public release.
+Stronghold piece generator used to simulate portal rooms. The upstream
+repository does not state a licence. Used with credit.
+
+==============================================================================
+Seedcracking from trees (tree_crack.py, cubiomes_src/treecrack*, tree_cuda.cu)
+==============================================================================
+
+SSA's tree cracker is a new implementation written for SSA, following the method
+of these tools (no code copied from them):
+
+  * TreeCracker and PopulationCrr — Andrew (Gaider10)
+    https://github.com/Gaider10/TreeCracker
+    https://github.com/Gaider10/PopulationCrr
+    The lattice over the first tree, the position / attribute windows, the exact
+    replay of the chunk's trees and the population chunk reversal. The upstream
+    repositories do not state a licence. Used with credit.
+  * tree-cracker — NelS (fork of the above, information estimates, 1.17 salt)
+    https://github.com/Nel-S/tree-cracker
+  * TreeCracking documentation — Epic10l2, with Edd (humhue)
+  * Tree decorator salts — Neil (hube12)
+  * Earlier tree crackers — Cortex (MCRcortex), TatertotGr8
+  * TextureRotations — 19MisterX98 (finding a forest's coordinates)
+    https://github.com/19MisterX98/TextureRotations
+  * SeedCandy — WearBlackAllDay (structure seed → world seeds)
+    https://github.com/WearBlackAllDay/SeedCandy
+
+The tree models were checked against real Java 1.16.1, 1.16.5 and 1.17.1 worlds.
+
+Structures and End pillars (struct_crack.py, cubiomes_src/structcrack_core.h,
+end_pillars.py) — also new code, following:
+
+  * SeedCrackerX — 19MisterX98, after KaptainWutax's SeedCracker
+    https://github.com/19MisterX98/SeedcrackerX
+    Lifting the 20 low bits of the structure seed from the structures whose chunk
+    range is even, then searching the 28 high bits; the End pillar seed.
+  * cubiomes — Cubitect (structure configurations, positions and biome viability,
+    used to check every result)
+
+Structure anchors and the pillar model were checked on Java 1.16.1 – 1.21.4 servers.
 
 ==============================================================================
 seed-checker — jellejurre (Minecraft check, tools/checker)
@@ -4019,4 +4056,34 @@ PyInstaller bootloader — GPL-2.0 with the PyInstaller bootloader exception
 
 The executable launcher is PyInstaller's bootloader, distributed under the GPL v2
 with an exception allowing it to be used with any program. https://pyinstaller.org
+
+==============================================================================
+Landscape photos — Unsplash (CC0 / Unsplash License)
+==============================================================================
+
+The five Landscapes themes use these photos (resized to 2560 px, assets/landscapes):
+
+  Mountain Lake  — "A Large Body of Water Surrounded By Mountains", Peter Thomas
+                   https://unsplash.com/photos/Dxod5pdRtsk — Unsplash License
+  Fern Forest    — "Morskie Oko", https://unsplash.com/photos/_1UF_3TlKcQ — Unsplash License
+  Ocean Shore    — Nattu Adnan, https://unsplash.com/photos/Ai2TRdvI6gM — Unsplash License
+  Pier at Dusk   — "Sunset by the Pier", https://unsplash.com/photos/ces8_Bo7bhQ — CC0
+  Desert Night   — Jared Evans, https://unsplash.com/photos/Wwg1TzCuV9E — CC0
+
+Unsplash photos published before June 8, 2017 are CC0 (public domain). The later
+ones are under the Unsplash License (https://unsplash.com/license): free to use,
+modify and redistribute, not to be sold as they are. Sources and licences as listed
+by the elementary OS and Pop!_OS wallpaper collections.
+
+==============================================================================
+Minecraft game data — Mojang Studios (loot_tables/)
+==============================================================================
+
+SSA reproduces Minecraft's world generation. To do so, loot_tables/ holds data
+read from the game's files (loot tables, structure templates' sizes, jigsaw pools
+and block lists, enchantment tables) and tests/server_truth/ holds what real
+servers generated. This data belongs to Mojang Studios / Microsoft; it is not
+covered by SSA's GPL licence and is only used for compatibility. No game code,
+texture or sound is shipped: the item and block pictures are read from the user's
+own Minecraft installation. SSA is not affiliated with Mojang Studios or Microsoft.
 

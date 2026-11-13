@@ -4,7 +4,7 @@ no GUI toolkit). Shared by the Tk picker (biome_picker.py) and the Qt UI.
 """
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from cubiomes_wrap import BIOME_COLORS, BIOME_NAMES
 from cubiomes_wrap import (

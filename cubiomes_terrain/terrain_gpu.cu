@@ -112,7 +112,7 @@ TG_DEV double tg_samplePerlin(const PerlinG *p, double d1, double d2, double d3,
     d1 -= i1; d3 -= i3; h1 = (uint8_t)(int)i1; h3 = (uint8_t)(int)i3;
     t1 = d1*d1*d1 * (d1 * (d1*6.0f-15.0f) + 10.0f);
     t3 = d3*d3*d3 * (d3 * (d3*6.0f-15.0f) + 10.0f);
-    if (yamp) { double yc = (ymax >= 0.0f && ymax < d2) ? ymax : d2; d2 -= floor(yc / yamp) * yamp; }
+    if (yamp) { double yc = (ymax >= 0.0f && ymax < d2) ? ymax : d2; d2 -= floor(yc / yamp + 1.0000000116860974e-07) * yamp; }   /* (24/10) + (double)1.0E-7F as in ImprovedNoise */
     const uint8_t *idx = p->d;
     uint8_t a1 = idx[h1] + h2,     b1 = idx[h1 + 1] + h2;
     uint8_t a2 = idx[a1] + h3,     b2 = idx[b1] + h3;
@@ -229,10 +229,21 @@ typedef struct {
     SplineG *factorSpline;
     SplineG *jaggednessSpline;
 } TerrainNoiseG;
+/* (24/10) 26.2+: the spaghetti samplers are interval_select(noise(x * k)) instead of
+ * rarity * noise(x / rarity) — set by the host for the version being computed */
+#ifdef __CUDACC__
+__device__ int tg_mulScales = 0;
+#endif
+static int tg_mulScales_h = 0;
+#if defined(__CUDA_ARCH__)
+  #define TG_MULS tg_mulScales
+#else
+  #define TG_MULS tg_mulScales_h
+#endif
 
 /* ───────────────────────────── density helpers ───────────────────────────── */
 TG_DEV int    tg_floordiv(int a, int b) { int q=a/b; if((a%b)&&((a<0)!=(b<0)))q--; return q; }
-TG_DEV double tg_pav(double w) { return -(fabs(fabs(w)-0.6666667f)-0.33333334f)*3.0f; }
+TG_DEV double tg_pav(double w) { return -3.0 * (-0.3333333333333333 + fabs(-0.6666666666666666 + fabs(w))); }   /* (24/10) as the router (double) */
 TG_DEV double tg_mapFromUnit(double in, double f, double t) { return (f+t)*0.5f + ((t-f)*0.5f)*in; }
 TG_DEV double tg_remap(double v, double iMin, double iMax, double oMin, double oMax) {
     double s=(oMax-oMin)/(iMax-iMin); return v*s + (oMin - iMin*s);
@@ -266,7 +277,9 @@ TG_DEV double tg_spaghetti2d(const TerrainNoiseG *P, int x, int y, int z) {
     double mod = tg_sampleDP(DP(TGO_SPAGHETTI_2D_MODULATOR), x*2.0f,y,z*2.0f);
     double rar = tg_rar2d(mod);
     double th  = tg_map(tg_sampleDP(DP(TGO_SPAGHETTI_2D_THICKNESS), x*2.0f,y,z*2.0f), -1.0f,1.0f, 0.6f,1.3f);
-    double s2  = tg_sampleDP(DP(TGO_SPAGHETTI_2D), x/rar,y/rar,z/rar);
+    double k2  = rar==0.5f?2.0f:(rar==0.75f?1.3333333333333333f:(rar==1.0f?1.0f:(rar==2.0f?0.5f:0.3333333333333333f)));
+    double s2  = TG_MULS ? tg_sampleDP(DP(TGO_SPAGHETTI_2D), x*k2,y*k2,z*k2)
+                               : tg_sampleDP(DP(TGO_SPAGHETTI_2D), x/rar,y/rar,z/rar);
     double a   = fabs(rar*s2) - 0.083f*th;
     double el  = tg_map(tg_sampleDP(DP(TGO_SPAGHETTI_2D_ELEVATION), x,0.0f,z), -1.0f,1.0f, tg_floordiv(-64,8), 8.0f);
     double b   = fabs(el - y/8.0f) - th;
@@ -276,8 +289,11 @@ TG_DEV double tg_spaghetti3d(const TerrainNoiseG *P, int x, int y, int z) {
     double rr = tg_sampleDP(DP(TGO_SPAGHETTI_3D_RARITY), x*2.0f,y,z*2.0f);
     double th = tg_mapFromUnit(tg_sampleDP(DP(TGO_SPAGHETTI_3D_THICKNESS), x,y,z), -0.065f, -0.088f);
     double rar = tg_rar3d(rr);
-    double s1 = rar*fabs(tg_sampleDP(DP(TGO_SPAGHETTI_3D_1), x/rar,y/rar,z/rar));
-    double s2 = rar*fabs(tg_sampleDP(DP(TGO_SPAGHETTI_3D_2), x/rar,y/rar,z/rar));
+    double k3 = rar==0.75f?1.3333333333333333f:(rar==1.0f?1.0f:(rar==1.5f?0.6666666666666666f:0.5f));
+    double s1 = TG_MULS ? fabs(rar*tg_sampleDP(DP(TGO_SPAGHETTI_3D_1), x*k3,y*k3,z*k3))
+                              : rar*fabs(tg_sampleDP(DP(TGO_SPAGHETTI_3D_1), x/rar,y/rar,z/rar));
+    double s2 = TG_MULS ? fabs(rar*tg_sampleDP(DP(TGO_SPAGHETTI_3D_2), x*k3,y*k3,z*k3))
+                              : rar*fabs(tg_sampleDP(DP(TGO_SPAGHETTI_3D_2), x/rar,y/rar,z/rar));
     return tg_clamp(fmax(s1,s2)+th, -1.0f, 1.0f);
 }
 TG_DEV double tg_caveEntrance(const TerrainNoiseG *P, int x, int y, int z) {
@@ -339,8 +355,9 @@ TG_DEV void tg_noiseParams(const TerrainNoiseG *P, int cellX, int cellZ, float n
     double pz = cellZ + tg_sampleDP(&P->climate[TG_NP_SHIFT], cellZ, cellX, 0) * 4.0f;
     np[0] = (float)tg_sampleDP(&P->climate[TG_NP_CONT],  px, 0, pz);
     np[1] = (float)tg_sampleDP(&P->climate[TG_NP_EROS],  px, 0, pz);
-    float w = (float)tg_sampleDP(&P->climate[TG_NP_WEIRD], px, 0, pz);
-    np[2] = (float)tg_pav(w);
+    double wd = tg_sampleDP(&P->climate[TG_NP_WEIRD], px, 0, pz);
+    float w = (float)wd;
+    np[2] = (float)tg_pav(wd);
     np[3] = w;
 }
 /* one noise column of 48+1 density values (cellHeight = 8) */
@@ -438,6 +455,39 @@ __device__ static void tg_columnDFJ(const TerrainNoiseG *P, int cellX, int cellZ
     }
 }
 
+/* (24/10) the five interpolated inputs of final_density at a corner (as the CPU
+ * sampleCornerInputs): M = 0.64*slide(..), noodle toggle / thickness / ridges.
+ * A block is solid iff M > 0 and noodle > 0 (exact per-block test, see terrainnoise.c). */
+__device__ static void tg_channelsAt(const TerrainNoiseG *P, int x, int y, int z,
+                                     double depth, double factor, double jagged, int caves, double *o) {
+    double sloped = tg_slopedCheese(P, x, y, z, depth, factor, jagged);
+    if (!caves) { o[0] = 0.64f * tg_slideOW(sloped, y); o[1] = -1.0f; o[2] = 0.0f; o[3] = 0.0f; o[4] = 0.0f; return; }
+    double rough = tg_spaghettiRoughness(P, x, y, z);
+    double entr  = tg_entrances(P, x, y, z, rough);
+    double a = fmin(sloped, 5.0f*entr);
+    double bb = tg_rangeChoice(sloped, -1000000.0f, 1.5625f, a, tg_underground(P,x,y,z,rough,entr,sloped));
+    o[0] = 0.64f * tg_slideOW(bb, y);
+    int inr = (y >= -60 && y < 321);
+    double k = 2.6666666666666665f;
+    o[1] = inr ? tg_sampleDP(&P->noises[TGO_NOODLE], x,y,z) : -1.0f;
+    o[2] = inr ? (-0.07500000000000001f + -0.025f * tg_sampleDP(&P->noises[TGO_NOODLE_THICKNESS], x,y,z)) : 0.0f;
+    o[3] = inr ? tg_sampleDP(&P->noises[TGO_NOODLE_RIDGE_A], x*k,y*k,z*k) : 0.0f;
+    o[4] = inr ? tg_sampleDP(&P->noises[TGO_NOODLE_RIDGE_B], x*k,y*k,z*k) : 0.0f;
+}
+__device__ static int tg_solid5(const double *b00, const double *b10, const double *b01, const double *b11,
+                                const double *t00, const double *t10, const double *t01, const double *t11,
+                                double tx, double ty, double tz) {
+    double v[5];
+    for (int n = 0; n < 5; n++) {
+        double a00 = tg_lerp(ty, b00[n], t00[n]), a10 = tg_lerp(ty, b10[n], t10[n]);
+        double a01 = tg_lerp(ty, b01[n], t01[n]), a11 = tg_lerp(ty, b11[n], t11[n]);
+        v[n] = tg_lerp(tz, tg_lerp(tx, a00, a10), tg_lerp(tx, a01, a11));
+        if (n == 0 && v[0] <= 0.0f) return 0;
+    }
+    if (v[1] >= -1000000.0f && v[1] < 0.0f) return 1;
+    return v[2] + 1.5f * fmax(fabs(v[3]), fabs(v[4])) > 0.0f;
+}
+
 /* one density value at (x,y,z) from the precomputed per-cell shaper.
  * caves=1 -> full exact density; caves=0 -> terrain shape only (slopedCheese with
  * the same slide+post-process, no entrances/underground/noodle carving). */
@@ -460,31 +510,33 @@ __device__ static double tg_densityAt(const TerrainNoiseG *P, int x, int y, int 
 __device__ static int tg_surfaceDescend(const TerrainNoiseG *P, int X, int Z, int cx, int cz,
         double dep00,double fac00,double jag00, double dep01,double fac01,double jag01,
         double dep10,double fac10,double jag10, double dep11,double fac11,double jag11, int caves) {
+    /* (24/10) per-block exact test on the 5 interpolated channels (was: the
+     * interpolated min(squeeze, noodle) — 1-4 blocks off in ~7 % of the columns) */
     const double pXZ[4] = {0.0f,0.25f,0.5f,0.75f};
     const double pY[8]  = {0.0f,0.125f,0.25f,0.375f,0.5f,0.625f,0.75f,0.875f};
-    double pcX = pXZ[X & 3], pcZ = pXZ[Z & 3];
+    double tx = pXZ[X & 3], tz = pXZ[Z & 3];
     int x0c = cx*4, x1c = (cx+1)*4, z0c = cz*4, z1c = (cz+1)*4;
-    /* top boundary: buf index i=48  ->  world y = 48*8 - 64 = 320 (build limit). */
     int yTop = 48*8 - 64;
-    double t00 = tg_densityAt(P, x0c, yTop, z0c, dep00,fac00,jag00, caves);
-    double t01 = tg_densityAt(P, x0c, yTop, z1c, dep01,fac01,jag01, caves);
-    double t10 = tg_densityAt(P, x1c, yTop, z0c, dep10,fac10,jag10, caves);
-    double t11 = tg_densityAt(P, x1c, yTop, z1c, dep11,fac11,jag11, caves);
+    double t00[5], t01[5], t10[5], t11[5], b00[5], b01[5], b10[5], b11[5];
+    tg_channelsAt(P, x0c, yTop, z0c, dep00,fac00,jag00, caves, t00);
+    tg_channelsAt(P, x0c, yTop, z1c, dep01,fac01,jag01, caves, t01);
+    tg_channelsAt(P, x1c, yTop, z0c, dep10,fac10,jag10, caves, t10);
+    tg_channelsAt(P, x1c, yTop, z1c, dep11,fac11,jag11, caves, t11);
     for (int cellY = 47; cellY >= 0; cellY--) {
         int yBot = cellY*8 - 64;
-        double b00 = tg_densityAt(P, x0c, yBot, z0c, dep00,fac00,jag00, caves);
-        double b01 = tg_densityAt(P, x0c, yBot, z1c, dep01,fac01,jag01, caves);
-        double b10 = tg_densityAt(P, x1c, yBot, z0c, dep10,fac10,jag10, caves);
-        double b11 = tg_densityAt(P, x1c, yBot, z1c, dep11,fac11,jag11, caves);
-        for (int relY = 7; relY >= 0; relY--) {
-            /* n000=botC00 n100=botC10 n010=topC00 n110=topC10
-               n001=botC01 n101=botC11 n011=topC01 n111=topC11 */
-            double noise = tg_lerp3(pcX, pY[relY], pcZ,
-                b00, b10, t00, t10,   b01, b11, t01, t11);
-            int y = cellY*8 + relY;
-            if (noise > 0.0f) return y + 1;
+        tg_channelsAt(P, x0c, yBot, z0c, dep00,fac00,jag00, caves, b00);
+        tg_channelsAt(P, x0c, yBot, z1c, dep01,fac01,jag01, caves, b01);
+        tg_channelsAt(P, x1c, yBot, z0c, dep10,fac10,jag10, caves, b10);
+        tg_channelsAt(P, x1c, yBot, z1c, dep11,fac11,jag11, caves, b11);
+        double mx = fmax(fmax(fmax(b00[0], b01[0]), fmax(b10[0], b11[0])),
+                         fmax(fmax(t00[0], t01[0]), fmax(t10[0], t11[0])));
+        if (mx > -1e-6f) {
+            for (int relY = 7; relY >= 0; relY--) {
+                if (tg_solid5(b00, b10, b01, b11, t00, t10, t01, t11, tx, pY[relY], tz))
+                    return cellY*8 + relY + 1;
+            }
         }
-        t00=b00; t01=b01; t10=b10; t11=b11;     /* this bottom is next cell's top */
+        for (int n = 0; n < 5; n++) { t00[n]=b00[n]; t01[n]=b01[n]; t10[n]=b10[n]; t11[n]=b11[n]; }
     }
     return -64;                                  /* nothing solid (sentinel) */
 }
@@ -529,6 +581,7 @@ static TerrainNoise   g_tn;
 
 static int tgpu_upload(int mc, uint64_t seed) {
     if (g_ok && g_seed == seed && g_mc == mc) return 1;
+    { int ms = mc >= MC_26_2; cudaMemcpyToSymbol(tg_mulScales, &ms, sizeof ms); tg_mulScales_h = ms; }   /* (24/10) */
     /* setupTerrainNoise is seed-INDEPENDENT (mc only) and sets up internal state;
      * calling it again on an already-initialised g_tn corrupted it -> access
      * violation on the 2nd seed of a search (the map never hit this: one seed).
@@ -902,7 +955,7 @@ int main(){
     int *cpuY=(int*)malloc(N*sizeof(int));
     for(int i=0;i<N;i++){
         initTerrainNoise(&tn, seed0+i, DIM_OVERWORLD);
-        int cx=X>>2,cz=Z>>2; double a[49],b[49],c[49],d[49];
+        int cx=X>>2,cz=Z>>2; double a[245],b[245],c[245],d[245];   /* (24/10) 5 channels */
         sampleNoiseColumnEx(&tn,cx,cz,a,0); sampleNoiseColumnEx(&tn,cx,cz+1,b,0);
         sampleNoiseColumnEx(&tn,cx+1,cz,c,0); sampleNoiseColumnEx(&tn,cx+1,cz+1,d,0);
         int blk[384]; cpuY[i]=generateColumn(X,Z,blk,a,b,c,d,1)-64;   /* no-caves ref */
@@ -986,7 +1039,7 @@ int main(void) {
     TerrainNoise tn; setupTerrainNoise(&tn,mc,0); initTerrainNoise(&tn,seed,DIM_OVERWORLD);
     int maxdiff = 0, maxnear = 0, maxdiffNC = 0;
     for (int i=0;i<N;i++){ int x=C[i][0],z=C[i][1],cx=x>>2,cz=z>>2;
-        double a[49],b[49],c[49],d[49];
+        double a[245],b[245],c[245],d[245];   /* (24/10) 5 channels */
         sampleNoiseColumn(&tn,cx,cz,a); sampleNoiseColumn(&tn,cx,cz+1,b);
         sampleNoiseColumn(&tn,cx+1,cz,c); sampleNoiseColumn(&tn,cx+1,cz+1,d);
         int blk[384]; int cpu = generateColumn(x,z,blk,a,b,c,d,1)-64;
@@ -994,7 +1047,7 @@ int main(void) {
         if (ad>maxdiff) maxdiff=ad;
         if (i<6 && ad>maxnear) maxnear=ad;   /* first 6 = within ~100k blocks */
         /* NO-CAVES reference */
-        double a0[49],b0[49],c0[49],d0[49];
+        double a0[245],b0[245],c0[245],d0[245];
         sampleNoiseColumnEx(&tn,cx,cz,a0,0); sampleNoiseColumnEx(&tn,cx,cz+1,b0,0);
         sampleNoiseColumnEx(&tn,cx+1,cz,c0,0); sampleNoiseColumnEx(&tn,cx+1,cz+1,d0,0);
         int cpuNC = generateColumn(x,z,blk,a0,b0,c0,d0,1)-64;

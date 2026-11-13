@@ -17,6 +17,7 @@ _STRONGHOLD_PARAMS = {
     "min_eyes":    {"type": "int",  "label": "🔎 Min eyes (0 = off)", "default": 0, "min": 0, "max": 12},
     "exact_eyes":  {"type": "bool", "label": "     Exact count (not ≥)", "default": False},
     "eye_gpu":     {"type": "bool", "label": "     GPU CUDA (fast eye scan)", "default": True},
+    "eye_full":    {"type": "bool", "label": "     Complete search (1.18+, slower)", "default": False},
     # ── Max Y ──
     "maxy_enabled": {"type": "bool", "label": "📏 Max Y filter", "default": False},
     "min_max_y":    {"type": "int",  "label": "     Stronghold top Y ≥", "default": 60, "min": -64, "max": 320},
@@ -65,6 +66,14 @@ CONDITION_TYPES = [
     {"key": "trial_chambers",   "name": "Trial chambers",    "category": "Structures", "icon": "⚔", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {"key": "ocean_ruin",       "name": "Ocean ruin",        "category": "Structures", "icon": "🌊", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {"key": "trail_ruins",      "name": "Trail ruins",       "category": "Structures", "icon": "🏺", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
+    # (30/10) desert wells, every version: the chunk's well attempt (1 in 1000), then
+    # where the game tests it — the biome (1.16 / 1.17: the chunk's; 1.18+: at the
+    # spot's surface), sand on top, no hole under the base (exact terrain).
+    {"key": "desert_well",      "name": "Desert well",       "category": "Structures", "icon": "🪣",
+     "desc": "A desert well that really generates: SSA tests the biome where the game does "
+             "and the terrain (sand on top, no hole under its base). GPU: 1.16 / 1.17 only "
+             "(from 1.18 the well depends on the whole seed).",
+     "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (1.16 / 1.17)", "default": False}}},
     # TEMPORARILY DISABLED (01/10, Édouard): its generation (salt, rules) changes
     # with almost every small Minecraft version — right once, wrong now. Hidden
     # from the condition menu and the map; the code stays (a loaded session
@@ -131,6 +140,19 @@ CONDITION_TYPES = [
                                     "not_abandoned": "Not abandoned"},
                          "segmented": True,
                          "default": "any"},
+            # (05/11) its houses and smiths (village_filter: the exact layout, terrain
+            # included → the whole seed; checked on the other conditions' candidates)
+            "houses": {"type": "range", "label": "Houses", "default": None, "int": True,
+                       "tip": "Number of houses of the village (empty = no bound). Farms, "
+                              "animal pens, hay piles and meeting points are not houses.\n"
+                              "Exact layout with the real terrain: depends on the whole seed "
+                              "(checked after the other conditions, ~10 ms per village)."},
+            "smiths": {"type": "range", "label": "Forges", "default": None, "int": True,
+                       "tip": "Number of forges with a loot chest (empty = no bound): the "
+                              "smith's house that has one in this village type — weaponsmith, "
+                              "toolsmith or armorer (plains: weaponsmith; desert: weaponsmith "
+                              "and toolsmith; savanna, snowy, taiga: some of their smith "
+                              "houses)."},
             "use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False},
         },
     },
@@ -189,6 +211,24 @@ CONDITION_TYPES = [
                                 "without_ship": "Without"},
                      "segmented": True, "default": "any"},
          "use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False},
+     }},
+    {"key": "elytra_spawn", "name": "Elytra on End spawn", "category": "End", "icon": "🪽",
+     "no_area": True,
+     "desc": "An End ship elytra that the game itself teleports to the End spawn platform "
+             "(1.18+, checked in 26.3). A second city's piece (mostly its ship) carves the "
+             "bow of the first ship, then a return gateway generates at the elytra frame's "
+             "level: its shape removes the frame's wall, the frame drops the elytra into the "
+             "portal (or next to it) and it lands on the platform at 100 48 0. Load the city "
+             "(come within a few chunks), then go back to the spawn platform.",
+     "params": {
+         "radius": {"type": "int", "label": "Elytra within (blocks of 0, 0)", "default": 10000,
+                    "min": 1000, "max": 30000,
+                    "tip": "Each 48-bit family scans every End city up to this distance: "
+                           "10 000 is as fast per result as farther."},
+         "ortho": {"type": "bool", "label": "Also 1 block away (≈ 1 in 6)", "default": True,
+                   "tip": "« same »: the portal replaces the frame, the elytra spawns inside it "
+                          "(always teleported). « 1 block away »: the elytra lands next to the "
+                          "portal and must slide in (≈ 18 % in our simulation)."},
      }},
     {"key": "end_gateway", "name": "End gateway", "category": "End", "icon": "🌌",
      "desc": "Scattered return gateways of the outer islands (End coordinates). Not the 20 "
@@ -480,6 +520,13 @@ CONDITION_TYPES = [
              "mansion, its floor or its cobblestone foundations. Each result is then checked "
              "with the real Minecraft 1.16.1 (about 1 % are such spawns).",
      "params": {}},
+    {"key": "elytra_spawn_preset", "name": "Elytra on End spawn (preset)", "category": "End",
+     "icon": "🪽", "preset": True,
+     "desc": "A ready session: the « Elytra on End spawn » condition in 48-bit family mode "
+             "(1.18+, checked in 26.3). Results show « elytra in the portal » or « 1 block "
+             "away » with the elytra's coordinates. About one result per 15-30 min on a "
+             "24-thread CPU.",
+     "params": {}},
     {"key": "spawn_feature116", "name": "Fallback spawn feature (1.16)", "category": "World",
      "icon": "🕳", "no_area": True,
      "desc": "1.16 fallback spawn: the joining player stays at (8.5, 65, 8.5). True when a "
@@ -565,6 +612,7 @@ TYPE_COLORS = {
     "end_city":          "#d4a0ff",
     "ruined_portal_nether": "#b84bd6",
     "end_gateway":       "#7fe0d0",
+    "elytra_spawn":      "#e8c86a",
     "nether_biomes":     "#d0503a",
     "end_biomes":        "#b8a8e8",
     "spawn":             "#5dd4d4",
@@ -724,7 +772,7 @@ DISABLED_TYPES = {t["key"]: t["disabled"] for t in CONDITION_TYPES if t.get("dis
 # 0 = overworld (default), -1 = Nether, 1 = End. A Nether / End condition reads
 # and writes coordinates of its own dimension (cubiomes-viewer convention).
 NETHER_TYPES = {"fortress", "bastion", "ruined_portal_nether", "nether_biomes"}
-END_TYPES = {"end_city", "end_gateway", "end_biomes"}
+END_TYPES = {"end_city", "end_gateway", "end_biomes", "elytra_spawn"}
 DIM_NAMES = {0: "Overworld", -1: "Nether", 1: "End"}
 
 

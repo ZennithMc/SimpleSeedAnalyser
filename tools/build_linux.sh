@@ -14,6 +14,9 @@ ROOT=$PWD
 VENV=${VENV:-$ROOT/.venv-build-linux}
 
 command -v uv >/dev/null || python3 -m pip install --user uv
+# a python-build-standalone Python (uv-managed), never the build machine's own:
+# a system Python would tie the release to this machine's glibc
+export UV_PYTHON_PREFERENCE=only-managed
 PY=$(uv python find 3.11 2>/dev/null || (uv python install 3.11 >/dev/null && uv python find 3.11))
 [ -d "$VENV" ] || uv venv -p "$PY" "$VENV"
 VIRTUAL_ENV=$VENV uv pip install -q pyinstaller pyinstaller-hooks-contrib PySide6-Essentials numpy pillow zstandard
@@ -37,12 +40,14 @@ PY
 fi
 
 # native libraries, rebuilt from the sources of this tree
-rm -f libcubiomes.so libgaider_layouts.so libterrain.so terrain.so
+rm -f libcubiomes.so libgaider_layouts.so libterrain.so terrain.so libtreecrack.so liblootvm.so
 "$VENV/bin/python" - <<'PY'
-import cubiomes_wrap, gaider_layouts, terrain
+import cubiomes_wrap, gaider_layouts, terrain, tree_crack, loot_native
 cubiomes_wrap._compile_cubiomes()
 assert gaider_layouts._compile(), gaider_layouts._LIB_LOAD_ERROR
 assert terrain._compile()
+assert tree_crack._compile(), tree_crack._LIB_ERR          # Crack tab (CPU)
+assert loot_native._compile(), loot_native._LIB_ERR        # loot finder in C
 PY
 
 # GPU (CUDA) libraries: a system nvcc, else the CUDA 13.0 compiler from PyPI
@@ -61,7 +66,7 @@ if [ "${SKIP_CUDA:-0}" != 1 ]; then
 fi
 
 "$VENV/bin/python" -m PyInstaller --noconfirm --clean SimpleSeedAnalyser.spec
-for f in README.md LICENSE THIRD_PARTY_LICENSES.txt; do
+for f in README.md Updates.txt LICENSE THIRD_PARTY_LICENSES.txt; do
     [ -f "$f" ] && cp "$f" dist/SimpleSeedAnalyser/
 done
 tar -C dist -czf dist/SimpleSeedAnalyser-linux-x86_64.tar.gz SimpleSeedAnalyser

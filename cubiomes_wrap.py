@@ -31,7 +31,7 @@ MC_VERSIONS: Dict[str, int] = {
     "Java 1.18":       22,  # MC_1_18_2
     "Java 1.19":       24,  # MC_1_19_4
     "Java 1.20":       25,  # MC_1_20_6
-    "Java 1.21":       28,  # MC_1_21_WD (1.21.4 / Winter Drop — Pale Garden)
+    "Java 1.21":       28,  # MC_1_21_WD (1.21.4 → 1.21.8 / Winter Drop — Pale Garden)
     "Java 26.3":       35,  # MC_26_3 (Dappled Forest — also incl. Sulfur Caves from 26.2)
 }
 # Backward-compat aliases: old sessions / code that hardcoded these still resolve,
@@ -44,13 +44,15 @@ MC_VERSIONS["Java 1.16.1"]   = 19   # MC_1_16_1
 MC_VERSIONS["Java 1.19.2"]   = 23   # MC_1_19_2
 MC_VERSIONS["Java 1.21.1"]   = 26   # MC_1_21_1 (trial chambers)
 MC_VERSIONS["Java 1.21.3"]   = 27   # MC_1_21_3
+MC_VERSIONS["Java 1.21.9"]   = 32   # MC_1_21_11: 1.21.9 → 1.21.11 (29/10: strongholds also in
+                                    # cherry groves from 1.21.9 — 25w31a, MC-278965)
 MC_VERSIONS["Java 26.1"]     = 33   # MC_26_1
 MC_VERSIONS["Java 26.2"]     = 34   # MC_26_2
 
 # Ordered list for the UI version dropdown.
 DROPDOWN_VERSIONS = [
     "Java 1.16.1", "Java 1.16", "Java 1.17", "Java 1.18", "Java 1.19.2", "Java 1.19", "Java 1.20",
-    "Java 1.21.1", "Java 1.21.3", "Java 1.21", "Java 26.1", "Java 26.2", "Java 26.3",
+    "Java 1.21.1", "Java 1.21.3", "Java 1.21", "Java 1.21.9", "Java 26.1", "Java 26.2", "Java 26.3",
 ]
 
 # Flag values for setupGenerator (generator.h)
@@ -348,8 +350,11 @@ STRUCTURE_TYPES: Dict[str, int] = {
 }
 
 # (18/10) Nether / End structures shown on the map of their dimension
+# (29/10) on the map only (not a search condition here): the mineshafts
+MAP_EXTRA_TYPES: Dict[str, int] = {"mineshaft": Mineshaft,
+                                   "desert_well": Desert_Well}     # (30/10) desert_well.py
 DIM_STRUCTURE_TYPES: Dict[int, Dict[str, int]] = {
-    0:  STRUCTURE_TYPES,
+    0:  dict(STRUCTURE_TYPES, **MAP_EXTRA_TYPES),
     -1: {"fortress": Fortress, "bastion": Bastion, "ruined_portal_nether": Ruined_Portal_N},
     1:  {"end_city": End_City, "end_gateway": End_Gateway},
 }
@@ -452,6 +457,7 @@ def _compile_cubiomes() -> str:
         "session_engine.c",
         "terrain116.c",         # exact 1.16 terrain + population (dungeons / lava lakes)
         "mineshaft116.c",       # 1.16 mineshafts (for the dungeons)
+        "jigsaw_engine.c",      # (31/10) JigsawPlacement (jigsaw.py generate in C)
         "gaider_fast.c",
         "drawing_bridge.c",
         "draw_engine.c",        # Draw search engine v2 (Qt Draw page)
@@ -934,7 +940,7 @@ class CubiomesLib:
             y = 63
 
         if scale not in (1, 4, 16, 64, 256):
-            raise ValueError(f"scale doit être dans (1,4,16,64,256), reçu {scale}")
+            raise ValueError(f"scale must be one of (1, 4, 16, 64, 256), got {scale}")
         y_sample = y if scale == 1 else y // 4
         r = Range(scale, gx, gz, sx, sz, y_sample, 1)
         with self._lock:
@@ -966,13 +972,21 @@ class CubiomesLib:
     # ── Spawn ────────────────────────────────────────────────────────────────
     def get_spawn(self) -> Tuple[int, int]:
         """
-        Coordonnées du spawn.
-        Utilise estimateSpawn en priorité — résultat cohérent avec Cubiomes
-        Viewer, et beaucoup plus rapide (~1ms vs ~200ms pour getSpawn).
-        getSpawn fait une recherche complète de hauteur de terrain ce qui peut
-        donner des résultats légèrement différents de Cubiomes Viewer sur
-        certaines seeds (surtout en 1.18+ avec les grottes profondes).
+        Coordonnées du spawn. (12/11) 1.18+ : celles du jeu (spawn_exact :
+        la recherche climatique puis la première colonne solide de la spirale de
+        chunks, sur le terrain de SSA ; vérifié sur des serveurs 1.21.4 / 1.21.11).
+        Avant 1.18 : estimateSpawn (comme Cubiomes Viewer, ~1 ms).
         """
+        # (12/11) 1.18+: the game's own spawn (spawn_exact: the search, then the first
+        # solid column of the spiral of chunks, on SSA's terrain), not the estimate
+        if self._mc >= 22 and not self._dim:
+            try:
+                import spawn_exact
+                sp = spawn_exact.spawn(self._seed, self._mc)
+                if sp is not None:
+                    return (sp[0], sp[2])
+            except Exception:
+                pass
         with self._lock:
             try:
                 p = self._lib.estimateSpawn(self._gen, None)
@@ -1079,6 +1093,25 @@ class CubiomesLib:
         mc   = self._mc
         out: List[Tuple[int, int]] = []
         pos = Pos()
+        # (29/10) one C call (same order, same cap): no Python loop holding the GIL
+        f = getattr(self._lib, "ssa_find_structures_box", None)
+        if f is not None and max_count > 0:
+            if not getattr(self, "_sfb_typed", False):
+                f.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                              ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int32), ctypes.c_int]
+                f.restype = ctypes.c_int
+                self._sfb_typed = True
+            cap = max(1, min(int(max_count), 1 << 20))
+            buf = (ctypes.c_int32 * (2 * cap))()
+            with self._lock:
+                k = f(self._gen, struct_type, mc, ctypes.c_uint64(seed), region_blocks,
+                      x1, z1, x2, z2, 1 if verify_biome else 0, extra_flags, buf, cap)
+                if k >= 0:
+                    out = [(buf[2 * i], buf[2 * i + 1]) for i in range(k)]
+                    if verify_biome and struct_type == End_City and out:
+                        out = self._end_city_terrain(out)
+                    return out
         with self._lock:
             for rx in rx_order:
                 for rz in rz_order:
@@ -1776,7 +1809,6 @@ class NoiseMapLib:
     """
     def __init__(self, seed: int, nptype: int = NP_TEMPERATURE,
                  large: bool = False, nmax: int = -1):
-        import numpy as np
         # Vérifie/force la présence de noise_bridge dans la lib principale
         _ensure_noise_bridge()
 

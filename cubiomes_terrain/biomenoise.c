@@ -1092,24 +1092,36 @@ float getSpline(const Spline *sp, const float *vals)
     for (i = 0; i < sp->len; i++)
         if (sp->loc[i] >= f)
             break;
-    if (i == 0 || i == sp->len)
+    /* (24/10) as CubicSpline.Multipoint.sample (26.2 jar): interval = the first
+     * location > input, minus one; ALL in float (lerp in double here gave a 1-ulp
+     * different offset/factor in ~half the columns -> density off by 1e-7) */
+    for (i = 0; i < sp->len; i++)
+        if (f < sp->loc[i])
+            break;
+    int start = i - 1;
+    if (start < 0 || start == sp->len - 1)
     {
-        if (i) i--;
-        float v = getSpline(sp->val[i], vals);
-        return v + sp->der[i] * (f - sp->loc[i]);
+        int j = start < 0 ? 0 : sp->len - 1;
+        float v = getSpline(sp->val[j], vals);
+        float der = sp->der[j];
+        if (der == 0.0F) return v;
+        return v + der * (f - sp->loc[j]);
     }
-    const Spline *sp1 = sp->val[i-1];
-    const Spline *sp2 = sp->val[i];
-    float g = sp->loc[i-1];
-    float h = sp->loc[i];
+    const Spline *sp1 = sp->val[start];
+    const Spline *sp2 = sp->val[start + 1];
+    float g = sp->loc[start];
+    float h = sp->loc[start + 1];
     float k = (f - g) / (h - g);
-    float l = sp->der[i-1];
-    float m = sp->der[i];
+    float l = sp->der[start];
+    float m = sp->der[start + 1];
     float n = getSpline(sp1, vals);
     float o = getSpline(sp2, vals);
     float p = l * (h - g) - (o - n);
     float q = -m * (h - g) + (o - n);
-    float r = lerp(k, n, o) + k * (1.0F - k) * lerp(k, p, q);
+    float l1 = n + k * (o - n);
+    float l2 = p + k * (q - p);
+    float kk = k * (1.0F - k);
+    float r = l1 + kk * l2;
     return r;
 }
 
@@ -1204,7 +1216,11 @@ void sampleNoiseParameters(BiomeNoise *bn, int x, int z, float np_param[4]) {
 
     np_param[0] = c;
     np_param[1] = e;
-    np_param[2] = peaksAndValleys(w);
+    /* (24/10) ridges_folded is computed in double by the router, then cast */
+    {
+        double wd = sampleDoublePerlin(&bn->climate[NP_WEIRDNESS], px, 0, pz);
+        np_param[2] = (float)(-3.0 * (-0.3333333333333333 + fabs(-0.6666666666666666 + fabs(wd))));
+    }
     np_param[3] = w;
 }
 

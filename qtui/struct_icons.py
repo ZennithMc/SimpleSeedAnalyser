@@ -56,7 +56,7 @@ SPEC = {
     "end_city_ship":    ("End city with a ship", "#c79be0"),
     "mineshaft":        ("Mineshaft",         "#8b6a3c"),
     "desert_well":      ("Desert well",       "#d6bd78"),
-    "dungeon":          ("Dungeon (1.16)",    "#5f6b75"),
+    "dungeon":          ("Dungeon",           "#5f6b75"),
     "dungeon_ok":       ("Dungeon (in Minecraft)", "#3f8f62"),
     "lava_lake":        ("Lava lake (1.16)",  "#d9531e"),
     "lava_lake_surface": ("Surface lava lake", "#e88a3a"),

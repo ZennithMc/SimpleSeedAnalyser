@@ -18,7 +18,7 @@ import uuid
 
 from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from .widgets import user_path, remember_path
+from .widgets import user_path
 from PySide6.QtWidgets import (QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
                                QPushButton, QSplitter, QStyle, QStyledItemDelegate, QTreeWidget,
@@ -187,9 +187,10 @@ def _when(iso):
 
 
 class _CardDelegate(QStyledItemDelegate):
-    """One session = one card: name + date, coloured chips (version,
-    conditions, results, paused, open), condition-type icons + description."""
-    H = 78
+    """(22/10) One session = one quiet row: the name and the date on top, a
+    single muted line under it (version · conditions · results · paused). No
+    coloured chips, no icons: the details are on the right."""
+    H = 62
 
     def __init__(self, dlg):
         super().__init__(dlg)
@@ -198,78 +199,62 @@ class _CardDelegate(QStyledItemDelegate):
     def sizeHint(self, opt, idx):
         return QSize(opt.rect.width(), self.H)
 
-    def _chip(self, p, x, y, text, fg, bg, font):
-        p.setFont(font)
-        w = p.fontMetrics().horizontalAdvance(text) + 14
-        r = QRectF(x, y, w, 18)
-        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(bg))
-        p.drawRoundedRect(r, 9, 9)
-        p.setPen(QColor(fg))
-        p.drawText(r, Qt.AlignmentFlag.AlignCenter, text)
-        return x + w + 6
-
     def paint(self, p, opt, idx):
-        from .session_model import type_icon
         m = idx.data(Qt.ItemDataRole.UserRole)
         if not m:
             return
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(opt.rect).adjusted(2, 3, -4, -3)
+        r = QRectF(opt.rect).adjusted(1, 2, -3, -2)
         sel = bool(opt.state & QStyle.StateFlag.State_Selected)
         hov = bool(opt.state & QStyle.StateFlag.State_MouseOver)
+        # (22/10) each session in its own quiet card (a thin border), so the
+        # entries stand apart; selected = accent tint + accent border
         if sel:
-            bg, line, lw = _soft(theme.ACCENT, 0.16), QColor(theme.ACCENT), 1.6
+            bg, line = _soft(theme.ACCENT, 0.14), QColor(theme.ACCENT)
         else:
             bg = QColor(theme.BG3 if hov else theme.BG2)
-            line, lw = QColor(theme.LINE2), 1.0
-        p.setPen(QPen(line, lw)); p.setBrush(bg)
-        p.drawRoundedRect(r, 8, 8)
+            line = QColor(theme.LINE2 if hov else theme.LINE)
+        p.setPen(QPen(line, 1.0)); p.setBrush(bg)
+        p.drawRoundedRect(r, 7, 7)
         if sel:                                          # accent bar on the left
             p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(theme.ACCENT))
-            p.drawRoundedRect(QRectF(r.left() + 1, r.top() + 10, 3, r.height() - 20), 1.5, 1.5)
+            p.drawRoundedRect(QRectF(r.left(), r.top() + 12, 3, r.height() - 24), 1.5, 1.5)
         x0 = r.left() + 14
         # line 1: name ……… date
-        fdate = theme.ui_font(8.5)
-        p.setFont(fdate)
+        p.setFont(theme.ui_font(8.5))
         when = _when(m["modified"])
         dw = p.fontMetrics().horizontalAdvance(when)
         p.setPen(QColor(theme.TEXT3))
-        p.drawText(QRectF(r.right() - dw - 12, r.top() + 8, dw, 20),
+        p.drawText(QRectF(r.right() - dw - 12, r.top() + 9, dw, 18),
                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, when)
-        fname = theme.ui_font(10.5, QFont.Weight.DemiBold)
-        p.setFont(fname); p.setPen(QColor(theme.TEXT))
+        p.setFont(theme.ui_font(10, QFont.Weight.DemiBold)); p.setPen(QColor(theme.TEXT))
         name = p.fontMetrics().elidedText(m["name"], Qt.TextElideMode.ElideRight,
-                                          int(r.width() - dw - 40))
-        p.drawText(QRectF(x0, r.top() + 7, r.width() - dw - 30, 22),
+                                          int(r.width() - dw - 44))
+        p.drawText(QRectF(x0, r.top() + 8, r.width() - dw - 34, 20),
                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
-        # line 2: chips
-        fchip = theme.ui_font(8, QFont.Weight.DemiBold)
-        y = r.top() + 32
-        x = x0
-        x = self._chip(p, x, y, m["mc"].replace("Java ", ""), theme.TEXT2, theme.BG4, fchip)
-        x = self._chip(p, x, y, _plural(m["n_cond"], "condition"), theme.TEXT2, theme.BG4, fchip)
+        # line 2: one muted line
+        p.setFont(theme.ui_font(8.5))
+        parts = [m["mc"].replace("Java ", "")]
+        parts.append(_plural(m["n_cond"], "condition"))
         if m["n_res"]:
-            x = self._chip(p, x, y, _plural(m["n_res"], "result"), theme.OK,
-                           _soft(theme.OK, 0.16), fchip)
-        if m["paused"]:
-            x = self._chip(p, x, y, "paused", theme.WARN, _soft(theme.WARN, 0.16), fchip)
-        if self.dlg.is_open_entry(m["path"]):
-            x = self._chip(p, x, y, "open in editor", theme.ACCENT, _soft(theme.ACCENT, 0.18), fchip)
-        # line 3: type icons + description
-        y3 = r.top() + 56
+            parts.append(_plural(m["n_res"], "result"))
+        txt = "  ·  ".join(parts)
         x = x0
-        for t in m["types"][:7]:
-            ic = type_icon(t, 14)
-            if ic is not None:
-                ic.paint(p, int(x), int(y3), 14, 14)
-                x += 18
-        if m["description"]:
-            p.setFont(theme.ui_font(8.5)); p.setPen(QColor(theme.TEXT3))
-            d = m["description"].replace("\n", "  ·  ")
-            d = p.fontMetrics().elidedText(d, Qt.TextElideMode.ElideRight, int(r.right() - x - 20))
-            p.drawText(QRectF(x + 4, y3 - 2, r.right() - x - 16, 18),
-                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, d)
+        p.setPen(QColor(theme.TEXT3))
+        fm = p.fontMetrics()
+        p.drawText(QRectF(x, r.top() + 30, r.width() - 40, 18),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, txt)
+        x += fm.horizontalAdvance(txt)
+        for flag, col in ((self.dlg.is_open_entry(m["path"]) and "open", theme.ACCENT),):
+            if flag:
+                x += 10
+                p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(col))
+                p.drawEllipse(QRectF(x, r.top() + 37, 5, 5))
+                p.setPen(QColor(col))
+                p.drawText(QRectF(x + 9, r.top() + 30, 80, 18),
+                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, flag)
+                x += 9 + fm.horizontalAdvance(flag)
         p.restore()
 
 
@@ -299,20 +284,26 @@ class LibraryDialog(QDialog):
             QPlainTextEdit#LibDesc {{ background: {theme.BG2}; border: 1px solid {theme.LINE2};
                                       border-radius: 6px; padding: 6px; }}
             QPlainTextEdit#LibDesc:focus {{ border-color: {theme.ACCENT}; }}
-            QFrame#LibCard {{ background: {theme.BG0}; border: 1px solid {theme.LINE2};
-                              border-radius: 8px; }}
-            QLabel#LibStat {{ border-radius: 9px; padding: 2px 10px; font-weight: 600; }}
+            QFrame#LibCard {{ background: {theme.BG1}; border: 1px solid {theme.LINE};
+                              border-radius: 10px; }}
             QLabel#LibCount {{ color: {theme.TEXT3}; }}
+            QLabel#LibMeta {{ color: {theme.TEXT3}; }}
+            QTreeWidget#LibTree {{ background: transparent; border: 0; }}
         """)
         root = QVBoxLayout(self); root.setContentsMargins(16, 16, 16, 12); root.setSpacing(10)
 
         split = QSplitter(Qt.Orientation.Horizontal); split.setHandleWidth(14)
         # ── left: search + cards
         left = QWidget(); lv = QVBoxLayout(left); lv.setContentsMargins(0, 0, 0, 0); lv.setSpacing(8)
-        head = QHBoxLayout()
+        head = QHBoxLayout(); head.setSpacing(6)
         head.addWidget(section_title("Saved sessions"))
         self.count = QLabel(""); self.count.setObjectName("LibCount")
         head.addStretch(1); head.addWidget(self.count)
+        from PySide6.QtWidgets import QToolButton
+        fold = QToolButton(); icons.bind(fold, "folder", 15); fold.setAutoRaise(True)
+        fold.setToolTip(f"Open the library folder\n{lib_dir()}\n(deleted sessions go to _trash)")
+        fold.clicked.connect(self._open_folder)
+        head.addWidget(fold)
         lv.addLayout(head)
         self.search = QLineEdit(); self.search.setPlaceholderText("Search by name or description…")
         self.search.setClearButtonEnabled(True)
@@ -322,6 +313,8 @@ class LibraryDialog(QDialog):
         self.list.setItemDelegate(_CardDelegate(self))
         self.list.setMouseTracking(True)
         self.list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setSpacing(2)
         self.list.currentItemChanged.connect(lambda *_: self._show())
         self.list.itemDoubleClicked.connect(lambda *_: self._open())
         lv.addWidget(self.list, 1)
@@ -332,7 +325,7 @@ class LibraryDialog(QDialog):
         self.b_new.setToolTip("Add the session being edited to the library (new entry)")
         self.b_new.clicked.connect(self._save_current_new)
         row.addWidget(self.b_new, 1)
-        b_imp = QPushButton("Import files…"); b_imp.clicked.connect(self._import)
+        b_imp = QPushButton("Import…"); b_imp.setProperty("kind", "ghost"); b_imp.clicked.connect(self._import)
         b_imp.setToolTip("Copy .session files (SSA or cubiomes-viewer) into the library")
         row.addWidget(b_imp)
         lv.addLayout(row)
@@ -346,23 +339,23 @@ class LibraryDialog(QDialog):
         self.name.setToolTip("Click to rename")
         self.name.editingFinished.connect(self._rename)
         rv.addWidget(self.name)
-        self.stats = QHBoxLayout(); self.stats.setSpacing(6); self.stats.setContentsMargins(8, 0, 0, 0)
-        self._stat_labels = []
-        rv.addLayout(self.stats)
-        self.info = QLabel(""); self.info.setObjectName("Muted")
-        self.info.setContentsMargins(10, 0, 0, 4)
+        # (22/10) one quiet line instead of the coloured chips
+        self.info = QLabel(""); self.info.setObjectName("LibMeta")
+        self.info.setTextFormat(Qt.TextFormat.RichText)
+        self.info.setContentsMargins(11, 0, 0, 6)
         rv.addWidget(self.info)
         rv.addWidget(section_title("Description"))
         self.desc = QPlainTextEdit(); self.desc.setObjectName("LibDesc")
-        self.desc.setPlaceholderText("Notes about this session (saved automatically)…")
-        self.desc.setFixedHeight(76)
+        self.desc.setPlaceholderText("Add a description…")
+        self.desc.setToolTip("Saved automatically")
+        self.desc.setFixedHeight(64)
         self.desc.textChanged.connect(self._desc_changed)
         rv.addWidget(self.desc)
         rv.addSpacing(4)
         rv.addWidget(section_title("Conditions"))
         self.tree = QTreeWidget(); self.tree.setHeaderHidden(True); self.tree.setColumnCount(3)
         self.tree.setTreePosition(1); self.tree.setRootIsDecorated(True)
-        self.tree.setObjectName("CondTree")
+        self.tree.setObjectName("LibTree")
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
         from PySide6.QtWidgets import QHeaderView
         h = self.tree.header(); h.setStretchLastSection(False)
@@ -376,14 +369,17 @@ class LibraryDialog(QDialog):
         self.b_open.setToolTip("Load it in the editor (Ctrl+S then saves the changes back here)."
                                "\nDouble-click a session does the same.")
         self.b_open.clicked.connect(self._open)
-        self.b_update = QPushButton("Replace with current")
+        self.b_update = QPushButton("Replace with current"); self.b_update.setProperty("kind", "ghost")
         self.b_update.setToolTip("Overwrite this entry with the session being edited "
                                  "(its name and description are kept)")
         self.b_update.clicked.connect(self._replace)
         self.b_dup = QPushButton("Duplicate"); self.b_dup.clicked.connect(self._duplicate)
         self.b_exp = QPushButton("Export…"); self.b_exp.clicked.connect(self._export)
+        for b in (self.b_dup, self.b_exp):
+            b.setProperty("kind", "ghost")
         self.b_exp.setToolTip("Save a copy as a .session file (cubiomes-viewer compatible)")
-        self.b_del = QPushButton("Delete"); self.b_del.setProperty("kind", "danger")
+        self.b_del = QPushButton("Delete"); self.b_del.setProperty("kind", "ghost")
+        self.b_del.setStyleSheet(f"QPushButton {{ color: {theme.DANGER}; }}")
         self.b_del.clicked.connect(self._delete)
         acts.addWidget(self.b_open)
         acts.addSpacing(8)
@@ -395,10 +391,6 @@ class LibraryDialog(QDialog):
         split.setSizes([400, 660])
         split.setStretchFactor(1, 1)
         root.addWidget(split, 1)
-        foot = QLabel(f"Stored in {lib_dir()}   ·   deleted sessions go to _trash")
-        foot.setObjectName("Muted")
-        foot.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        root.addWidget(foot)
         self._loading = False
         self.reload()
 
@@ -435,18 +427,6 @@ class LibraryDialog(QDialog):
         it = self.list.currentItem()
         return it.data(Qt.ItemDataRole.UserRole) if it is not None else None
 
-    def _set_stats(self, chips):
-        for w in self._stat_labels:
-            self.stats.removeWidget(w); w.hide(); w.setParent(None); w.deleteLater()
-        self._stat_labels = []
-        for text, fg, bg in chips:
-            lab = QLabel(text); lab.setObjectName("LibStat")
-            lab.setStyleSheet(f"color: {fg}; background: {bg};")
-            self.stats.insertWidget(len(self._stat_labels), lab)
-            self._stat_labels.append(lab)
-        if self.stats.count() == len(self._stat_labels):
-            self.stats.addStretch(1)
-
     def _show(self):
         m = self._cur()
         on = m is not None
@@ -456,24 +436,23 @@ class LibraryDialog(QDialog):
         self.tree.clear()
         if not on:
             self.name.setText(""); self.desc.setPlainText("")
-            self._set_stats([])
             self.info.setText("No saved session yet — “Save current session” adds the one being edited.")
             self._loading = False
             return
         self.name.setText(m["name"])
         self.desc.setPlainText(m["description"])
-        soft = lambda c, a: f"rgba({QColor(c).red()},{QColor(c).green()},{QColor(c).blue()},{int(a * 255)})"
-        chips = [(m["mc"], theme.TEXT, theme.BG4),
-                 (_plural(m["n_cond"], "condition"), theme.TEXT, theme.BG4),
-                 (_plural(m["n_res"], "result"), theme.OK if m["n_res"] else theme.TEXT3,
-                  soft(theme.OK, 0.16) if m["n_res"] else theme.BG3)]
+        dot = lambda col, txt: (f"&nbsp;&nbsp;<span style='color:{col}'>●</span>&nbsp;"
+                                f"<span style='color:{col}'>{txt}</span>")
+        parts = [m["mc"], _plural(m["n_cond"], "condition"), _plural(m["n_res"], "result"),
+                 f"modified {_when(m['modified'])}"]
+        meta = "&nbsp;&nbsp;·&nbsp;&nbsp;".join(parts)
         if m["paused"]:
-            chips.append(("paused search · Resume continues it", theme.WARN, soft(theme.WARN, 0.16)))
+            meta += "&nbsp;&nbsp;·&nbsp;&nbsp;search paused"
         if self.is_open_entry(m["path"]):
-            chips.append(("open in the editor", theme.ACCENT, soft(theme.ACCENT, 0.18)))
-        self._set_stats(chips)
-        created = f"Created {_when(m['created'])}   ·   " if m["created"] else ""
-        self.info.setText(f"{created}Modified {_when(m['modified'])}")
+            meta += dot(theme.ACCENT, "open in the editor")
+        self.info.setText(meta)
+        tip = f"Created {_when(m['created'])}" if m["created"] else ""
+        self.info.setToolTip(tip)
         self._loading = False
         self._fill_tree(m["path"])
 
@@ -594,6 +573,11 @@ class LibraryDialog(QDialog):
             last = p
         if last:
             self.reload(select=last)
+
+    def _open_folder(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl.fromLocalFile(lib_dir()))
 
     def _delete(self):
         m = self._cur()

@@ -27,6 +27,7 @@
 #define ALGO_END_CITY 3
 #define ALGO_DUNGEON116 4     /* (10/10) 1.16 dungeon attempts: rx/rz = CHUNK range */
 #define ALGO_LAKE116    5     /* (10/10) 1.16 lava lakes: rx/rz = CHUNK range */
+#define ALGO_WELL116    6     /* (30/10) 1.16 / 1.17 desert wells: rx/rz = CHUNK range */
 
 struct GpuStructJob {
     int32_t algo_kind, salt, region_size, chunk_range;
@@ -141,7 +142,26 @@ __device__ int d_test_f116(const GpuStructJob*j,uint64_t seed){
     return 0;
 }
 
+/* (30/10) 1.16 / 1.17 desert well attempts (cubiomes getStructurePos Desert_Well:
+ * population seed + salt, nextFloat < 1/1000, x z = nextInt(16)) — no biome, no
+ * terrain: a superset of the wells, the CPU checks them */
+__device__ int d_test_well116(const GpuStructJob*j,uint64_t seed){
+    int hits=0;
+    for(int cz=j->rz1;cz<=j->rz2;cz++) for(int cx=j->rx1;cx<=j->rx2;cx++){
+        uint64_t pop=d_popSeed(seed,cx*16,cz*16);
+        uint64_t r; d_setSeed(&r,pop+(uint64_t)(int64_t)j->salt);
+        if((float)d_next(&r,24)/(float)(1<<24) >= 1.f/1000) continue;
+        int x=d_nextInt(&r,16)+cx*16, z=d_nextInt(&r,16)+cz*16;
+        int inside;
+        if(j->rmax_sq){ int64_t dx=x-j->cx,dz=z-j->cz; inside=(dx*dx+dz*dz<j->rmax_sq); }
+        else inside=(x>=j->x1&&x<=j->x2&&z>=j->z1&&z<=j->z2);
+        if(inside){ hits++; if(hits>=j->min_count) return 1; }
+    }
+    return 0;
+}
+
 __device__ __forceinline__ int d_test_job(const GpuStructJob*j,uint64_t seed){
+    if(j->algo_kind==ALGO_WELL116) return d_test_well116(j,seed);
     if(j->algo_kind>=ALGO_DUNGEON116) return d_test_f116(j,seed);
     int hits=0;
     for(int rz=j->rz1;rz<=j->rz2;rz++) for(int rx=j->rx1;rx<=j->rx2;rx++){

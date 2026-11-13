@@ -1,0 +1,69 @@
+SimpleSeedAnalyser — Updates
+=============================
+
+------------------------------------------------------------------------------
+v1.2.0
+------------------------------------------------------------------------------
+
+# SimpleSeedAnalyser v1.2.0 — Chest loot, 3D SeedCracking, every structure layouts on map & village parameters (1.18+)
+
+- **Chest loot**: click a structure to see each of its chests exactly as in the game, in every version (checked on real servers): pyramids, temples, shipwrecks, ocean ruins, buried treasures, igloos, ruined portals, villages, outposts, mansions, strongholds, mineshafts, dungeons, ancient cities, camps, bastions, fortresses and End cities
+- **Loot tab**: find seeds by the loot of their chests (Find / Most / Layout), with the exact probability of what you ask for
+- **Structure plans**: detailed top-down plans on the map with the chests in yellow, and /tp commands right above each chest
+- **Crack tab**: seedcracking from the trees you saw (1.16 – 1.17, 3D view), from structures and from the End pillars, GPU accelerated
+- **Ruined portals**: new condition panel (surface / underground, completable portals, crying obsidian)
+- **Villages**: number of houses and forges in the village condition (with a new interface)
+- **New conditions**: desert wells, elytra on the End spawn platform (preset)
+- **World spawn**: exact spawn point in 1.18+ (checked on real servers), used by the map and the Spawn condition
+- **Themes**: Landscapes themes, biome palette editor and a new colour picker
+
+-**Bug fixed**: wrong spawnpoints from Cubiomes in 1.18+, biome samples on a 1 block area accepting any biome (bug found in Cubiomes Viewer)
+
+
+------------------------------------------------------------------------------
+v1.1.0 — 2026-10-20
+------------------------------------------------------------------------------
+
+# SimpleSeedAnalyser v1.1.0 — Full Nether and End implementation & bug fixes
+
+- **Nether and End**: map, biomes, structures and new conditions (fortress, bastion, End city with ship, gateways…)
+- **Structure details**: click any structure for its info and exact /tp commands
+- **Climate tools**: live climate values on the map and where each biome can generate
+- **Faster searches**: more GPU filters, GPU spiral scan, instant Stop / Pause fixed for some larger scale sessions
+- **Draw**: search a seed list
+- **Settings window** and themes from your own pictures
+- **Abandoned camps**: added for 26.3
+
+-**Bug fixed**: biome conditions pre 1.18, strongholds in 26.3, UI glitch on the right pannel, 48 bit family using NOT/OR gate, disabled conditions could still be displayed on the map, end city bridge placement causing height difference (bug found in Cubiomes Viewer)
+
+
+------------------------------------------------------------------------------
+v1.0.0 — 2026-10-10
+------------------------------------------------------------------------------
+
+SimpleSeedAnalyser (SSA) is a free seedfinding tool for Minecraft Java (1.16 → 26.3, Overworld, Large Biomes), built on **Cubiomes**.
+
+Think of it as an improved Cubiomes Viewer: many additional seedfinding features, and it will keep getting updates.
+
+## What's new in SSA
+
+- **Speed**: major optimisations for structure and biome conditions (up to ~3× faster on some sessions).
+- **Strongholds**: eye count, top Y, broken end portals (1.16), their full layout shown on the map, and more.
+- **Customisation**: 35+ themes and 14 noise map palettes, plus an editor to create and share your own.
+- **Crunchiness**: crunchiness viewer and session condition, GPU-accelerated (CUDA), plus noise tiling support thanks to a fixed spiral iterator.
+- **Drawing**: draw a terrain and find seeds that match it.
+- **Statistics**: see how much time each condition takes, the share of seeds that pass it and more, to debug and improve your sessions.
+- **Noise**: more visualisation options, octaves "up to" or "only", and the gradient vectors that form each octave can be shown, with their own settings.
+- **Exact Y**: maps for both pre-1.18 and 1.18+, including cave systems (up to the final density).
+- **More session conditions**: locate climate centre, exact Y, crunchiness, lava lakes, dungeons.
+
+And many smaller quality-of-life features like a button to check every stronghold of a seed instantly with their details, or two search start modes: "Saved" (Cubiomes Viewer's system, slightly improved) or "Random starting seed", handy for experimenting,..
+
+## Download
+- **Windows 10 / 11**: `SimpleSeedAnalyser-windows.zip` — unzip and run `SimpleSeedAnalyser.exe` (unsigned: *More info → Run anyway*).
+- **Linux x86-64** (glibc 2.34+): `SimpleSeedAnalyser-linux-x86_64.tar.gz` — extract and run `./SimpleSeedAnalyser/SimpleSeedAnalyser`.
+- CPU with AVX2. GPU optional: NVIDIA RTX 20 series or newer, driver 580+.
+
+Problems? Run `SimpleSeedAnalyser --selftest` and contact me on Discord: **@zennith7402**.
+
+Huge thanks to **Cubitect** (Cubiomes, Cubiomes Viewer), **Gaider10** (12-eye) and **jellejurre** (seed-checker) — full credits in the README.

@@ -126,6 +126,40 @@ def _eye_pool():
         return _EYE_POOL
 
 
+_DUNGEON_POOL = None
+
+
+def _dungeon_pool():
+    """(30/10) helper processes for the 1.18+ dungeons of the map (Python: terrain in
+    C threads, the decoration in Python — kept off the UI process's GIL)."""
+    global _DUNGEON_POOL
+    with _EYE_POOL_LOCK:
+        if _DUNGEON_POOL is None:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            n = max(1, min(4, (os.cpu_count() or 2) // 2))
+            _DUNGEON_POOL = ProcessPoolExecutor(max_workers=n, mp_context=mp.get_context("spawn"))
+            import atexit
+            atexit.register(lambda: _DUNGEON_POOL.shutdown(wait=False, cancel_futures=True))
+        return _DUNGEON_POOL
+
+
+_LOOT_POOL = None
+
+
+def loot_pool():
+    """(29/10) one helper process for the loot window (not behind the map's jobs)."""
+    global _LOOT_POOL
+    with _EYE_POOL_LOCK:
+        if _LOOT_POOL is None:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            _LOOT_POOL = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
+            import atexit
+            atexit.register(lambda: _LOOT_POOL.shutdown(wait=False, cancel_futures=True))
+        return _LOOT_POOL
+
+
 _LOC_POOL = None
 
 
@@ -167,6 +201,39 @@ def shutdown_eye_pool():
             pass
 
 
+_EXACT_EXEC = None
+
+
+def _exact_grid_par(world_key, x0, z0, n, step, caves, still=None):
+    """(31/10) _exact_grid in bands of rows computed on every core at once (each
+    thread its own terrain context; the C call releases the GIL): a 1:1 tile in a
+    fraction of the time on one thread. still(): False → the tile is no longer on
+    screen, the bands not started yet are dropped (None returned)."""
+    global _EXACT_EXEC
+    import terrain
+    if _GPU_LANE.acquire(blocking=False):
+        try:
+            if terrain._gpu() is not None:
+                return _thread_terrain(world_key).surface_grid(x0, z0, n, n, step=step, caves=caves)
+        finally:
+            _GPU_LANE.release()
+    if _EXACT_EXEC is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _EXACT_EXEC = ThreadPoolExecutor(max(2, (os.cpu_count() or 4) - 2))
+    rows = max(4, n // max(2, (os.cpu_count() or 4) - 2))
+    bands = [(r0, min(n, r0 + rows)) for r0 in range(0, n, rows)]
+
+    def band(b):
+        if still is not None and not still():
+            return None
+        return terrain.surface_grid_exact(world_key[1], world_key[0], x0, z0 + b[0] * step, n,
+                                          b[1] - b[0], step=step, caves=caves)
+    parts = list(_EXACT_EXEC.map(band, bands))
+    if any(q is None for q in parts):
+        return None
+    return np.vstack(parts)
+
+
 def _exact_grid(world_key, x0, z0, n, step, caves):
     """Exact surface grid. The GPU lane is taken when free (fastest); when it is
     busy the calling worker computes on the CPU instead of waiting, so all the
@@ -189,6 +256,14 @@ _LUTS: dict = {}
 def palette_names():
     from colormaps import get_available_colormaps
     return get_available_colormaps()
+
+
+def forget_palette(name=None):
+    """(22/10) Drop a cached biome LUT (a palette was edited)."""
+    if name is None:
+        _LUTS.clear()
+    else:
+        _LUTS.pop(name, None)
 
 
 def biome_lut(palette: str) -> np.ndarray:
@@ -323,10 +398,12 @@ class MapEngine(QObject):
 
     MAX_TILES = 900
     MAX_NOISE = 700
+    MAX_IDS = 500                      # (22/10) biome ids kept per tile (see tile())
 
     def __init__(self, world):
         super().__init__()
         self.world = world
+        self._ids = {}                 # (world key, scale, tx, tz, dim) -> uint8 ids
         self.pool = QThreadPool()
         self.pool.setMaxThreadCount(max(2, min(12, (os.cpu_count() or 4) - 1)))
         # exact Y: heavy. Separate pool so it never starves the biome tiles.
@@ -388,8 +465,10 @@ class MapEngine(QObject):
         self.landmarks = {}
         self._request_landmarks()
 
-    def set_palette(self, name: str):
-        if name != self.palette:
+    def set_palette(self, name: str, force=False):
+        if name != self.palette or force:
+            if force:
+                forget_palette(name)
             self.palette = name
             self.tiles.clear()
             self.previews.clear()
@@ -435,9 +514,22 @@ class MapEngine(QObject):
                 if not self._still_wanted(key):
                     self.bus.skipped.emit(key)
                     return
-                lib = _thread_lib(wk, dim)
-                ids = np.frombuffer(lib.gen_biomes_region(tx * TILE, tz * TILE, TILE, TILE, scale),
-                                    dtype=np.int32).reshape(TILE, TILE)
+                # (22/10) the biome ids of a tile are kept (uint8, 64 KB): a
+                # palette change / the palette editor's live preview only
+                # recolours them instead of generating the biomes again
+                ck = (wk, scale, tx, tz, dim)
+                ids = self._ids.get(ck)
+                if ids is None:
+                    lib = _thread_lib(wk, dim)
+                    ids = np.frombuffer(lib.gen_biomes_region(tx * TILE, tz * TILE, TILE, TILE, scale),
+                                        dtype=np.int32).reshape(TILE, TILE)
+                    if ids.min() >= 0 and ids.max() < 256:
+                        self._ids[ck] = ids.astype(np.uint8)
+                        while len(self._ids) > self.MAX_IDS:
+                            try:
+                                self._ids.pop(next(iter(self._ids)))
+                            except (StopIteration, KeyError, RuntimeError):
+                                break
                 lut = biome_lut(pal)
                 self.bus.tile.emit(key, _pixmap_from_rgb(lut[np.clip(ids, 0, len(lut) - 1)]))
             self.pool.start(_Job(job, lambda k=key: self.bus.failed.emit(k)), priority)
@@ -575,8 +667,12 @@ class MapEngine(QObject):
                 # side (each sample there is in its own chunk: 4× the time for 2×).
                 n = TILE if scale == 1 else min(EXACT_GRID, TILE)
                 step = max(1, (TILE * scale) // n)
-                small = _exact_grid(wk, tx * TILE * scale, tz * TILE * scale, n + 1, step,
-                                    bool(caves)).astype(np.float32)
+                small = _exact_grid_par(wk, tx * TILE * scale, tz * TILE * scale, n + 1, step,
+                                        bool(caves), lambda: self._still_wanted(rkey))
+                if small is None:                         # left the screen meanwhile
+                    self.bus.skipped.emit(rkey)
+                    return
+                small = small.astype(np.float32)
                 arr = _bilinear_up(small, n, TILE)
                 vmin, vmax = HEIGHT_RANGE
             pos = (np.asarray(arr, np.float32) - vmin) / max(vmax - vmin, 1e-6)
@@ -669,9 +765,35 @@ class MapEngine(QObject):
             B = self.STRUCT_BLOCK
 
             def job(key=key, wk=wk):
+                if skey == "desert_well" and not sv:   # (30/10) desert_well.py: terrain + biome
+                    try:
+                        import desert_well as dwl
+                        pts = [(x, z) for x, _y, z in _eye_pool().submit(
+                            dwl.wells, wk[0], wk[1], bx * B, bz * B, bx * B + B - 1, bz * B + B - 1).result()]
+                    except Exception:
+                        pts = []
+                    self.bus.structures.emit(key, pts)
+                    return
+                if skey == "mineshaft":             # (29/10) mineshaft_loot, helper process
+                    try:
+                        import mineshaft_loot as ml
+                        pts = _eye_pool().submit(ml.map_points, wk[0], wk[1], bx, bz, B, sv).result()
+                    except Exception:
+                        pts = []
+                    self.bus.structures.emit(key, pts)
+                    return
                 lib = _thread_lib(wk, sdim)
                 pts = lib.find_structures_in_box(stype, bx * B, bz * B, bx * B + B - 1, bz * B + B - 1,
                                                  verify_biome=not sv, max_count=100000)
+                if (skey in ("desert_pyramid", "jungle_temple", "trail_ruins")
+                        or (skey == "ruined_portal" and sdim == 0 and int(self.world.mc) <= 20)) \
+                        and pts and not sv:
+                    try:                     # (24/10) not below the sea level (1.18+)
+                        import struct_terrain
+                        pts = struct_terrain.filter_points(skey, self.world.seed,
+                                                           self.world.mc, pts)
+                    except Exception:
+                        pass
                 if skey == "igloo" and pts:          # igloos with a basement: own icon
                     try:
                         self.basements[key] = frozenset(
@@ -748,9 +870,16 @@ class MapEngine(QObject):
             if kd[0] != self.epoch:          # another seed / version since: dropped
                 return
             try:
-                dun, lak = f116.features_exact(mc, seed, bx * B, bz * B, bx * B + B - 1, bz * B + B - 1,
-                                               threads=1)
-                cols = {(f.ox, f.oz): f116.lake_columns(seed, f) for f in lak}
+                if int(mc) >= 22:            # (30/10) 1.18+: Python, in a helper process
+                    dun = _dungeon_pool().submit(f116.modern_dungeons, mc, seed, bx * B, bz * B,
+                                                 bx * B + B - 1, bz * B + B - 1).result()
+                    lak, cols = (), {}
+                else:
+                    dun, lak = f116.features_exact(mc, seed, bx * B, bz * B, bx * B + B - 1,
+                                                   bz * B + B - 1, threads=1)
+                    if int(mc) not in f116.VERSIONS:      # 1.17: the dungeons only
+                        lak = ()
+                    cols = {(f.ox, f.oz): f116.lake_columns(seed, f) for f in lak}
             except Exception:
                 dun, lak, cols = (), (), {}
             self.bus.structures.emit(kd, (list(dun), {}))
@@ -802,6 +931,130 @@ class MapEngine(QObject):
                 res = {}
             self.bus.pieces.emit(key, res.get((key[1], key[2]), []))
         self.pool.start(_Job(job), 3)
+        return None
+
+    # ── (24/10) villages / outposts: every jigsaw piece (jigsaw.py) ─────────────
+    def jigsaw_pieces(self, key, x, z, fetch=True):
+        """[(x0, z0, x1, z1, kind, y0, y1)] of the village / outpost at (x, z),
+        None until computed (1.18+, not in the structure-seed view)."""
+        if self.seed_view:
+            return None
+        k = (self.epoch, "jig", key, int(x), int(z))
+        v = self.sh_pieces.get(k)
+        if v is not None or not fetch or k in self.pieces_pending:
+            return v
+        # (24/10) at most 2 at a time, in the helper PROCESSES (pure Python, 1-2 s
+        # each: in a thread it held the GIL and the map fell to 2 fps)
+        if key not in ("mineshaft", "ruined_portal", "mansion", "bastion", "ancient_city", "fortress", "stronghold", "end_city",
+                       "shipwreck", "ocean_ruin", "igloo", "desert_pyramid",
+                       "jungle_temple", "swamp_hut", "monument", "desert_well",
+                       "trail_ruins", "trial_chambers", "ruined_portal_nether", "end_gateway") and \
+                sum(1 for q in self.pieces_pending if len(q) > 2 and q[1] == "jig"
+                    and q[2] not in ("mineshaft", "ruined_portal", "mansion", "bastion", "ancient_city", "fortress", "stronghold", "end_city",
+                       "shipwreck", "ocean_ruin", "igloo", "desert_pyramid",
+                       "jungle_temple", "swamp_hut", "monument", "desert_well",
+                       "trail_ruins", "trial_chambers", "ruined_portal_nether", "end_gateway")) >= 2:
+            return None
+        self.pieces_pending.add(k)
+        wk = self.world.key
+
+        def job():
+            try:
+                if key == "mineshaft":               # (31/10) its top view (jigsaw_plan)
+                    import jigsaw_plan
+                    res = _eye_pool().submit(jigsaw_plan.plan_mineshaft, wk[0], wk[1], int(x),
+                                             int(z)).result() or []
+                elif key == "mansion":               # (31/10) its top view (jigsaw_plan)
+                    import jigsaw_plan
+                    res = _eye_pool().submit(jigsaw_plan.plan_mansion, wk[0], wk[1], int(x),
+                                             int(z)).result() or []
+                elif key == "ancient_city":          # (31/10) its top view (jigsaw_plan)
+                    import jigsaw_plan
+                    res = _eye_pool().submit(jigsaw_plan.plan_ancient_city, wk[0], wk[1], int(x),
+                                             int(z)).result() or []
+                elif key == "end_city":              # (05/11) its top view (jigsaw_plan)
+                    import jigsaw_plan
+                    res = _eye_pool().submit(jigsaw_plan.plan_end_city, wk[0], wk[1], int(x),
+                                             int(z)).result() or []
+                elif key == "stronghold":            # (31/10) its X-ray plan (jigsaw_plan)
+                    import jigsaw_plan
+                    res = _eye_pool().submit(jigsaw_plan.plan_stronghold, wk[0], wk[1], int(x),
+                                             int(z)).result() or []
+                elif key == "fortress":              # (31/10) its top view (jigsaw_plan)
+                    import jigsaw_plan
+                    res = _eye_pool().submit(jigsaw_plan.plan_fortress, wk[0], wk[1], int(x),
+                                             int(z)).result() or []
+                elif key == "bastion":               # (31/10) its top view (jigsaw_plan)
+                    import jigsaw_plan
+                    res = _eye_pool().submit(jigsaw_plan.plan_bastion, wk[0], wk[1], int(x),
+                                             int(z)).result() or []
+                elif key in ("ruined_portal_nether", "end_gateway"):
+                    import jigsaw_plan
+                    fn = jigsaw_plan.plan_ruined_portal_nether if key == "ruined_portal_nether" else \
+                        jigsaw_plan.plan_end_gateway
+                    res = fn(wk[0], wk[1], int(x), int(z)) or []
+                elif key in ("trail_ruins", "trial_chambers"):
+                    import jigsaw_plan                 # (05/11) jigsaw_extra (exact layouts)
+                    fn = jigsaw_plan.plan_trail_ruins if key == "trail_ruins" else \
+                        jigsaw_plan.plan_trial_chambers
+                    res = _eye_pool().submit(fn, wk[0], wk[1], int(x), int(z)).result() or []
+                elif key == "desert_well":
+                    import jigsaw_plan
+                    res = jigsaw_plan.plan_desert_well(wk[0], wk[1], int(x), int(z))
+                elif key in ("desert_pyramid", "jungle_temple", "swamp_hut", "monument"):
+                    import jigsaw_plan                 # (05/11) read from a server's world
+                    res = _eye_pool().submit(jigsaw_plan.plan_scattered, wk[0], wk[1], key, int(x),
+                                             int(z)).result() or []
+                elif key in ("ruined_portal", "shipwreck", "ocean_ruin", "igloo"):
+                    # (05/11) their top view (jigsaw_plan); a ruined portal: its box if none
+                    import jigsaw_plan
+                    fn = {"ruined_portal": jigsaw_plan.plan_ruined_portal,
+                          "shipwreck": jigsaw_plan.plan_shipwreck,
+                          "ocean_ruin": jigsaw_plan.plan_ocean_ruin,
+                          "igloo": jigsaw_plan.plan_igloo}[key]
+                    res = _eye_pool().submit(fn, wk[0], wk[1], int(x), int(z)).result()
+                    if not res and key == "ruined_portal":
+                        import ruined_portal_loot as rpl
+                        res = rpl.map_boxes(wk[0], wk[1], int(x) >> 4, int(z) >> 4)
+                    res = res or []
+                elif key in ("village", "pillager_outpost", "abandoned_camp"):
+                    # (31/10) the top view (jigsaw_plan): image + chests + boxes
+                    import jigsaw_plan
+                    res = _eye_pool().submit(jigsaw_plan.plan, wk[0], wk[1], key, int(x) >> 4,
+                                             int(z) >> 4, bool(wk[2])).result() or []
+                else:
+                    import jigsaw
+                    res = _eye_pool().submit(jigsaw.map_boxes, wk[0], wk[1], key, int(x) >> 4,
+                                             int(z) >> 4, bool(wk[2])).result() or []
+            except Exception:
+                res = []
+            self.bus.pieces.emit(k, res)
+        self.pool.start(_Job(job), 3)
+        return None
+
+    def mineshaft_chests(self, x, z, fetch=True):
+        """(31/10) [(x, y, z, table)] of a mineshaft's chest minecarts (they need the
+        terrain: seconds), None until computed. One at a time."""
+        if self.seed_view:
+            return None
+        k = (self.epoch, "msc", int(x), int(z))
+        v = self.sh_pieces.get(k)
+        if v is not None or not fetch or k in self.pieces_pending:
+            return v
+        if any(len(q) > 1 and q[1] == "msc" for q in self.pieces_pending):
+            return None
+        self.pieces_pending.add(k)
+        wk = self.world.key
+
+        def job():
+            try:
+                import mineshaft_loot as ml
+                got = _eye_pool().submit(ml.chest_list, wk[0], wk[1], int(x) >> 4, int(z) >> 4).result()
+                res = [(c[0], c[1], c[2], "chests/abandoned_mineshaft") for c in got or ()]
+            except Exception:
+                res = []
+            self.bus.pieces.emit(k, res)
+        self.pool.start(_Job(job), 2)
         return None
 
     def _on_pieces(self, key, pieces):

@@ -234,10 +234,10 @@ int samplePreliminarySurfaceLevel(TerrainNoise *params, int x, int z);
  * @param cellZ the cell Z-coordinate
  * @param buffer the Y buffer
  */
-void sampleNoiseColumn(TerrainNoise *params, int cellX, int cellZ, double buffer[48 + 1]);
+void sampleNoiseColumn(TerrainNoise *params, int cellX, int cellZ, double buffer[(48 + 1) * 5]);
 /* Same, with a caves flag: caves=1 -> full exact density; caves=0 -> terrain shape
  * only (no entrances/underground/noodle carving), everything else exact. */
-void sampleNoiseColumnEx(TerrainNoise *params, int cellX, int cellZ, double buffer[48 + 1], int caves);
+void sampleNoiseColumnEx(TerrainNoise *params, int cellX, int cellZ, double buffer[(48 + 1) * 5], int caves);
 /* Highest-solid world Y at block (x,z), top-down with early-exit (~2× faster than
  * sampleNoiseColumn+generateColumn, bit-identical). Air-above-solid Y (==col-64). */
 int sampleSurfaceYDescend(TerrainNoise *params, int x, int z, int caves);
@@ -258,12 +258,12 @@ int sampleSurfaceYDescend(TerrainNoise *params, int x, int z, int caves);
  * @param flag the boolean flag for the stop condition
  * @return the last air block if the flag was set, -64 otherwise
  */
-int generateColumn(int x, int z, int blocks[384], const double ds00[48 + 1], const double ds01[48 + 1], const double ds10[48 + 1], const double ds11[48 + 1], int flag);
+int generateColumn(int x, int z, int blocks[384], const double ds00[(48 + 1) * 5], const double ds01[(48 + 1) * 5], const double ds10[(48 + 1) * 5], const double ds11[(48 + 1) * 5], int flag);
 
 /* Surface-only fast path of generateColumn(flag=1): skips the air cells above the
  * surface (conservative max-corner test) → ~10-30x fewer lerp3. Returns the same
  * air-above-solid index as generateColumn. Bit-identical surface. */
-int generateColumnFast(int x, int z, const double ds00[48 + 1], const double ds01[48 + 1], const double ds10[48 + 1], const double ds11[48 + 1]);
+int generateColumnFast(int x, int z, const double ds00[(48 + 1) * 5], const double ds01[(48 + 1) * 5], const double ds10[(48 + 1) * 5], const double ds11[(48 + 1) * 5]);
 
 /**
  * Generate a region of terrain using memoisation to prevent recalculating noise columns.

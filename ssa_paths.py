@@ -26,7 +26,7 @@ _MAC = sys.platform == "darwin"
 _HOME = os.path.expanduser("~")
 
 
-APP_VERSION = "1.1.0"      # shown in Settings → About
+APP_VERSION = "1.2.0"      # shown in Settings → About
 
 
 def _mk(d: str) -> str:

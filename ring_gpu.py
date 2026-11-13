@@ -124,14 +124,23 @@ def compile_spec(active, mc, large=False):
         c = active[j]
         t = c.get("type")
         p = c.get("params") or {}
-        if t == "climate_minmax" and _is_point(c) and not p.get("invert"):
+        if t == "climate_minmax" and _is_point(c):
             para = PARA.get(p.get("para"))
             nmax = _num(p.get("nmax"), -1)
             rng = p.get("range") or [None, None]
             lo, hi = _num(rng[0], None), _num(rng[1], None)
             if para is not None and nmax in (-1, 0):
-                pts.append((para, -RG_INF if lo is None else lo - M_POINT,
-                            RG_INF if hi is None else hi + M_POINT))
+                if not p.get("invert"):
+                    pts.append((para, -RG_INF if lo is None else lo - M_POINT,
+                                RG_INF if hi is None else hi + M_POINT))
+                elif lo is not None and hi is not None and hi - M_POINT > lo + M_POINT:
+                    # (22/10) « Invert test »: outside [lo, hi] — sent as lo' > hi'
+                    # (the kernel keeps v >= lo' OR v <= hi'), the margins widen it
+                    pts.append((para, hi - M_POINT, lo + M_POINT))
+                elif lo is not None and hi is None:          # outside [lo, +inf) = v < lo
+                    pts.append((para, -RG_INF, lo + M_POINT))
+                elif hi is not None and lo is None:          # outside (-inf, hi] = v > hi
+                    pts.append((para, hi - M_POINT, RG_INF))
             for k in kids.get(j + 1, ()):
                 walk(k)
             return

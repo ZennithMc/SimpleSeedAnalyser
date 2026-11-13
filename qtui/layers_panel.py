@@ -27,7 +27,8 @@ LANDMARKS = [("__spawn", "Spawn", "spawn"), ("__strongholds", "Strongholds", "st
              ("__origin", "Origin (0, 0)", "origin_cross")]
 SURFACE = ["village", "pillager_outpost", "desert_pyramid", "jungle_temple", "swamp_hut",
            "igloo", "mansion", "monument", "shipwreck", "ocean_ruin", "ruined_portal",
-           "buried_treasure", "trail_ruins", "ancient_city", "trial_chambers", "abandoned_camp"]
+           "buried_treasure", "trail_ruins", "ancient_city", "trial_chambers", "abandoned_camp",
+           "mineshaft", "desert_well"]
 NOISE_CHOICES = ["Off", "Temperature", "Humidity", "Continentalness", "Erosion", "Weirdness",
                  "Approx height", "Exact Y"]
 # keyboard shortcuts of the noise layer (on any page with a map)
@@ -83,16 +84,20 @@ class LayersPanel(QWidget):
         lay.addWidget(self._lm_box)
         lml.addWidget(section_title("Landmarks"))
         for key, label, ikey in LANDMARKS:
-            lml.addWidget(self._toggle(key, label, ikey))
-            if key == "__strongholds":
-                sh = QPushButton("All 128 strongholds · eyes, top Y…")
-                sh.setProperty("kind", "ghost")
-                sh.setStyleSheet("text-align: left; padding: 2px 8px 2px 26px; font-size: 8.5pt;")
-                sh.setToolTip("Every stronghold of the seed with its eye count, top Y and (1.13–1.17)\n"
-                              "corruptible portal. Right-click / double-click a stronghold on the map\n"
-                              "for its details.")
-                sh.clicked.connect(lambda: self.map.show_all_strongholds())
-                lml.addWidget(sh)
+            tg = self._toggle(key, label, ikey)
+            if key != "__strongholds":
+                lml.addWidget(tg)
+                continue
+            # (22/10) the list of the 128 strongholds: a small button on the row
+            # (was a line of text under it)
+            srow = QHBoxLayout(); srow.setSpacing(4); srow.setContentsMargins(0, 0, 0, 0)
+            srow.addWidget(tg); srow.addStretch(1)
+            sh = QToolButton(); icons.bind(sh, "more", 16)
+            sh.setAutoRaise(True); sh.setFixedSize(22, 22)
+            sh.setToolTip("All strongholds of the seed: eyes, top Y, broken portals…")
+            sh.clicked.connect(lambda: self.map.show_all_strongholds())
+            srow.addWidget(sh)
+            lml.addLayout(srow)
         lml.addSpacing(10)
         row = QHBoxLayout(); row.setSpacing(4)
         row.addWidget(section_title("Structures")); row.addStretch(1)
@@ -109,7 +114,7 @@ class LayersPanel(QWidget):
             if key in DISABLED_TYPES:            # temporarily hidden (abandoned camp, 01/10)
                 self.map.visible[key] = False
                 continue
-            if key in cw.STRUCTURE_TYPES:
+            if key in cw.DIM_STRUCTURE_TYPES[0]:
                 label = struct_icons.label(key)
                 tg = self._toggle(key, label, key)
                 if key == "village":             # abandoned villages: own icon, same switch (01/10)
@@ -130,18 +135,17 @@ class LayersPanel(QWidget):
                     tg.setToolTip("Scattered return gateways of the outer islands (not the\n"
                                   "20 that appear when the dragon dies).")
                 sld.addWidget(tg)
-        lay.addWidget(body("Structures appear when zoomed in (Settings → Map sets how far).",
-                           muted=True, small=True))
         # (10/10) 1.16 dungeons / lava lakes, with a Y range
         self._f116_box, f116l = _box()
         lay.addWidget(self._f116_box)
         _outer_lay, lay = lay, f116l                   # (18/10) overworld only: own box
         lay.addSpacing(6)
-        lay.addWidget(section_title("1.16 features"))
-        for key, tip in (("dungeon", "The dungeons that really generate: SSA rebuilds the 1.16.1 terrain\n"
-                                     "(caves, ravines, lakes, mineshafts) like Minecraft, block for block.\n"
-                                     "Near a village / outpost (not modelled) they are marked « ? ».\n"
-                                     "Shown from 4 blocks/pixel (the terrain is rebuilt: heavy), Y from 0.25."),
+        lay.addWidget(section_title("Features"))
+        for key, tip in (("dungeon", "The dungeons that really generate: SSA rebuilds the terrain (caves,\n"
+                                     "ravines, lakes / geodes, mineshafts) like Minecraft, block for block.\n"
+                                     "1.16 / 1.17: shown from 4 blocks/pixel; near a village / outpost (not\n"
+                                     "modelled) they are marked « ? ». 1.18+: from 2 blocks/pixel (heavier,\n"
+                                     "they appear progressively). Right-click one: the loot of its chests."),
                          ("lava_lake", "The lava lakes that really generate, with their real top lava Y\n"
                                        "(surface ones dropped to the ground) — exact 1.16.1 terrain.\n"
                                        "Shown from 2 blocks/pixel (4 with « Surface »), shape + Y from 0.75.")):
@@ -171,9 +175,9 @@ class LayersPanel(QWidget):
         yrow = QHBoxLayout(); yrow.setSpacing(6)
         yrow.addWidget(body("Y", muted=True))
         from PySide6.QtWidgets import QSpinBox
-        lo, hi = self.map.ov.get("f116_y", (0, 255))
-        self.f116_lo = QSpinBox(); self.f116_lo.setRange(0, 255); self.f116_lo.setValue(int(lo))
-        self.f116_hi = QSpinBox(); self.f116_hi.setRange(0, 255); self.f116_hi.setValue(int(hi))
+        lo, hi = self.map.f116_yrange()                 # (30/10) -64 → 319 (1.18+)
+        self.f116_lo = QSpinBox(); self.f116_lo.setRange(-64, 319); self.f116_lo.setValue(int(lo))
+        self.f116_hi = QSpinBox(); self.f116_hi.setRange(-64, 319); self.f116_hi.setValue(int(hi))
         for w in (self.f116_lo, self.f116_hi):
             w.setToolTip("Only the dungeons (spawner Y) / lava lakes (top lava Y) in this range.\n"
                          "Surface lakes are shown with the full range only.")
@@ -268,6 +272,7 @@ class LayersPanel(QWidget):
         self.oct_list.currentRowChanged.connect(lambda _r: self._apply_octave())
         ol.addWidget(self.oct_list)
         self.oct_hint = body("", muted=True, small=True)
+        self.oct_hint.setVisible(False)
         ol.addWidget(self.oct_hint)
 
         # arrows
@@ -325,11 +330,17 @@ class LayersPanel(QWidget):
         # ── display ────────────────────────────────────────────────────
         lay.addWidget(section_title("Display"))
         lay.addWidget(body("Biome colours"))
+        brow = QHBoxLayout(); brow.setSpacing(6)
         self.palette = QComboBox(); self.palette.addItems(palette_names())
         if self.map.engine.palette in palette_names():
             self.palette.setCurrentText(self.map.engine.palette)
         self.palette.currentTextChanged.connect(self._on_palette)
-        lay.addWidget(self.palette)
+        brow.addWidget(self.palette, 1)
+        bed = QToolButton(); icons.bind(bed, "palette", 17)
+        bed.setToolTip("Biome colours: create / edit your own palettes")
+        bed.clicked.connect(self.open_biome_palettes)
+        brow.addWidget(bed)
+        lay.addLayout(brow)
         lay.addSpacing(8)
         self.size = LabeledSlider("Icon size", 12, 40, self.map.icon_px, "{:.0f} px")
         self.size.changed.connect(self._on_size)
@@ -538,6 +549,26 @@ class LayersPanel(QWidget):
         self.map.engine.set_palette(name)
         self.map.update()
 
+    def open_biome_palettes(self):
+        """(22/10) The biome palette editor; the palette kept there is shown."""
+        from .biome_palette_editor import BiomePaletteEditor
+        win = self.window()
+        dlg = BiomePaletteEditor(self.map.engine, self.world.mc, self.palette.currentText(), win)
+        dlg.exec()
+        chosen = dlg.chosen
+        dlg.deleteLater()
+        names = palette_names()
+        self.palette.blockSignals(True)
+        self.palette.clear(); self.palette.addItems(names)
+        keep = chosen if chosen in names else (self.map.engine.palette if self.map.engine.palette in names
+                                               else names[0])
+        self.palette.setCurrentText(keep)
+        self.palette.blockSignals(False)
+        if chosen:
+            self._on_palette(keep)
+        self.map.engine.set_palette(keep, force=True)
+        self.map.update()
+
     def _on_size(self, v):
         self.map.icon_px = int(v)
         self.map.update()
@@ -599,10 +630,13 @@ class LayersPanel(QWidget):
                                       f"{cum / total * 100:.1f} % cumulated")
                         it.setData(Qt.ItemDataRole.UserRole, (i, stream == "B"))
                         self.oct_list.addItem(it)
-            self.oct_hint.setText("Octave · share of the final noise · cumulated share Σ "
-                                  "(A and B are the two Perlin streams of the double noise).")
+            # (22/10) the column legend as a tooltip (was a line of text)
+            self.oct_list.setToolTip("Octave · share of the final noise · cumulated share Σ\n"
+                                     "(A and B are the two Perlin streams of the double noise)")
+            self.oct_hint.setText("")
         else:
             self.oct_hint.setText("Octave data needs a newer libcubiomes.")
+            self.oct_hint.setVisible(True)
         self.oct_list.setCurrentRow(0)
         self.oct_list.blockSignals(False)
         self._sync_oct_enabled()
@@ -631,7 +665,8 @@ class LayersPanel(QWidget):
     def _on_arrow_mode(self, mode, apply=True):
         lattice = mode == "Lattice"
         self.arrow_y.setVisible(lattice)
-        self.arrow_hint.setText(
+        self.arrow_hint.hide()                 # (22/10) explanation → tooltip
+        self.arrow_mode.setToolTip(
             "Raw Perlin lattice gradient vectors of the selected octave (true 3D: they "
             "change with the Y slice). Hue = direction, brightness = vertical part."
             if lattice else

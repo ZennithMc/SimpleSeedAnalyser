@@ -51,7 +51,13 @@ CUDA_UNITS = {
         "file": "noise_gpu.dll" if IS_WIN else "libnoise_gpu.so",
         "sources": ["cubiomes_src/noise_gpu.cu", "cubiomes_src/noise_gpu_kernel.cuh",
                     "cubiomes_src/ssa_cuda_common.cuh"],
-    },    "topy_gpu": {                     # 1.13-1.17 stronghold Top Y (03/10)
+    },
+    "tree_cuda": {                    # (05/11) Seedcracking: trees → structure seed
+        "file": "tree_cuda.dll" if IS_WIN else "libtree_cuda.so",
+        "sources": ["cubiomes_src/tree_cuda.cu", "cubiomes_src/treecrack_core.h",
+                    "cubiomes_src/structcrack_core.h", "cubiomes_src/ssa_cuda_common.cuh"],
+    },
+    "topy_gpu": {                     # 1.13-1.17 stronghold Top Y (03/10)
         "file": "topy_gpu.dll" if IS_WIN else "libtopy_gpu.so",
         "sources": ["cubiomes_src/topy_gpu.cu", "cubiomes_src/topy_gpu_gen.cuh",
                     "cubiomes_src/ssa_cuda_common.cuh"],
@@ -117,12 +123,12 @@ def _run_build(unit: str) -> tuple[bool, str]:
         r = subprocess.run([sys.executable, script, "--unit", unit],
                            capture_output=True, timeout=1800)
     except Exception as e:
-        return False, f"build impossible : {e}"
+        return False, f"cannot build: {e}"
     log = ((r.stdout or b"") + (r.stderr or b"")).decode(errors="replace")
     if r.returncode != 0:
-        return False, "échec du build :\n" + log[-2500:]
+        return False, "build failed:\n" + log[-2500:]
     print(log.strip()[-600:], flush=True)
-    return True, "reconstruite"
+    return True, "rebuilt"
 
 
 def _bind_common(lib):
@@ -238,5 +244,5 @@ class GpuError(RuntimeError):
 def check(lib, rc, what: str):
     """Lève GpuError si rc < 0, avec le message CUDA exact."""
     if rc is None or rc < 0:
-        raise GpuError(f"{what} : {last_error(lib) or 'erreur CUDA'}")
+        raise GpuError(f"{what}: {last_error(lib) or 'CUDA error'}")
     return rc

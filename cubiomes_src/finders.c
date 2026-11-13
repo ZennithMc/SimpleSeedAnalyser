@@ -828,6 +828,8 @@ int isStrongholdBiome(int mc, int id)
     case bamboo_jungle_hills:
         // simulate MC-199298
         return mc <= MC_1_15 || mc >= MC_1_18;
+    case cherry_grove:      // (29/10) in #stronghold_biased_to from 1.21.9 (25w31a, MC-278965;
+        return mc >= MC_1_21_9;  // absent in the 1.21.1 / 1.21.3 / 1.21.4 jars, present in 1.21.11)
     case mangrove_swamp:
     case deep_dark:
     case dappled_forest:    // (18/10) not in #stronghold_biased_to (26.3 jar)
@@ -987,22 +989,31 @@ uint64_t calcFitness(const Generator *g, int x, int z)
 static
 void findFittest(const Generator *g, Pos *pos, uint64_t *fitness, double maxrad, double step)
 {
-    double rad, ang;
+    /* (SSA 12/11) Climate.SpawnFinder.radialSearch counts in FLOATS:
+     * angle += increment / radius (float), radius += increment (float), and the
+     * angle is reset once (double) angle > 2π. The doubles of cubiomes tried other
+     * points (checked on real 1.21.11 servers). volatile: no excess precision. */
+    volatile float rad = (float) step, ang = 0.0f;
+    const float inc = (float) step, mr = (float) maxrad;
     Pos p = *pos;
-    for (rad = step; rad <= maxrad; rad += step)
+    while (rad <= mr)
     {
-        for (ang = 0; ang <= PI*2; ang += step/rad)
+        int x = p.x + (int)(sin((double) ang) * (double) rad);
+        int z = p.z + (int)(cos((double) ang) * (double) rad);
+        uint64_t fit = calcFitness(g, x, z);
+        // Then update pos and fitness if combined total is lower/better
+        if (fit < *fitness)
         {
-            int x = p.x + (int)(sin(ang) * rad);
-            int z = p.z + (int)(cos(ang) * rad);
-            uint64_t fit = calcFitness(g, x, z);
-            // Then update pos and fitness if combined total is lower/better
-            if (fit < *fitness)
-            {
-                pos->x = x;
-                pos->z = z;
-                *fitness = fit;
-            }
+            pos->x = x;
+            pos->z = z;
+            *fitness = fit;
+        }
+        float q = inc / rad;
+        ang = ang + q;
+        if ((double) ang > PI*2)
+        {
+            ang = 0.0f;
+            rad = rad + inc;
         }
     }
 }
@@ -2670,7 +2681,10 @@ int genBridge(PieceEnv *env, Piece *current, int depth)
     {
         int x = -8 + nextInt(env->rng, 8);
         int z = -70 + nextInt(env->rng, 10);
-        base = addEndCityPiece(env, base, rot, x, y, z, END_SHIP);
+        /* (30/10) SSA: the game does not make the ship the base of the bridge end
+         * (EndCityPieces: addHelper(pieces, addPiece(..., piece, ..., "ship", ...)) —
+         * `piece` stays the last bridge piece); checked on the 26.2 server */
+        addEndCityPiece(env, base, rot, x, y, z, END_SHIP);
         *env->ship = 1;
     }
     else
@@ -3336,6 +3350,11 @@ int monteCarloBiomes(
             break;
         }
     }
+    // (06/11, SSA) every cell was sampled without an early decision — small areas,
+    // e.g. a single block or cell: the exact fraction decides. Before, ret stayed 1
+    // and an area of one or a few cells matched ANY biome.
+    if (i == n && ret == 1 && m > 0)
+        ret = x / m >= coverage - 1e-9;
     if (buf)
         free(buf);
     return ret;

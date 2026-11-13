@@ -49,7 +49,7 @@ cubiomes-viewer search.h):
 from __future__ import annotations
 
 import struct
-from typing import List, Tuple, Optional, Dict
+from typing import List, Optional, Dict
 
 # ── Filter IDs from cubiomes-viewer search.h ─────────────────────────
 F_SELECT            = 0
@@ -833,7 +833,7 @@ _COUNTED = {"village", "monument", "mansion", "outpost", "hut", "igloo",
 MC_TO_SESSION = {"Java 1.16": "1.16", "Java 1.16.1": "1.16.1", "Java 1.17": "1.17",
                  "Java 1.18": "1.18", "Java 1.19": "1.19", "Java 1.19.2": "1.19.2",
                  "Java 1.20": "1.20", "Java 1.21": "1.21 WD", "Java 1.21.4 +": "1.21 WD",
-                 "Java 1.21.1": "1.21.1", "Java 1.21.3": "1.21.3",
+                 "Java 1.21.1": "1.21.1", "Java 1.21.3": "1.21.3", "Java 1.21.9": "1.21",
                  "Java 26.1": "26.1", "Java 26.2": "26.2", "Java 26.3": "26.3"}
 
 # cubiomes-viewer « #MC: » string → SSA version (cubiomes str2mc). Exact
@@ -846,8 +846,8 @@ _SESSION_TO_MC = {
     "1.19.2": "Java 1.19.2", "1.19": "Java 1.19", "1.19.4": "Java 1.19",
     "1.20": "Java 1.20", "1.20.6": "Java 1.20",
     "1.21.1": "Java 1.21.1", "1.21.2": "Java 1.21.3", "1.21.3": "Java 1.21.3",
-    "1.21 wd": "Java 1.21", "1.21.4": "Java 1.21", "1.21": "Java 1.21",
-    "1.21.5": "Java 1.21", "1.21.6": "Java 1.21", "1.21.9": "Java 1.21", "1.21.11": "Java 1.21",
+    "1.21 wd": "Java 1.21", "1.21.4": "Java 1.21", "1.21": "Java 1.21.9",
+    "1.21.5": "Java 1.21", "1.21.6": "Java 1.21", "1.21.9": "Java 1.21.9", "1.21.11": "Java 1.21.9",
     "26.1": "Java 26.1", "26.2": "Java 26.2", "26.3": "Java 26.3",
 }
 

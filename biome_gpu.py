@@ -13,7 +13,7 @@ Public API:
 
 Self-test:  py biome_gpu.py
 """
-import os, ctypes, platform, subprocess, time, shutil
+import os, ctypes, platform, subprocess, time
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -128,7 +128,7 @@ def _load():
     # de 15 min pour les 5 familles de cartes, et la compilation intégrée (limite
     # 3 min) échouait donc toujours → ce mode n'a jamais tourné. Le scan « 128
     # strongholds » 1.13-1.17 passe par le moteur CPU (déjà utilisé en pratique).
-    _ERR = ("GPU « 128 strongholds » 1.13-1.17 retiré — calcul CPU")
+    _ERR = ("GPU \"128 strongholds\" 1.13-1.17 removed — computed on the CPU")
     _AVAIL = False
     return
     path = _find_lib()

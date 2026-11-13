@@ -27,7 +27,7 @@ FAMILY = 65536                     # seeds per 48-bit family
 # many results unless the stop rule itself is a result count; the user can
 # continue with a 10× higher limit, up to SAFETY_MAX.
 SAFETY_FIRST = 100_000
-SAFETY_MAX = 10_000_000
+SAFETY_MAX = 100_000_000          # (22/10) was 10 M: the results are compact now
 
 
 def safety_first() -> int:
@@ -73,6 +73,10 @@ class SearchRunner(QObject):
         self._lock = threading.Lock()
         self._buf = []
         self._seen = set()
+        self._dedupe = True
+        import collections as _co
+        self._recent = _co.deque(maxlen=1_000_000)   # (22/10) the last results (see _merge_overflow)
+        self._refind = set()
         self.found = 0
         self.safety_limit = SAFETY_FIRST
         # (17/10) known before any search: the autosave of a session restored
@@ -116,6 +120,7 @@ class SearchRunner(QObject):
             return
         if not _resume:
             self._seen.clear()
+            self._recent.clear(); self._refind = set()
             self.found = 0
             self.safety_limit = safety_first()
             self.base_start = int(start)
@@ -257,8 +262,32 @@ class SearchRunner(QObject):
         self.rule = tuple(st.get("rule") or ("never", 0))
         self._prof_live = None
         with self._lock:
-            self._seen = set(seen)
-            self.found = len(self._seen)
+            seen = list(seen) if not isinstance(seen, (list, tuple)) else seen
+            # (22/10) a big restored search: no set of millions of seeds (the
+            # range scan resumes after them, it cannot find them again)
+            self._seen = set(seen) if len(seen) <= 300_000 else set()
+            self.found = len(seen)
+            self._recent.clear(); self._refind = set()
+            if not self._seen and seen:
+                # the saved results after the resume point (found in flight
+                # before the pause) are the only ones the resumed search can
+                # find again
+                try:
+                    import numpy as _np
+                    MK = U64 - 1
+                    a = _np.array([int(x) & MK for x in seen], dtype=_np.uint64)
+                    rp, b = _np.uint64(int(self.resume_point) & MK), _np.uint64(int(self.base_start) & MK)
+                    if self.eff_mode == "inc":
+                        ahead = (a - b) >= (rp - b)
+                    elif self.eff_mode not in ("fam48", "blocks"):
+                        raise ValueError("unknown order")
+                    else:
+                        m = _np.uint64(M48)
+                        ahead = ((a & m) - (b & m)) & m >= ((rp - (b & m)) & m)
+                    self._refind = {int(x) - (1 << 64) if int(x) >= (1 << 63) else int(x)
+                                    for x in a[ahead].tolist()}
+                except Exception:
+                    self._seen = set(seen)        # fall back: the full set
         self.can_pause = True
         self.auto_paused = None
         self._set_state("paused")
@@ -277,15 +306,24 @@ class SearchRunner(QObject):
     def _work(self):
         import custom_search as cs
         p = self.params
+        self._dedupe = p.get("seed_list") is not None or len(self._seen) > 0
 
         def on_match(seed, details=""):
             s = int(seed)
             # one row per seed; stronghold jobs can report several strongholds of
             # the same seed (all-128 scans) → keyed by position as well
             key = (s, details.get("x"), details.get("z")) if isinstance(details, dict) else s
+            # (22/10) the set of every result (~70 bytes each: 700 MB at 10 M) is
+            # only kept where a seed CAN come twice: a seed list (repeats),
+            # strongholds (several per seed); a range scan finds each seed once
+            track = self._dedupe or not isinstance(key, int)
             with self._lock:
-                if key in self._seen:
+                if track and key in self._seen:
                     return
+                if not track:
+                    if key in self._refind:       # found again after a resume
+                        return
+                    self._recent.append(key)
                 target = self.rule[1] if (self.rule[0] == "results" and self.rule[1] > 0) \
                     else self._safety()
                 if self.found >= target:
@@ -296,7 +334,8 @@ class SearchRunner(QObject):
                     # again), the others are found again after Resume.
                     self._overflow.append((key, s, details or ""))
                     return
-                self._seen.add(key)
+                if track:
+                    self._seen.add(key)
                 self._buf.append((s, details or ""))
                 self.found += 1
                 if self.rule[0] == "results" and self.rule[1] > 0 and self.found >= self.rule[1]:
@@ -625,29 +664,45 @@ class SearchRunner(QObject):
                     n += 1
         return n
 
+    def _before_fn(self, eff):
+        """sd -> True if the seed is before the resume point (already searched)."""
+        rp, b = int(self.resume_point), int(self.base_start)
+        if eff == "inc":
+            lim = (rp - b) % U64
+            return lambda sd: (sd - b) % U64 < lim
+        if eff in ("fam48", "blocks"):
+            m = 1 << 48
+            lim = (rp - (b & M48)) % m
+            return lambda sd: ((sd & M48) - (b & M48)) % m < lim
+        return None
+
     def _merge_overflow(self, eff):
         """Matches that arrived after the result limit (see on_match): keep the
         ones the resumed search would not find again."""
         with self._lock:
             extra, self._overflow = self._overflow, []
+        # (22/10) the results already shown that lie AFTER the resume point
+        # (found in flight before the pause) will be found again by the resumed
+        # search: only those are remembered to drop the repeats (was: every
+        # result ever found, in a set)
+        if self.resume_point is not None and self.can_pause:
+            bf = self._before_fn(eff)
+            with self._lock:
+                # (+ the ones remembered at earlier pauses still ahead: a block
+                # cut by two pauses in a row)
+                self._refind = {k for k in list(self._refind) + list(self._recent)
+                                if bf is None or not bf(k)}
+                self._recent.clear()
         if not extra or self.resume_point is None or not self.can_pause:
             return                              # stopped: the limit is what was asked
-        rp, b = int(self.resume_point), int(self.base_start)
-        if eff == "inc":
-            lim = (rp - b) % U64
-            before = lambda sd: (sd - b) % U64 < lim
-        elif eff in ("fam48", "blocks"):
-            m = 1 << 48
-            lim = (rp - (b & M48)) % m
-            before = lambda sd: ((sd & M48) - (b & M48)) % m < lim
-        else:
-            before = lambda sd: True            # unknown order: never lose a result
+        before = self._before_fn(eff) or (lambda sd: True)   # unknown order: never lose one
         batch = []
         with self._lock:
             for key, sd, det in extra:
-                if key in self._seen or not before(sd):
+                if key in self._seen or key in self._refind or not before(sd):
                     continue
-                self._seen.add(key)
+                if self._dedupe or not isinstance(key, int):
+                    self._seen.add(key)
                 self.found += 1
                 batch.append((sd, det))
         if batch:

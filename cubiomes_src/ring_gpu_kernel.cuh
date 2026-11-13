@@ -238,7 +238,10 @@ GPUDEV static int Rg_testPos(const RgN *bn, const RgSpec *s, int x, int z){
     int qx = x >> 2, qz = z >> 2;
     for (int i = 0; i < s->npt; i++){
         int v = Rg_val(bn, s->pt[i].para, qx, qz);
-        if (v < s->pt[i].lo || v > s->pt[i].hi) return 0;
+        int lo = s->pt[i].lo, hi = s->pt[i].hi;
+        if (lo <= hi) { if (v < lo || v > hi) return 0; }
+        else if (v < lo && v > hi) return 0;      // (22/10) lo > hi: an « Invert test »,
+                                                  // passes when v >= lo OR v <= hi
     }
     for (int r = 0; r < s->nor; r++){
         const RgOr *o = &s->ors[r];

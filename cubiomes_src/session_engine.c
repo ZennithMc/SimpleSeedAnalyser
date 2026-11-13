@@ -53,6 +53,7 @@
 #include "biomenoise.h"
 #include "noise.h"
 #include "terrain116.h"
+#include "mineshaft116.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -100,6 +101,7 @@
 #define CTYPE_CLIMATE_AREA        21   /* Locate climate center: coarse flood fill (01/10) */
 #define CTYPE_SPAWN_FEATURE       22   /* (09/10) 1.16 fallback spawn: dungeon / lava lake */
 #define CTYPE_FEATURE116          23   /* (10/10) 1.16 dungeons / lava lakes in an area */
+#define CTYPE_ELYTRA_SPAWN        24   /* (24/10) an End ship elytra teleported to the End spawn */
 
 #define VARIANT_NONE          0
 #define VARIANT_ABANDONED     1
@@ -810,6 +812,465 @@ static const T116 *f116x_ctx(int mc, uint64_t seed, T116Cache **cache)
     return F116X_T;
 }
 
+/* (26/10) The blocks of chunk (cx, cz) of a 1.16 world as the STRONGHOLDS step
+ * finds them: terrain, surface, carvers, then the chunk's lakes, mineshafts and
+ * dungeons (t116_populate_ex). out[65536]: T116_* codes, [(y*16 + z)*16 + x].
+ * The stronghold pieces' walls skip the air there (generateBox(..., true, ...)):
+ * each skipped wall block is one random draw less before the chests.
+ * Returns 1, or 0 (not 1.16 / failure). */
+EXPORT int ssa_t116_blocks(int mc, uint64_t seed, int32_t cx, int32_t cz, uint8_t *out)
+{
+    if (!(f116_version_ok(mc) || mc == MC_1_17_1) || !out) return 0;
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, seed, &cache);
+    if (!t) return 0;
+    T116Chunk *res = (T116Chunk *)malloc(sizeof(T116Chunk));
+    if (!res) return 0;
+    T116Feat fe[16];
+    int n = t116_populate_ex(t, cache, cx, cz, fe, 16, res, 3);
+    if (n >= 0) memcpy(out, res->b, 65536);
+    free(res);
+    return n >= 0;
+}
+
+/* ═══ (30/10) desert wells: does the attempt at (x, z) really place a well? ═══
+ * DesertWellFeature: down to the first non-air block, which must be sand, and no
+ * hole 2 deep under the 5 × 5 base (desert_well.py, checked on the servers).
+ *   1.16 / 1.17: the chunk's biome getNoiseBiome(cx*4+2, cz*4+2) (desert, desert
+ *     hills, desert lakes), the exact 1.16 terrain of the chunk populated up to its
+ *     dungeons (ssa_t116_blocks, the neighbours alone for the 5 × 5 base);
+ *   1.18+: the terrain library's carved chunks (cv_chunk, registered by
+ *     ssa_set_terrain_fns): water on top = no well, the biome at the spot at that
+ *     height (scale 1) = desert, the 5 × 5 base checked block by block.
+ *     Without the terrain library: desert at 1:4, y 64 (an estimate). */
+typedef void *(*cv_alloc_fn)(void);
+typedef int (*cv_init_fn)(void *, int, uint64_t);
+typedef int (*cv_top_fn)(void *, int, int);
+typedef int (*cv_chunk_fn)(void *, int, int, const int *, int, uint8_t *, int);
+static cv_alloc_fn TF_ALLOC = NULL;
+static cv_init_fn  TF_INIT = NULL;
+static cv_top_fn   TF_SURF = NULL, TF_SOLID = NULL;
+static cv_chunk_fn TF_CHUNK = NULL;
+
+EXPORT void ssa_set_terrain_fns(void *alloc, void *init, void *surf, void *solid, void *chunk)
+{
+    TF_ALLOC = (cv_alloc_fn)alloc; TF_INIT = (cv_init_fn)init;
+    TF_SURF = (cv_top_fn)surf; TF_SOLID = (cv_top_fn)solid;
+    TF_CHUNK = (cv_chunk_fn)chunk;
+}
+
+/* 1.18+ chunks of the terrain library (codes 0 solid, 1 air, 2 water, 3 lava;
+   [((y + 64) * 16 + z) * 16 + x]), a few per thread */
+static __thread struct { int ok, mc, cx, cz; uint64_t seed; uint8_t *b; } TF_C[6];
+static __thread int TF_NEXT;
+
+static const uint8_t *tf_chunk(void *ctx, int mc, uint64_t seed, int cx, int cz)
+{
+    for (int i = 0; i < 6; i++)
+        if (TF_C[i].ok && TF_C[i].mc == mc && TF_C[i].seed == seed &&
+            TF_C[i].cx == cx && TF_C[i].cz == cz) return TF_C[i].b;
+    int k = TF_NEXT++ % 6;
+    if (!TF_C[k].b && !(TF_C[k].b = (uint8_t *)malloc(384 * 256))) return NULL;
+    TF_C[k].ok = 0;
+    int dummy = 0;
+    if (TF_CHUNK(ctx, cx, cz, &dummy, 0, TF_C[k].b, 0) < 0) return NULL;
+    TF_C[k].ok = 1; TF_C[k].mc = mc; TF_C[k].seed = seed; TF_C[k].cx = cx; TF_C[k].cz = cz;
+    return TF_C[k].b;
+}
+
+/* 0 air, 1 solid (a desert floor: sand), 2 fluid, -1 unknown */
+static int tf_get(void *ctx, int mc, uint64_t seed, int x, int y, int z)
+{
+    if (y < -64 || y > 319) return 0;
+    const uint8_t *c = tf_chunk(ctx, mc, seed, x >> 4, z >> 4);
+    if (!c) return -1;
+    int b = c[(((y + 64) << 4) | (z & 15)) << 4 | (x & 15)];
+    return b == 1 ? 0 : b == 0 ? 1 : 2;
+}
+
+static __thread void *TF_CTX = NULL;
+static __thread uint64_t TF_SEED;
+static __thread int TF_MC = -1;
+
+static void *tf_ctx(int mc, uint64_t seed)
+{
+    if (!TF_ALLOC || !TF_INIT || !TF_SURF || !TF_SOLID || !TF_CHUNK) return NULL;
+    if (!TF_CTX) { TF_CTX = TF_ALLOC(); if (!TF_CTX) return NULL; TF_MC = -1; }
+    if (TF_MC != mc || TF_SEED != seed) {
+        if (!TF_INIT(TF_CTX, mc, seed)) { TF_MC = -1; return NULL; }
+        TF_MC = mc; TF_SEED = seed;
+    }
+    return TF_CTX;
+}
+
+/* (12/11) The world spawn of 1.18+ as MinecraftServer.setInitialSpawn sets it
+ * (checked on real 1.21.11 servers; spawn_exact.py is the same in Python): the chunk
+ * of Climate.SpawnFinder's point (estimateSpawn, float search), then a spiral of
+ * 11 × 11 chunks, in each the columns x by x, z by z; the first column whose top block
+ * is solid — or water that freeze_top_layer turns to ice (a cold biome above it) —
+ * wins, the spawn is just above it. Not modelled: trees / rocks on the column (same
+ * X, Z, higher Y); a frozen ocean's warm patches (taken as frozen). Returns 0 when
+ * the terrain library is missing (the caller keeps getSpawn). */
+static int spawn_cold(int id)
+{
+    return id == snowy_tundra || id == ice_spikes || id == snowy_taiga || id == snowy_beach ||
+           id == frozen_river || id == grove || id == snowy_slopes || id == jagged_peaks ||
+           id == frozen_peaks || id == frozen_ocean;
+}
+
+static int spawn_exact_at(Generator *g, int mc, uint64_t seed, Pos s, int32_t *out);
+
+/* SurfaceRuleData: a swamp / mangrove swamp floor at y 62 is water where the noise
+   minecraft:surface_swamp (first octave -2, amplitude 1) is >= 0 */
+static __thread struct { int ok; uint64_t seed; DoublePerlinNoise dpn; PerlinNoise oct[2]; } SWAMP_N;
+
+static int swamp_water(uint64_t seed, int x, int z)
+{
+    if (!SWAMP_N.ok || SWAMP_N.seed != seed) {
+        Xoroshiro xr, pxr;
+        xSetSeed(&xr, seed);
+        uint64_t lo = xNextLong(&xr), hi = xNextLong(&xr);
+        static const double amp[] = {1.0};
+        pxr.lo = lo ^ 0xc7afe50ddb0bafd7ULL;          /* md5 "minecraft:surface_swamp" */
+        pxr.hi = hi ^ 0x13a4f289e298db6aULL;
+        xDoublePerlinInit(&SWAMP_N.dpn, &pxr, SWAMP_N.oct, amp, -2, 1, -1);
+        SWAMP_N.ok = 1; SWAMP_N.seed = seed;
+    }
+    return sampleDoublePerlin(&SWAMP_N.dpn, x, 0, z) >= 0.0;
+}
+
+EXPORT int ssa_spawn_exact(Generator *g, int mc, uint64_t seed, int32_t *out)
+{
+    if (mc < MC_1_18) return 0;
+    return spawn_exact_at(g, mc, seed, estimateSpawn(g, NULL), out);
+}
+
+/* s: estimateSpawn's point (the search's chunk) */
+static int spawn_exact_at(Generator *g, int mc, uint64_t seed, Pos s, int32_t *out)
+{
+    void *ctx = tf_ctx(mc, seed);
+    if (!ctx) return 0;
+    int cx0 = s.x >> 4, cz0 = s.z >> 4;
+    int j = 0, k = 0, dj = 0, dk = -1;
+    for (int i = 0; i < 121; i++) {
+        if (j >= -5 && j <= 5 && k >= -5 && k <= 5) {
+            int cx = cx0 + j, cz = cz0 + k;
+            const uint8_t *c = tf_chunk(ctx, mc, seed, cx, cz);
+            if (!c) return 0;
+            for (int lx = 0; lx < 16; lx++)
+                for (int lz = 0; lz < 16; lz++) {
+                    int y;
+                    for (y = 383; y >= 0; y--)
+                        if (c[((y << 4) | lz) << 4 | lx] != 1) break;
+                    if (y < 0) continue;
+                    int v = c[((y << 4) | lz) << 4 | lx];
+                    int x = cx * 16 + lx, z = cz * 16 + lz, wy = y - 64;
+                    if (v == 0 && wy == 62) {
+                        int b = getBiomeAt(g, 1, x, 62, z);
+                        if ((b == swamp || b == mangrove_swamp) && swamp_water(seed, x, z)) v = 2;
+                    }
+                    if (v == 0 || (v == 2 && spawn_cold(getBiomeAt(g, 1, x, wy + 1, z)))) {
+                        out[0] = x; out[1] = wy + 1; out[2] = z;
+                        return 1;
+                    }
+                }
+        }
+        if (j == k || (j < 0 && j == -k) || (j > 0 && j == 1 - k)) {
+            int t = dj; dj = -dk; dk = t;
+        }
+        j += dj; k += dk;
+    }
+    out[0] = cx0 * 16 + 8; out[1] = 64; out[2] = cz0 * 16 + 8;   /* getSpawnHeight */
+    return 1;
+}
+
+/* (31/10) getFirstOccupiedHeight(WORLD_SURFACE_WG) of 1.18+ for jigsaw_engine.c:
+ * the terrain library's cv_surface (INT32_MIN without it) */
+EXPORT int ssa_tf_surface(int mc, uint64_t seed, int x, int z)
+{
+    void *ctx = tf_ctx(mc, seed);
+    if (!ctx) return INT32_MIN;
+    return TF_SURF(ctx, x, z);
+}
+
+EXPORT int ssa_tf_ready(void) { return TF_ALLOC && TF_INIT && TF_SURF && TF_SOLID && TF_CHUNK; }
+
+/* populated 1.16 / 1.17 chunks, a few per thread */
+#define WELL_NC 6
+static __thread struct { int ok, mc, cx, cz; uint64_t seed; uint8_t *b; } WELL_C[WELL_NC];
+static __thread int WELL_NEXT;
+
+static const uint8_t *well116_chunk(int mc, uint64_t seed, int cx, int cz)
+{
+    for (int i = 0; i < WELL_NC; i++)
+        if (WELL_C[i].ok && WELL_C[i].mc == mc && WELL_C[i].seed == seed &&
+            WELL_C[i].cx == cx && WELL_C[i].cz == cz) return WELL_C[i].b;
+    int k = WELL_NEXT++ % WELL_NC;
+    if (!WELL_C[k].b && !(WELL_C[k].b = (uint8_t *)malloc(65536))) return NULL;
+    WELL_C[k].ok = 0;
+    if (!ssa_t116_blocks(mc, seed, cx, cz, WELL_C[k].b)) return NULL;
+    WELL_C[k].ok = 1; WELL_C[k].mc = mc; WELL_C[k].seed = seed; WELL_C[k].cx = cx; WELL_C[k].cz = cz;
+    return WELL_C[k].b;
+}
+
+/* 0 air, 1 sand, 2 fluid, 3 other solid, -1 unknown */
+static int well116_get(int mc, uint64_t seed, int x, int y, int z)
+{
+    if (y < 0 || y > 255) return 0;
+    const uint8_t *c = well116_chunk(mc, seed, x >> 4, z >> 4);
+    if (!c) return -1;
+    int b = c[((y << 4) | (z & 15)) << 4 | (x & 15)];
+    if (b == T116_AIR || b == T116_CAVE_AIR) return 0;
+    if (b == T116_SAND) return 1;
+    if (b == T116_WATER || b == T116_LAVA) return 2;
+    return 3;
+}
+
+/* 1 a well (its sand Y in *py), 0 none */
+static int well_exists(int mc, uint64_t seed, const Generator *g, int x, int z, int *py)
+{
+    if (mc <= MC_1_17) {
+        int cx = x >> 4, cz = z >> 4;
+        if (!f116_is_desert(getBiomeAt(g, 4, cx * 4 + 2, 0, cz * 4 + 2))) return 0;
+        int y = 255, v = 0;
+        while (y > 2) {
+            v = well116_get(mc, seed, x, y, z);
+            if (v < 0) return 1;                    /* cannot tell: kept */
+            if (v != 0) break;
+            y--;
+        }
+        if (v != 1) return 0;
+        for (int i = -2; i <= 2; i++)
+            for (int j = -2; j <= 2; j++)
+                if (well116_get(mc, seed, x + i, y - 1, z + j) == 0 &&
+                    well116_get(mc, seed, x + i, y - 2, z + j) == 0) return 0;
+        if (py) *py = y;
+        return 1;
+    }
+    /* 1.18+: no desert around (1:4, y 64) → nothing to look at */
+    int any = 0;
+    for (int a = -8; a <= 8 && !any; a += 8)
+        for (int b = -8; b <= 8 && !any; b += 8)
+            if (getBiomeAt(g, 4, (x + a) >> 2, 16, (z + b) >> 2) == desert) any = 1;
+    if (!any) return 0;
+    void *ctx = tf_ctx(mc, seed);
+    if (!ctx) { if (py) *py = 64; return 1; }       /* no terrain library: the estimate */
+    int y = 319, v = 0;                             /* the carved terrain (caves too) */
+    while (y > -62) {
+        v = tf_get(ctx, mc, seed, x, y, z);
+        if (v < 0) return 1;
+        if (v != 0) break;
+        y--;
+    }
+    if (v != 1) return 0;                           /* water (or lava) on top */
+    if (mc >= MC_26_3) {
+        /* 26.3: a data-driven placed feature — the top block (heightmap - 1) is sand,
+         * no air at all in the 5 × 2 × 5 under it (volume_match), biome there */
+        if (getBiomeAt(g, 1, x, y, z) != desert) return 0;
+        for (int i = -2; i <= 2; i++)
+            for (int j = -2; j <= 2; j++)
+                if (tf_get(ctx, mc, seed, x + i, y - 1, z + j) == 0 ||
+                    tf_get(ctx, mc, seed, x + i, y - 2, z + j) == 0) return 0;
+        if (py) *py = y;
+        return 1;
+    }
+    if (getBiomeAt(g, 1, x, y + 1, z) != desert) return 0;
+    for (int i = -2; i <= 2; i++)
+        for (int j = -2; j <= 2; j++)
+            if (tf_get(ctx, mc, seed, x + i, y - 1, z + j) == 0 &&
+                tf_get(ctx, mc, seed, x + i, y - 2, z + j) == 0) return 0;
+    if (py) *py = y;
+    return 1;
+}
+
+EXPORT int ssa_desert_well_exists(int mc, uint64_t seed, int x, int z, int *py)
+{
+    Generator g;
+    setupGenerator(&g, mc, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+    return well_exists(mc, seed, &g, x, z, py);
+}
+
+/* (24/10) the same once the neighbours of `mask` (bit k = (dz+1)*3 + (dx+1))
+ * were decorated first (their lakes / dungeons reach into the chunk) */
+EXPORT void ssa_t116_spider_mode(int all) { ms116_spider_reset(all); }
+
+EXPORT int ssa_t116_blocks_nb(int mc, uint64_t seed, int32_t cx, int32_t cz, int mask, uint8_t *out)
+{
+    if (!(f116_version_ok(mc) || mc == MC_1_17_1) || !out) return 0;
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, seed, &cache);
+    if (!t) return 0;
+    T116Chunk *res = (T116Chunk *)malloc(sizeof(T116Chunk));
+    if (!res) return 0;
+    int n = t116_populate_nb(t, cache, cx, cz, mask, res);
+    if (n >= 0) memcpy(out, res->b, 65536);
+    free(res);
+    return n >= 0;
+}
+
+/* (29/10) 1.18+: the chunks of [cx0, cx1] × [cz0, cz1] that pass the mineshaft
+ * frequency test (setLargeFeatureSeed, nextDouble < (double)0.004f); the biome /
+ * deep dark / mesa checks follow in mineshaft118.has_start. (cx, cz) each. */
+EXPORT int ssa_mineshaft_candidates(uint64_t seed, int32_t cx0, int32_t cz0, int32_t cx1, int32_t cz1,
+                                    int32_t *out, int max)
+{
+    uint64_t r;
+    setSeed(&r, seed);
+    uint64_t a = nextLong(&r), b = nextLong(&r);
+    int n = 0;
+    for (int32_t x = cx0; x <= cx1; x++)
+        for (int32_t z = cz0; z <= cz1 && n < max; z++) {
+            setSeed(&r, ((uint64_t)(int64_t)x * a) ^ ((uint64_t)(int64_t)z * b) ^ seed);
+            if (nextDouble(&r) < 0.004000000189989805) { out[2 * n] = x; out[2 * n + 1] = z; n++; }
+        }
+    return n;
+}
+
+/* (29/10) 1.18+ normal mineshaft of chunk (cx, cz), no biome check: its pieces
+ * (x0, y0, z0, x1, y1, z1, type) — mineshaft118.layout in C */
+EXPORT int ssa_mineshaft118_pieces(int mc, uint64_t seed, int32_t cx, int32_t cz, int32_t *out, int max)
+{
+    Ms116Start s;
+    if (!ms118_start_normal(seed, cx, cz, mc >= MC_1_19_2, &s)) return -1;
+    int n = 0;
+    for (int i = 0; i < s.n && n < max; i++, n++) {
+        const Ms116Box *b = &s.p[i].bb;
+        int32_t *o = out + 7 * n;
+        o[0] = b->x0; o[1] = b->y0; o[2] = b->z0; o[3] = b->x1; o[4] = b->y1; o[5] = b->z1;
+        o[6] = s.p[i].type;
+    }
+    ms116_start_free(&s);
+    return n;
+}
+
+/* (29/10) mineshafts 1.16 / 1.17 for the map and the loot ─────────────────── */
+/* the starts in chunks [cx0, cx1] × [cz0, cz1]: (cx, cz, type 1 normal / 2 mesa) */
+EXPORT int ssa_t116_mineshaft_starts(int mc, uint64_t seed, int32_t cx0, int32_t cz0,
+                                     int32_t cx1, int32_t cz1, int32_t *out, int max)
+{
+    if (!(f116_version_ok(mc) || mc == MC_1_17_1) || !out) return -1;
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, seed, &cache);
+    if (!t) return -1;
+    int n = 0;
+    for (int32_t x = cx0; x <= cx1; x++)
+        for (int32_t z = cz0; z <= cz1 && n < max; z++) {
+            int ty = ms116_has_start(t, x, z);
+            if (ty) { out[3 * n] = x; out[3 * n + 1] = z; out[3 * n + 2] = ty; n++; }
+        }
+    return n;
+}
+
+/* the pieces of the start of chunk (cx, cz): (x0, y0, z0, x1, y1, z1, type) each */
+EXPORT int ssa_t116_mineshaft_pieces(int mc, uint64_t seed, int32_t cx, int32_t cz,
+                                     int32_t *out, int max)
+{
+    if (!(f116_version_ok(mc) || mc == MC_1_17_1) || !out) return -1;
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, seed, &cache);
+    if (!t) return -1;
+    Ms116Start s;
+    if (!ms116_start(t, cx, cz, &s)) return 0;
+    int n = 0;
+    for (int i = 0; i < s.n && n < max; i++, n++) {
+        const Ms116Box *b = &s.p[i].bb;
+        int32_t *o = out + 7 * n;
+        o[0] = b->x0; o[1] = b->y0; o[2] = b->z0; o[3] = b->x1; o[4] = b->y1; o[5] = b->z1;
+        o[6] = s.p[i].type;
+    }
+    ms116_start_free(&s);
+    return n;
+}
+
+/* the chest minecarts chunk (cx, cz) places (its neighbours of `mask` decorated
+ * first): (x, y, z, loot seed, start cx, start cz) each */
+EXPORT int ssa_t116_mineshaft_chests(int mc, uint64_t seed, int32_t cx, int32_t cz, int mask,
+                                     int64_t *out, int max)
+{
+    if (!(f116_version_ok(mc) || mc == MC_1_17_1) || !out) return -1;
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, seed, &cache);
+    if (!t) return -1;
+    T116Chunk *res = (T116Chunk *)malloc(sizeof(T116Chunk));
+    if (!res) return -1;
+    ms116_capture(cx, cz, out, max);
+    ms116_removed_mode((mask >> 16) & 1);       /* bit 16: the removed pieces skipped */
+    int n = t116_populate_nb(t, cache, cx, cz, mask & 0xFFFF, res);
+    ms116_removed_mode(0);
+    int k = ms116_capture_end();
+    free(res);
+    return n >= 0 ? k : -1;
+}
+
+/* (30/10) the dungeons chunk (cx, cz) places (its neighbours of `mask` decorated
+ * first, 1.16 / 1.17 exact terrain; 1.17: no geodes): 16 int64 each — spawner
+ * X Y Z, half sizes, mob (0 skeleton, 1-2 zombie, 3 spider), chest count, then per
+ * chest x y z and its LootTableSeed. */
+EXPORT int ssa_t116_dungeons(int mc, uint64_t seed, int32_t cx, int32_t cz, int mask,
+                             int64_t *out, int max)
+{
+    if (!(f116_version_ok(mc) || mc == MC_1_17_1) || !out) return -1;
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, seed, &cache);
+    if (!t) return -1;
+    T116Chunk *res = (T116Chunk *)malloc(sizeof(T116Chunk));
+    if (!res) return -1;
+    t116_dungeon_capture(cx, cz, out, max);
+    int n = t116_populate_nb(t, cache, cx, cz, mask & 0xFFFF, res);
+    int k = t116_dungeon_capture_end();
+    free(res);
+    return n >= 0 ? k : -1;
+}
+
+/* (24/10) debug: the chunk after its carvers only */
+EXPORT int ssa_t116_carved(int mc, uint64_t seed, int32_t cx, int32_t cz, uint8_t *out)
+{
+    if (!(f116_version_ok(mc) || mc == MC_1_17_1) || !out) return 0;
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, seed, &cache);
+    if (!t) return 0;
+    T116Chunk *res = (T116Chunk *)malloc(sizeof(T116Chunk));
+    if (!res) return 0;
+    int n = t116_carved(t, cache, cx, cz, res);
+    if (n >= 0) memcpy(out, res->b, 65536);
+    free(res);
+    return n >= 0;
+}
+
+/* (30/10) the NOISE-status chunk of 1.16 / 1.17 (stone, sea water, air: no surface,
+ * no carvers) = ChunkGenerator.getBaseColumn / getBaseHeight, for the ruined
+ * portals' findSuitableY. out[65536]: T116 codes, [(y*16 + z)*16 + x]. */
+EXPORT int ssa_t116_noise_chunk(int mc, uint64_t seed, int32_t cx, int32_t cz, uint8_t *out)
+{
+    if (!(f116_version_ok(mc) || mc == MC_1_17_1) || !out) return 0;
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, seed, &cache);
+    if (!t) return 0;
+    const T116Chunk *c = t116_cache_chunk(t, cache, cx, cz, 4);
+    if (!c) return 0;
+    memcpy(out, c->b, 65536);
+    return 1;
+}
+
+/* (25/10) getFirstFreeHeight(x, z, WORLD_SURFACE_WG) of 1.16 / 1.17: the first
+ * free block above the noise terrain (stone or sea water), as the jigsaw
+ * structures read it. -1 on failure. */
+EXPORT int ssa_t116_base_height(int mc, uint64_t seed, int32_t x, int32_t z)
+{
+    if (!(f116_version_ok(mc) || mc == MC_1_17_1)) return -1;
+    T116Cache *cache;
+    const T116 *t = f116x_ctx(mc, seed, &cache);
+    if (!t) return -1;
+    const T116Chunk *c = t116_cache_chunk(t, cache, x >> 4, z >> 4, 4);
+    if (!c) return -1;
+    for (int y = 255; y >= 0; --y) {
+        int b = T116_AT(c, x & 15, y, z & 15);
+        if (b != T116_AIR && b != T116_CAVE_AIR) return y + 1;
+    }
+    return 0;
+}
+
 /* a village / pillager outpost start within 6 chunks: its pieces may block a
  * lake (LakeFeature's village test) and its "beard" reshapes the terrain —
  * neither is modelled: the features there get flag 32 (uncertain). The
@@ -994,8 +1455,9 @@ EXPORT int ssa_features116x(int mc, int64_t seed, int kind, int x1, int z1, int 
                             SsaFeat *out, int cap, int nthreads)
 {
     /* kind 0 dungeons, 1 lava lakes, 2 both; nthreads 1: on the calling thread
-       only (the map runs one block per worker), 0: every core */
-    if (!f116_version_ok(mc)) return 0;
+       only (the map runs one block per worker), 0: every core.
+       (30/10) 1.17.1 too (the map's dungeons: 1.16 terrain + 1.17 carvers, no geodes) */
+    if (!(f116_version_ok(mc) || mc == MC_1_17_1)) return 0;
     int32_t cx1 = (kind ? x1 - 23 : x1) >> 4, cz1 = (kind ? z1 - 23 : z1) >> 4;
     int32_t cx2 = x2 >> 4, cz2 = z2 >> 4;
     int64_t w = (int64_t)cx2 - cx1 + 1, h = (int64_t)cz2 - cz1 + 1;
@@ -1793,6 +2255,14 @@ static int struct_collect(SsaEnv *env, const SsaCond *c, int cond_idx,
             if (stype == Village && c->variant_filter == VARIANT_ABANDONED &&
                 !village_maybe_abandoned(env->mc, env->seed, p.x, p.z))
                 continue;                          /* cheap, before the biome */
+            if (stype == Desert_Well) {            /* (30/10) where the game tests */
+                if (!well_exists(env->mc, env->seed, g, p.x, p.z, NULL)) continue;
+                if (hits < maxn) out[hits] = p;
+                if (xs) { *xs += p.x; *zs += p.z; }
+                hits++;
+                if (stop_at > 0 && hits >= stop_at) goto done;
+                continue;
+            }
             int biome_id = isViableStructurePos(stype, g, p.x, p.z, 0);
             if (!biome_id) continue;
             if (stype == End_City) {
@@ -1971,6 +2441,10 @@ static int eval_climate_area(SsaEnv *env, const SsaCond *c, int cond_idx,
     return 1;
 }
 
+/* (24/10) elytra_spawn.inc.c, included at the end of this file */
+static int ely_eval(SsaEnv *env, const SsaCond *c, int cond_idx);
+static int ely_pass48(SsaEnv *env, const SsaCond *c);
+
 static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
                            int32_t at_x, int32_t at_z,
                            const SsaCond *all_conds, int n_conds,
@@ -2067,7 +2541,27 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
 
     case CTYPE_SPAWN: {
         env_set_dim(env, DIM_OVERWORLD);
-        Pos p = getSpawn(&env->g);
+        Pos p, e = {0, 0};
+        int32_t sxyz[3];
+        if (env->mc >= MC_1_18) {
+            /* (12/11) the spawn lies in the 11 × 11 chunks around the search's point:
+               when none of them can pass, no terrain is needed */
+            e = estimateSpawn(&env->g, NULL);
+            int64_t bx0 = ((int64_t)(e.x >> 4) - 5) * 16, bx1 = ((int64_t)(e.x >> 4) + 5) * 16 + 15;
+            int64_t bz0 = ((int64_t)(e.z >> 4) - 5) * 16, bz1 = ((int64_t)(e.z >> 4) + 5) * 16 + 15;
+            if (rmax_sq) {
+                int64_t dx = at_x < bx0 ? bx0 - at_x : at_x > bx1 ? at_x - bx1 : 0;
+                int64_t dz = at_z < bz0 ? bz0 - at_z : at_z > bz1 ? at_z - bz1 : 0;
+                if (dx*dx + dz*dz >= rmax_sq) return 0;
+            } else if (bx1 < x1 || bx0 > x2 || bz1 < z1 || bz0 > z2) {
+                return 0;
+            }
+        }
+        if (env->mc >= MC_1_18 && spawn_exact_at(&env->g, env->mc, env->seed, e, sxyz)) {
+            p.x = sxyz[0]; p.z = sxyz[2];                  /* (12/11) as in the game */
+        } else {
+            p = getSpawn(&env->g);
+        }
         if (rmax_sq) {
             int64_t dx = p.x - at_x, dz = p.z - at_z;
             if (dx*dx + dz*dz >= rmax_sq) return 0;
@@ -2131,6 +2625,9 @@ static int eval_condition(SsaEnv *env, const SsaCond *c, int cond_idx,
         if (hits < min_count) return 0;
         env_push(env, cond_idx, (int32_t)(xsum/hits), (int32_t)(zsum/hits));
         return 1; }
+
+    case CTYPE_ELYTRA_SPAWN:                     /* (24/10) step = radius, struct_type = ortho */
+        return ely_eval(env, c, cond_idx);
 
     case CTYPE_SPAWN_FEATURE: {                  /* (09/10) struct_type = kind */
         int ok;
@@ -3624,6 +4121,9 @@ static int test_structure_pos_only(SsaEnv *env, const SsaCond *c,
      * rejected the whole 48-bit family (Blocks) or the seed (Incremental
      * pre-pass) → results lost for « no village here » sessions. */
     if (exclude) return 1;
+    /* (30/10) 1.18+ desert wells: placed by the population random of the WHOLE
+     * seed (Xoroshiro): nothing to tell from 48 bits */
+    if (stype == Desert_Well && env->mc >= MC_1_18) return 1;
     int hits = 0;
     for (int32_t rz = rz1; rz <= rz2; rz++) {
         for (int32_t rx = rx1; rx <= rx2; rx++) {
@@ -3761,6 +4261,11 @@ static int ssa_test_seed_pos_only(SsaEnv *env, const SsaCond *conds,
             if (f116_collect(env->seed, c, NULL, x1, z1, x2, z2, rmax_sq, 0, 0, fb, 64, need, NULL) < need)
                 return 0;
         }
+        else if (ctype == CTYPE_ELYTRA_SPAWN) {
+            /* (24/10) cities, ships, the slots, the End terrain: 48 bits */
+            if (!ely_pass48(env, &conds[i]))
+                return 0;
+        }
         else if (ctype == CTYPE_SPAWN_FEATURE && !conds[i].exclude) {
             /* (10/10) the fallback-point feature only depends on the 48 bits
              * (before: never tested here → every family expanded) */
@@ -3815,7 +4320,8 @@ static int ctype_is_dep48(int ctype) {
             ctype == CTYPE_STRUCTURE_END ||
             ctype == CTYPE_SLIME ||
             ctype == CTYPE_SPAWN_FEATURE ||
-            ctype == CTYPE_FEATURE116);
+            ctype == CTYPE_FEATURE116 ||
+            ctype == CTYPE_ELYTRA_SPAWN);
 }
 
 /* Compte les conditions top-level dep48 (structures/slime) et dep64 (le reste).
@@ -3824,13 +4330,21 @@ static int ctype_is_dep48(int ctype) {
  * un OR/NOT en top-level est considéré comme potentiellement dep64 (on ne
  * peut pas garantir que toutes ses branches sont dep48), ce qui forcera la
  * stratégie BLOCKS — correcte dans tous les cas. */
+/* (30/10) a condition on 1.18+ desert wells depends on the whole seed */
+static int CLASSIFY_MC = 0;
+static int cond_is_dep48(const SsaCond *c) {
+    if (c->ctype == CTYPE_STRUCTURE_OW && c->struct_type == Desert_Well && CLASSIFY_MC >= MC_1_18)
+        return 0;
+    return ctype_is_dep48(c->ctype);
+}
+
 static void classify_session(const SsaCond *conds, int n_conds,
                               int *out_n_dep48, int *out_n_dep64) {
     int n48 = 0, n64 = 0;
     for (int i = 0; i < n_conds; i++) {
         if (conds[i].parent_idx != 0 || conds[i].cond_idx <= 0) continue;
         int ct = conds[i].ctype;
-        if (ctype_is_dep48(ct)) {
+        if (cond_is_dep48(&conds[i])) {
             n48++;
         } else if (ct == CTYPE_LOGIC_OR || ct == CTYPE_LOGIC_NOT) {
             /* Un logique top-level : on inspecte ses descendants. S'il ne
@@ -3852,7 +4366,7 @@ static void classify_session(const SsaCond *conds, int n_conds,
                     p = conds[pj].parent_idx;
                 }
                 if (is_desc) {
-                    if (ctype_is_dep48(conds[j].ctype)) sub48++;
+                    if (cond_is_dep48(&conds[j])) sub48++;
                     else if (conds[j].ctype != CTYPE_LOGIC_OR &&
                              conds[j].ctype != CTYPE_LOGIC_NOT) sub64++;
                 }
@@ -3900,7 +4414,8 @@ static int cond_cost_heuristic(const SsaCond *c) {
     double v;
     switch (c->ctype) {
         case CTYPE_SLIME:           v = 1; break;
-        case CTYPE_SPAWN_FEATURE:   v = 300; break;   /* 48 bits first, then the exact terrain (10/10 bis) */
+        case CTYPE_SPAWN_FEATURE:   v = 300; break;
+        case CTYPE_ELYTRA_SPAWN:    v = 1; break;     /* 48 bits cached, then 1-4 gateways (24/10) */   /* 48 bits first, then the exact terrain (10/10 bis) */
         case CTYPE_FEATURE116:      v = 50 + 1500 * area_cells(c, 16); break;    /* exact terrain: ~1.5 ms a chunk (10/10 bis) */
         case CTYPE_LOGIC_OR:        v = 0.2; break;
         case CTYPE_LOGIC_NOT:       v = 0.2; break;
@@ -4569,6 +5084,7 @@ EXPORT SsaEngine *ssa_engine_create(
      * session ne contient que des conditions dep48 (donc indépendantes des bits
      * hauts), où émettre un représentant par famille est correct et suffisant. */
     int n_dep48 = 0, n_dep64 = 0;
+    CLASSIFY_MC = mc;
     classify_session(conds, n_conds, &n_dep48, &n_dep64);
 
     if (requested_mode == SSA_MODE_FAM48 && (eng_flags & 2) && n_dep48 > 0) {
@@ -4820,6 +5336,7 @@ EXPORT int ssa_ctype_structure_end(void)      { return CTYPE_STRUCTURE_END; }
 EXPORT int ssa_ctype_mineshaft(void)          { return CTYPE_MINESHAFT; }
 EXPORT int ssa_ctype_slime(void)              { return CTYPE_SLIME; }
 EXPORT int ssa_ctype_spawn_feature(void)      { return CTYPE_SPAWN_FEATURE; }
+EXPORT int ssa_ctype_elytra_spawn(void)       { return CTYPE_ELYTRA_SPAWN; }
 EXPORT int ssa_ctype_feature116(void)         { return CTYPE_FEATURE116; }
 EXPORT int ssa_ctype_spawn(void)              { return CTYPE_SPAWN; }
 EXPORT int ssa_ctype_biome_filter(void)       { return CTYPE_BIOME_FILTER; }
@@ -5223,6 +5740,69 @@ EXPORT int ssa_struct_collect_one(const SsaCond *cond, int mc, int large, int64_
 /* (18/10) Map helpers for the End. g: an End generator of the seed.
  * ssa_end_city_filter keeps, in place, the (x, z) pairs whose End city has
  * a high enough island (isViableEndCityTerrain) and returns how many stay. */
+/* (29/10) cubiomes_wrap.find_structures_in_box in one call (the map: a 4096-block
+ * block holds 65 536 buried-treasure regions — the Python loop held the GIL and
+ * the map stuttered). Same order: regions sorted by |r - centre| (ties: lower r
+ * first), rx outer, rz inner; stops at max_count. Returns the count. */
+static int sfb_cmp_c;
+static int sfb_cmp(const void *a, const void *b)
+{
+    int ra = *(const int *)a, rb = *(const int *)b;
+    int da = abs(ra - sfb_cmp_c), db = abs(rb - sfb_cmp_c);
+    if (da != db) return da < db ? -1 : 1;
+    return ra < rb ? -1 : (ra > rb);
+}
+static void sfb_order(int *r, int lo, int hi, int c)
+{
+    /* stable sort by |r - c| of an ascending range: hand-merged, no qsort state */
+    int n = hi - lo + 1, k = 0;
+    r[k++] = c;
+    for (int d = 1; k < n; d++) {
+        if (c - d >= lo) r[k++] = c - d;
+        if (c + d <= hi && k < n) r[k++] = c + d;
+    }
+    (void)sfb_cmp;
+}
+static inline int sfb_floordiv(int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
+
+EXPORT int ssa_find_structures_box(Generator *g, int stype, int mc, uint64_t seed,
+                                   int region_blocks, int x1, int z1, int x2, int z2,
+                                   int verify, int flags, int32_t *out, int max_count)
+{
+    int rx0 = sfb_floordiv(x1, region_blocks) - 1, rx1 = sfb_floordiv(x2, region_blocks) + 1;
+    int rz0 = sfb_floordiv(z1, region_blocks) - 1, rz1 = sfb_floordiv(z2, region_blocks) + 1;
+    int cx = sfb_floordiv(sfb_floordiv(x1 + x2, 2), region_blocks);
+    int cz = sfb_floordiv(sfb_floordiv(z1 + z2, 2), region_blocks);
+    int nx = rx1 - rx0 + 1, nz = rz1 - rz0 + 1;
+    if (nx <= 0 || nz <= 0) return 0;
+    int *ox = (int *)malloc(sizeof(int) * (size_t)(nx + nz));
+    if (!ox) return -1;
+    int *oz = ox + nx;
+    /* centre clamped into the range keeps the |r - c| order */
+    if (cx < rx0 || cx > rx1 || cz < rz0 || cz > rz1) {
+        /* generic: insertion by distance (rare: the centre is always inside) */
+        for (int i = 0; i < nx; i++) ox[i] = rx0 + i;
+        for (int i = 0; i < nz; i++) oz[i] = rz0 + i;
+        sfb_cmp_c = cx; qsort(ox, nx, sizeof(int), sfb_cmp);
+        sfb_cmp_c = cz; qsort(oz, nz, sizeof(int), sfb_cmp);
+    } else {
+        sfb_order(ox, rx0, rx1, cx);
+        sfb_order(oz, rz0, rz1, cz);
+    }
+    int n = 0;
+    for (int i = 0; i < nx && n < max_count; i++) {
+        for (int j = 0; j < nz && n < max_count; j++) {
+            Pos p;
+            if (!getStructurePos(stype, mc, seed, ox[i], oz[j], &p)) continue;
+            if (!(x1 <= p.x && p.x <= x2 && z1 <= p.z && p.z <= z2)) continue;
+            if (verify && !isViableStructurePos(stype, g, p.x, p.z, flags)) continue;
+            out[2 * n] = p.x; out[2 * n + 1] = p.z; n++;
+        }
+    }
+    free(ox);
+    return n;
+}
+
 EXPORT int ssa_end_city_filter(Generator *g, int32_t *xz, int n)
 {
     if (!g || !xz || n <= 0) return 0;
@@ -5391,9 +5971,9 @@ EXPORT int ssa_struct_pieces(int stype, int mc, uint64_t seed, int32_t x, int32_
         yoff = isViableEndCityTerrain(&g, &sn, x, z);
         /* (18/10) the game starts the city at block 7 of its chunk from 1.18
          * (EndCityStructure: chunkPos.getBlockX(7) / getBlockZ(7), read in the
-         * 26.3 jar; 1.17 and before: + 8). cubiomes' getEndCityPieces keeps
+         * 26.3 jar; 1.18.2 and before: + 8). cubiomes' getEndCityPieces keeps
          * the old + 8: every piece one block too far east and south */
-        if (mc >= MC_1_18) xzoff = -1;
+        if (mc >= MC_1_19_2) xzoff = -1;     /* (30/10) 1.18.2 still + 8 (its End server) */
     }
     else if (stype == Fortress)
         n = getFortressPieces(pc, CAP, mc, seed, x >> 4, z >> 4);
@@ -6023,3 +6603,93 @@ static int64_t expand_lows_impl(
     return kept;
 }
 
+/* (24/10) Elytra on End spawn */
+#include "elytra_spawn.inc.c"
+
+/* (07/11) Loot finder: the tries of a structure inside a disc, and their
+ * viability.
+ *
+ * ssa_struct_candidates: getStructurePos for every region of the square around
+ * the disc (same loop order as loot_finder.positions), keeping only those
+ * inside the disc. Returns the count; at most `max` pairs go to xz.
+ *
+ * ssa_struct_viable: isViableStructurePos(st, g, x, z, 0), except for End
+ * cities, which take a pruned path. Their biome is midlands or highlands iff
+ * some island cell gives u = ds * v^2 <= 10000 (getEndBiome). v (9..21)
+ * depends only on the cell, so the simplex sample (the costly part) is only
+ * taken for cells that could reach the threshold. The result is identical. */
+EXPORT int ssa_struct_candidates(int st, int mc, uint64_t seed, int reg,
+        int cx, int cz, int R, int *xz, int max)
+{
+    int n = 0;
+    int64_t r2 = (int64_t)R * R;
+    int rx0 = (int) floor((double)(cx - R) / reg) - 1, rx1 = (int) floor((double)(cx + R) / reg) + 1;
+    int rz0 = (int) floor((double)(cz - R) / reg) - 1, rz1 = (int) floor((double)(cz + R) / reg) + 1;
+    for (int rx = rx0; rx < rx1; rx++)
+        for (int rz = rz0; rz < rz1; rz++)
+        {
+            Pos p;
+            if (!getStructurePos(st, mc, seed, rx, rz, &p))
+                continue;
+            int64_t dx = p.x - cx, dz = p.z - cz;
+            if (dx*dx + dz*dz > r2)
+                continue;
+            if (n < max) { xz[2*n] = p.x; xz[2*n+1] = p.z; }
+            n++;
+        }
+    return n;
+}
+
+static int ssa_end_city_biome_ok(const EndNoise *en, int cx, int cz)
+{
+    static const uint16_t ds[26] = {
+          625, 529, 441, 361, 289, 225, 169, 121,  81,  49,  25,   9,   1,
+            1,   9,  25,  49,  81, 121, 169, 225, 289, 361, 441, 529, 625,
+    };
+    int64_t c2 = (int64_t)cx * cx + (int64_t)cz * cz;
+    if (c2 <= 4096)
+        return 0;                                   /* the_end */
+    int64_t hx = 2 * (int64_t)cx + 1, hz = 2 * (int64_t)cz + 1;
+    if (en->mc > MC_1_13)
+    {
+        int64_t rsq = hx * hx + hz * hz;
+        if ((int)rsq < 0)
+            return 0;                               /* end_barrens */
+    }
+    int64_t ox = hx / 2 - cx, oz = hz / 2 - cz;
+    const uint16_t *pi = ds + (hx < 0), *pj = ds + (hz < 0);
+    for (int j = 0; j < 25; j++)
+    {
+        int64_t rz = cz + oz + j - 12;
+        for (int i = 0; i < 25; i++)
+        {
+            uint32_t d = (uint32_t) pi[i] + pj[j];
+            if (d * 81 > 10000)
+                continue;                           /* even v = 9 is too far */
+            int64_t rx = cx + ox + i - 12;
+            uint64_t rsq = rx * rx + rz * rz;
+            if (rsq <= 4096)
+                continue;
+            uint16_t v = (unsigned int)(
+                    fabsf((float)rx) * 3439.0f + fabsf((float)rz) * 147.0f
+                ) % 13 + 9;
+            v *= v;
+            if (d * v > 10000)
+                continue;
+            if (sampleSimplex2D(&en->perlin, rx, rz) < -0.9f)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+EXPORT int ssa_struct_viable(int st, Generator *g, int x, int z)
+{
+    if (st == End_City && g->dim == DIM_END)
+    {
+        if (g->mc <= MC_1_8)
+            return 0;
+        return ssa_end_city_biome_ok(&g->en, x >> 4, z >> 4);
+    }
+    return isViableStructurePos(st, g, x, z, 0) != 0;
+}

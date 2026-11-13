@@ -275,7 +275,6 @@ def search_chunk(args):
 
     from stronghold_eyes import count_stronghold_eyes, get_stronghold_portal_full
     from stronghold_eyes import _inflate_arg, topy_of
-    from cubiomes_wrap import StrongholdIter as _SHIter
 
     lib = _get_cubiomes()
     g = _get_gaider_c()

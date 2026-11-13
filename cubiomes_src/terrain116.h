@@ -72,6 +72,10 @@ typedef struct {
     int ox, oy, oz;           /* lake box origin (after the drop) */
 } T116Feat;
 
+/* (30/10) capture the dungeons chunk (cx, cz) places (16 int64 each, see terrain116.c) */
+void t116_dungeon_capture(int cx, int cz, int64_t *out, int max);
+int  t116_dungeon_capture_end(void);
+
 typedef struct T116Cache T116Cache;
 T116Cache *t116_cache_new(int cap);
 void t116_cache_free(T116Cache *c);
@@ -86,6 +90,8 @@ int t116_dungeons_maybe(const T116 *t, int cx, int cz);
 /* getBiomeAt(g, 4, x, 0, z), memoised per thread (same answer) */
 int t116_biome4(const Generator *g, int x, int z);
 /* want: 1 lakes only (cheaper), 3 lakes + mineshafts + dungeons */
+int t116_carved(const T116 *t, T116Cache *cache, int cx, int cz, T116Chunk *result);
+int t116_populate_nb(const T116 *t, T116Cache *cache, int cx, int cz, int mask, T116Chunk *result);
 int t116_populate_ex(const T116 *t, T116Cache *cache, int cx, int cz, T116Feat *out, int cap,
                      T116Chunk *result, int want);
 #endif

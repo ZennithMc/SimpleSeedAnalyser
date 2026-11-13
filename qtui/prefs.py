@@ -33,9 +33,10 @@ CHOICES = {
         "100000",
         [("100000", "Pause at 100 000 results and ask"),
          ("1000000", "Pause at 1 000 000 results and ask"),
-         ("10000000", "Only at 10 000 000 (the maximum)")],
+         ("10000000", "Pause at 10 000 000 results and ask"),
+         ("100000000", "Only at 100 000 000 (the maximum)")],
         "A search that finds that many results pauses itself: the conditions are probably\n"
-        "too broad, and millions of results make SSA slow."),
+        "too broad. Each result takes about 20 bytes of memory (10 M ≈ 200 MB)."),
     "topy_family": (
         "ask",
         [("ask", "Ask every time"), ("switch", "Always switch to 48-bit family"),
@@ -69,6 +70,9 @@ VALUES = {
     "inertia": True,                # the map keeps sliding after a drag
     "zoom_speed": 1.0,              # wheel zoom step factor
     "struct_max_bpp": 48.0,         # structures shown up to this zoom (blocks / pixel)
+    "struct_max_bpp_by": "",        # (31/10) per structure: "key=bpp;key=bpp" ("" = all as above)
+    "struct_boxes": True,           # (22/10) the footprint box of each structure when zoomed in
+    "hide_structs_on_noise": False, # (22/10) no structures over a noise / height layer
     "use_gpu": True,                # RESTART: NVIDIA GPU libraries
     "ui_scale": 100,                # RESTART: interface scale in %
     "java_home": "",                # JDK 17 for the Minecraft check ("" = automatic)
@@ -166,3 +170,20 @@ def notify_done(window) -> None:
             QApplication.beep()
     except Exception:
         pass
+
+
+def struct_limits() -> dict:
+    """(31/10) {structure key: blocks / pixel} from struct_max_bpp_by."""
+    raw = get("struct_max_bpp_by")
+    got = _CACHE.get(("__limits", raw))
+    if got is None:
+        got = {}
+        for part in raw.split(";"):
+            k, _s, v = part.partition("=")
+            try:
+                if k.strip():
+                    got[k.strip()] = float(v)
+            except ValueError:
+                pass
+        _CACHE[("__limits", raw)] = got
+    return got

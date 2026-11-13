@@ -111,7 +111,7 @@ _SSA_TO_F: Dict[str, int] = {
 
 # Conditions SSA-only : sauvegardées en #SSA: <json>, ignorées par cubiomes
 _SSA_ONLY = {"crunchiness", "mountain_ring", "mushroom_island", "cherry_ring", "dungeon", "lava_lake",
-             "spawn_feature116",
+             "spawn_feature116", "elytra_spawn",
              "climate_center"}   # coarse flood fill: no cubiomes-viewer equivalent (01/10)
 
 _SCALE_TO_F_CLEAN = {1: F_BIOME, 4: F_BIOME_4, 16: F_BIOME_16,
@@ -210,9 +210,10 @@ def write_session_file(
         lines.append(f"#Desc: #SSA: {full}")
         n_ssa += 1
 
-    if results:
-        for sd in results:
-            lines.append(str(sd))
+    if results is not None and len(results):
+        if hasattr(results, "tolist"):             # (22/10) a numpy array of seeds
+            results = results.tolist()
+        lines.extend(map(str, results))
 
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")

@@ -28,8 +28,8 @@ import os
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QFont, QIcon, QImage, QKeySequence, QPainter,
                            QPainterPath, QPen, QPixmap, QPolygonF, QShortcut)
-from .widgets import user_path, remember_path
-from PySide6.QtWidgets import (QColorDialog, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+from .widgets import user_path
+from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
                                QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QToolButton,
                                QVBoxLayout, QWidget)
@@ -346,6 +346,7 @@ class _StopRow(QWidget):
     def _val(self, v):
         self.ed.stops[self.i]["pos"] = round(pos_of_value(self.ed.noise, v / self.k), 4)
         self.ed.edited(final=True, rows=False)
+        self.ed.reorder_rows()                 # (22/10) moves to its place while typing
 
     def _hex(self):
         c = QColor(self.hex.text().strip())
@@ -575,6 +576,23 @@ class PaletteEditor(QDialog):
         add.clicked.connect(self._add_in_gap)
         self.rows_lay.addWidget(add)
 
+    def reorder_rows(self):
+        """(22/10) The stop rows in value order, WITHOUT rebuilding them (the
+        field being typed in keeps the focus): a stop whose value is changed
+        goes to its place at once (before: only after reopening the editor)."""
+        rows = getattr(self, "rows", None)
+        if not rows:
+            return
+        order = sorted(rows, key=lambda i: self.stops[i]["pos"] if i < len(self.stops) else 9)
+        cur = [self.rows_lay.itemAt(k).widget() for k in range(self.rows_lay.count())]
+        want = [rows[i] for i in order]
+        if [w for w in cur if w in want] == want:
+            return
+        for w in want:
+            self.rows_lay.removeWidget(w)
+        for k, w in enumerate(want):
+            self.rows_lay.insertWidget(k, w)
+
     def _select_row(self, i):
         for k, r in getattr(self, "rows", {}).items():
             r.setStyleSheet(f"background: {theme.BG3}; border-radius: 6px;" if k == i else "")
@@ -643,10 +661,21 @@ class PaletteEditor(QDialog):
     def pick_color(self, i):
         if not (0 <= i < len(self.stops)):
             return
-        c = QColorDialog.getColor(QColor(*self.stops[i]["rgb"]), self, "Stop colour")
-        if c.isValid():
+        # (22/10) SSA's own picker, the bar / map following the colour live
+        from .color_picker import pick_color as _pick
+        start = tuple(self.stops[i]["rgb"])
+
+        def live(c):
+            if i < len(self.stops):
+                self.stops[i]["rgb"] = (c.red(), c.green(), c.blue())
+                self.edited(final=False, rows=False)
+        c = _pick(self, QColor(*start), "Stop colour", live=live)
+        if c is not None:
             self.stops[i]["rgb"] = (c.red(), c.green(), c.blue())
             self.edited(final=True)
+        elif i < len(self.stops):
+            self.stops[i]["rgb"] = start
+            self.edited(final=False, rows=False)
 
     def _reverse(self):
         """Mirror on the colour axis (the bar), extremes included."""

@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-tools/build_native.py — build UNIQUE des DLL CUDA de SSA (poste de développement).
+tools/build_native.py — builds SSA's native libraries (development machine).
 
-    py tools/build_native.py              reconstruit toutes les unités CUDA (+ terrain)
-    py tools/build_native.py --unit X     une seule (gaider_cuda, structure_cuda, noise_gpu, topy_gpu)
-    py tools/build_native.py --check      indique seulement ce qui est à jour / à refaire
-    py tools/build_native.py --cubiomes   reconstruit libcubiomes.dll (moteur C, gcc)
-                                          + gaider_layouts.dll (strongholds, g++)
-                                          — SSA doit être fermé
-    py tools/build_native.py --layouts    reconstruit seulement gaider_layouts.dll
+    py tools/build_native.py              rebuild every CUDA unit (+ terrain)
+    py tools/build_native.py --unit X     one unit only (gaider_cuda, structure_cuda, noise_gpu, topy_gpu, tree_cuda)
+    py tools/build_native.py --check      only say what is up to date / to rebuild
+    py tools/build_native.py --cubiomes   rebuild libcubiomes (C engine, gcc)
+                                          + gaider_layouts (strongholds, g++)
+                                          + treecrack (Seedcracking, g++)
+                                          + lootvm (loot finder, gcc)
+                                          — close SSA first
+    py tools/build_native.py --layouts    rebuild gaider_layouts only
+    py tools/build_native.py --lootvm     rebuild lootvm only
 
-Chaque DLL est compilée UNE fois pour toutes les cartes supportées (fatbin) :
+Each CUDA library is compiled ONCE for every supported card (fatbin):
   sm_75 (RTX 20 / GTX 16), sm_80 (A100), sm_86 (RTX 30), sm_89 (RTX 40),
-  sm_120 (RTX 50) + PTX compute_120 (cartes futures, compilé par le pilote).
-Validé sur RTX 5080 : résultats et performances identiques à l'ancienne DLL sm_120.
+  sm_120 (RTX 50) + PTX compute_120 (future cards, compiled by the driver).
 
-Le build se fait dans un fichier temporaire puis remplace la DLL d'un coup ;
-si SSA tourne encore (DLL verrouillée), l'ancienne DLL reste intacte.
-Le résultat est décrit dans native_build.json (lu par native_libs.py).
-Utilisateur final : n'a besoin que du pilote NVIDIA (≥ 580), rien d'autre.
+The build goes to a temporary file that then replaces the library in one step;
+if SSA is still running (library locked), the old library stays untouched.
+The result is described in native_build.json (read by native_libs.py).
+End users only need the NVIDIA driver (580+), nothing else.
 """
 from __future__ import annotations
 
@@ -48,6 +50,7 @@ MAIN_SRC = {  # fichier compilé par nvcc (les autres sources sont des #include)
     "structure_cuda": "cubiomes_src/structure_cuda.cu",
     "noise_gpu": "cubiomes_src/noise_gpu.cu",
     "topy_gpu": "cubiomes_src/topy_gpu.cu",
+    "tree_cuda": "cubiomes_src/tree_cuda.cu",
 }
 
 
@@ -85,14 +88,14 @@ def build_unit(unit: str) -> tuple[bool, str]:
         log = ((r.stderr or b"") + (r.stdout or b"")).decode(errors="replace")
         if os.path.exists(tmp):
             os.remove(tmp)
-        return False, f"nvcc a échoué ({dt:.0f} s) :\n{log[-3000:]}"
+        return False, f"nvcc failed ({dt:.0f} s):\n{log[-3000:]}"
     try:
         os.replace(tmp, out)
     except OSError as e:
         os.remove(tmp)
-        return False, (f"impossible de remplacer {os.path.basename(out)} ({e}) — "
-                       f"ferme SSA puis relance le build")
-    return True, f"{os.path.basename(out)} construite en {dt:.0f} s ({os.path.getsize(out)//1024} Ko)"
+        return False, (f"cannot replace {os.path.basename(out)} ({e}) — "
+                       f"close SSA and run the build again")
+    return True, f"{os.path.basename(out)} built in {dt:.0f} s ({os.path.getsize(out)//1024} KB)"
 
 
 def write_manifest(done: dict, nvcc: str):
@@ -124,21 +127,21 @@ def build_cubiomes() -> int:
                 os.remove(old)
             os.replace(out, old)
         except OSError as e:
-            print(f"[FAIL] {os.path.basename(out)} verrouillée (SSA encore ouvert ?) : {e}")
+            print(f"[FAIL] {os.path.basename(out)} is locked (is SSA still open?): {e}")
             return 1
     t0 = time.time()
     try:
         cw._compile_cubiomes()
         ok = cw._is_valid_lib(out)
     except Exception as e:
-        print(f"[FAIL] libcubiomes : {e}")
+        print(f"[FAIL] libcubiomes: {e}")
         ok = False
     if not ok:
         if os.path.exists(old):
             os.replace(old, out)
-        print("[FAIL] libcubiomes : ancienne bibliothèque restaurée")
+        print("[FAIL] libcubiomes: the old library was restored")
         return 1
-    print(f"[ OK ] {os.path.basename(out)} reconstruite en {time.time() - t0:.0f} s "
+    print(f"[ OK ] {os.path.basename(out)} rebuilt in {time.time() - t0:.0f} s "
           f"(ancienne : {os.path.basename(old)})")
     return 0
 
@@ -155,7 +158,7 @@ def build_layouts() -> int:
                 os.remove(old)
             os.replace(out, old)
         except OSError as e:
-            print(f"[FAIL] {os.path.basename(out)} verrouillée (SSA encore ouvert ?) : {e}")
+            print(f"[FAIL] {os.path.basename(out)} is locked (is SSA still open?): {e}")
             return 1
     t0 = time.time()
     p = gl._compile()
@@ -165,7 +168,7 @@ def build_layouts() -> int:
             import ctypes
             ctypes.CDLL(out).max_y_batch_arr      # loads and has the Top Y entry point
         except Exception as e:
-            print(f"[FAIL] gaider_layouts : {e}")
+            print(f"[FAIL] gaider_layouts: {e}")
             ok = False
     if not ok:
         if os.path.exists(out):
@@ -175,11 +178,35 @@ def build_layouts() -> int:
                 pass
         if os.path.exists(old):
             os.replace(old, out)
-        print(f"[FAIL] gaider_layouts : {gl._LIB_LOAD_ERROR or 'build failed'} — "
-              "ancienne bibliothèque restaurée")
+        print(f"[FAIL] gaider_layouts: {gl._LIB_LOAD_ERROR or 'build failed'} — "
+              "the old library was restored")
         return 1
-    print(f"[ OK ] {os.path.basename(out)} reconstruite en {time.time() - t0:.0f} s "
+    print(f"[ OK ] {os.path.basename(out)} rebuilt in {time.time() - t0:.0f} s "
           f"(ancienne : {os.path.basename(old)})")
+    return 0
+
+
+def build_treecrack() -> int:
+    """(05/11) Rebuild treecrack (Seedcracking, CPU side: g++)."""
+    import tree_crack as tc
+    t0 = time.time()
+    p = tc._compile()
+    if p is None:
+        print(f"[FAIL] {tc._lib_name()}: {tc._LIB_ERR}")
+        return 1
+    print(f"[ OK ] {os.path.basename(p)} rebuilt in {time.time() - t0:.0f} s")
+    return 0
+
+
+def build_lootvm() -> int:
+    """(07/11) Rebuild lootvm (the loot finder's chests in C: gcc)."""
+    import loot_native as ln
+    t0 = time.time()
+    p = ln._compile()
+    if p is None:
+        print(f"[FAIL] {ln._lib_name()}: {ln._LIB_ERR}")
+        return 1
+    print(f"[ OK ] {os.path.basename(p)} rebuilt in {time.time() - t0:.0f} s")
     return 0
 
 
@@ -187,14 +214,18 @@ def main():
     args = sys.argv[1:]
     if "--layouts" in args:
         return build_layouts()
+    if "--lootvm" in args:
+        return build_lootvm()
     if "--cubiomes" in args:
         r = build_cubiomes()
-        return build_layouts() or r
+        r = build_layouts() or r
+        r = build_lootvm() or r
+        return build_treecrack() or r
     units = list(MAIN_SRC)
     if "--unit" in args:
         u = args[args.index("--unit") + 1]
         if u not in MAIN_SRC:
-            print(f"unité inconnue : {u} (choix : {', '.join(MAIN_SRC)})")
+            print(f"unknown unit: {u} (choose from: {', '.join(MAIN_SRC)})")
             return 2
         units = [u]
     if "--check" in args:
@@ -204,7 +235,7 @@ def main():
         return 0
     nvcc = nvcc_version()
     if nvcc is None:
-        print("nvcc introuvable : installe le CUDA Toolkit 13.x et ouvre un nouveau terminal.")
+        print("nvcc not found: install the CUDA Toolkit 13.x and open a new terminal.")
         return 2
     print(f"[build] nvcc {nvcc}")
     done, failed = {}, []
@@ -217,21 +248,21 @@ def main():
             failed.append(u)
     if done:
         write_manifest(done, nvcc)
-        print(f"[build] {nl.MANIFEST_NAME} mis à jour")
+        print(f"[build] {nl.MANIFEST_NAME} updated")
     if "--unit" not in args:
         # Terrain (Exact-Y) : encore construit par terrain.py (gcc pour terrain.dll,
         # nvcc pour terrain_gpu.dll) — ne reconstruit que si les sources ont changé.
         try:
             import terrain
             p = terrain._compile()
-            print(("[ OK ] " if p else "[FAIL] ") + f"terrain (CPU) : {p or terrain._ERR[:800]}")
+            print(("[ OK ] " if p else "[FAIL] ") + f"terrain (CPU): {p or terrain._ERR[:800]}")
             if p is None:
                 failed.append("terrain")
             g = terrain._compile_load_gpu()
-            print(("[ OK ] " if g else "[WARN] ") + "terrain_gpu (carte Exact-Y) : "
-                  + ("prêt" if g else "non construit (la carte utilisera le CPU)"))
+            print(("[ OK ] " if g else "[WARN] ") + "terrain_gpu (Exact-Y map): "
+                  + ("ready" if g else "not built (the map will use the CPU)"))
         except Exception as e:
-            print(f"[FAIL] terrain : {e}")
+            print(f"[FAIL] terrain: {e}")
             failed.append("terrain")
     return 1 if failed else 0
 

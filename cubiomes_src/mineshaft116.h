@@ -70,6 +70,13 @@ int  ms116_has_start(const T116 *t, int cx, int cz);
 /* build the start of chunk (cx, cz): returns 0 if none.  Free with ms116_start_free. */
 int  ms116_start(const T116 *t, int cx, int cz, Ms116Start *s);
 void ms116_start_free(Ms116Start *s);
+/* (29/10) record the chest minecarts chunk (cx, cz) places: 6 int64 each */
+void ms116_capture(int cx, int cz, int64_t *out, int max);
+/* (29/10) 1.18+ normal (not badlands) start, moved below the sea level to -64 */
+int ms118_start_normal(uint64_t seed, int cx, int cz, int extra_double, Ms116Start *s);
+int  ms116_capture_end(void);
+void ms116_removed_mode(int on);
+void ms116_spider_reset(int all);
 
 /* place, as chunk (cx, cz)'s population does, every mineshaft piece intersecting
  * the chunk: returns the number of pieces generated (failed liquid checks not

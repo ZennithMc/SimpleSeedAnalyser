@@ -492,8 +492,6 @@ class DrawPage(QWidget):
         g.addLayout(sr, 6, 1)
         g.setColumnStretch(1, 1)
         v.addLayout(g)
-        v.addWidget(body("On the map: drag a corner of the square to resize it, its border to "
-                         "move it. Outside the square, dragging moves the map.", muted=True, small=True))
         grow = QHBoxLayout()
         self.grid_lines = QCheckBox("Grid lines"); self.grid_lines.setChecked(True)
         self.grid_lines.toggled.connect(lambda on: (setattr(self.map, "show_grid", on), self.map.update()))
@@ -628,9 +626,6 @@ class DrawPage(QWidget):
         v.addWidget(self.list, 1)
         self.stale_lbl = body("", small=True); self.stale_lbl.setStyleSheet(f"color: {theme.WARN}; font-size: 8pt;")
         self.stale_lbl.hide(); v.addWidget(self.stale_lbl)
-        v.addWidget(body("Click a result: the seed is loaded and the drawing shown where it "
-                         "fits — green cells match, red ones do not. Paint again to edit.",
-                         muted=True, small=True))
         return right
 
     # ═══ run bar ════════════════════════════════════════════════════════════

@@ -15,7 +15,7 @@ Public API:
 
 Self-test (on a CUDA machine):  py noise_gpu.py
 """
-import os, ctypes, platform, subprocess, time, threading
+import os, ctypes, platform, time, threading
 import numpy as np
 
 # Serializes _load(): concurrent callers (the 12 map tile workers, the GPU search
@@ -190,7 +190,7 @@ def _note_err(rc):
     global _ERR
     try:
         import native_libs as _nl
-        _ERR = f"noise_gpu rc={rc} : {_nl.last_error(_LIB) or 'erreur CUDA'}"
+        _ERR = f"noise_gpu rc={rc}: {_nl.last_error(_LIB) or 'CUDA error'}"
     except Exception:
         _ERR = f"noise_gpu rc={rc}"
     print(f"[noise_gpu] {_ERR}", flush=True)

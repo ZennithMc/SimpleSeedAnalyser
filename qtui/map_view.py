@@ -19,7 +19,8 @@ import math
 import time
 
 from PySide6.QtCore import QElapsedTimer, QObject, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtGui import (QColor, QFont, QGuiApplication, QImage, QPainter, QPainterPath, QPen,
+                           QPixmap)
 from PySide6.QtWidgets import QInputDialog, QLabel, QMenu, QToolButton, QVBoxLayout, QWidget
 
 import cubiomes_wrap as cw
@@ -40,12 +41,66 @@ def _struct_max():
         return max(4.0, min(256.0, float(prefs.get("struct_max_bpp"))))
     except Exception:
         return STRUCT_MAX_BPP
+def _struct_limit(key):
+    """(31/10) the zoom (blocks / pixel) up to which `key`'s icons show: its own
+    Settings value, else the global one."""
+    try:
+        from . import prefs
+        v = prefs.struct_limits().get(key)
+        if v is not None:
+            return max(1.0, min(256.0, float(v)))
+    except Exception:
+        pass
+    return _struct_max()
+
+
+def _struct_max_any():
+    """The largest of the limits (the structures are computed up to it)."""
+    try:
+        from . import prefs
+        return max([_struct_max()] + [max(1.0, min(256.0, float(v))) for v in prefs.struct_limits().values()])
+    except Exception:
+        return _struct_max()
+
+
+def _pref(key, default):
+    """(22/10) a Settings value, or the default if prefs is unavailable."""
+    try:
+        from . import prefs
+        return prefs.get(key)
+    except Exception:
+        return default
+
+
 BOX_MAX_BPP = 4.0                      # real footprints of the structures from this zoom
+def _jig_mc(mc):
+    try:
+        import jigsaw
+        return jigsaw.MC_FIRST <= int(mc) <= jigsaw.MC_LAST
+    except Exception:
+        return False
+
+
 CV_PIECE_TYPES = ("end_city", "fortress", "bastion")   # (18/10) cubiomes-viewer red boxes
 CV_BB_MAX_BPP = 2.0                    # cubiomes-viewer: blocks2pix > 0.5
 END_SHIP_PIECE = 12                    # cubiomes finders.h End city piece enum (END_SHIP)
 FORTRESS_BRIDGE_SPAWNER = 5            # cubiomes finders.h piece enum (BRIDGE_SPAWNER)
+JIG_MAX_BPP = 1.0                      # (24/10) village / outpost pieces from this zoom
+MS_MAX_BPP = 2.0                       # (29/10) mineshaft corridors from this zoom
 PIECES_MAX_BPP = 2.0                   # stronghold pieces from this zoom (03/10)
+# (29/10) zoomed out (only icons): the icons of each 4096-block structure block are
+# drawn once into a pixmap and blitted (thousands of icons: 180 ms → a few ms a frame)
+ICON_CACHE_BPP = 4.01                  # above BOX_MAX_BPP: icons only
+# (31/10) drawing order of the structures, deepest first (the rest: 0, the surface)
+DRAW_DEPTH = {"ancient_city": -6, "trial_chambers": -5, "mineshaft": -4, "buried_treasure": -3,
+              "ocean_ruin": -2, "shipwreck": -2, "monument": -2, "bastion": -1, "fortress": -1}
+PLAN_MAX_BPP = 4.0                     # (31/10) village / outpost / camp top views from this zoom
+PLAN_HD_BPP = 0.5            # (05/11) ≥ 2 px / block: the plans' block textures
+PLAN_CHEST_BPP = 1.0                   # their loot chests from this zoom
+CHEST_COL = QColor(255, 201, 40)       # the loot chests (yellow)
+ANIM_ICON_BUDGET = 3000      # (31/10) icons drawn one by one while zooming (more: scaled blocks)
+ICON_CACHE_BYTES = 256 << 20
+PIECE_MARGIN = 160                     # blocks: the farthest piece / box from its start
 ARROW_UNIFORM = {"White": "#f2f2f2", "Black": "#111111", "Cyan": "#33e0ff", "Yellow": "#ffe14d"}
 
 
@@ -258,7 +313,7 @@ class MapView(QWidget):
         lay.addWidget(self._tool("minus", "Zoom out  (−)", lambda: self.zoom_smooth(2)))
         lay.addSpacing(4)
         lay.addWidget(self._tool("home", "Centre on 0, 0  (Home)", lambda: self.center_on(0, 0)))
-        lay.addWidget(self._tool("target", "Centre on spawn", self.center_on_spawn))
+        # (22/10) « Centre on spawn » removed: the spawn is near 0, 0 (the method stays)
         self._ruler = None
         if self.MEASURE:
             lay.addSpacing(4)
@@ -458,6 +513,9 @@ class MapView(QWidget):
         self._paint_origin(p)
         self._paint_arrows(p)
         self._icon_hits = []
+        self._icon_hits_w = []
+        self._chest_hits = []                 # (31/10) (sx, sy, key, structure x, z, chest)
+        self._area_hits = []                  # (31/10) (x0, z0, x1, z1, key, x, z, plan | None)
         self._paint_structures(p)
         self._paint_selected(p)
         self._paint_zones(p)
@@ -489,6 +547,11 @@ class MapView(QWidget):
         tiles.sort(key=lambda t: (t[0] + 0.5 - ctx) ** 2 + (t[1] + 0.5 - ctz) ** 2)
         return tiles, span
 
+    def noise_shown(self):
+        """(22/10) a noise / height layer is drawn over the biomes right now."""
+        n = self.ov.get("noise")
+        return bool(n) and n != "Off" and (self.dim == 0 or self._end_height())
+
     def _end_height(self):
         """(18/10) « Approx height » in the End = the island surface, like
         cubiomes-viewer's height view there (the climate noises: overworld)."""
@@ -509,16 +572,22 @@ class MapView(QWidget):
         s = self._tile_scale(noise)
         animating = self._anim.isActive()
         tiles, span = self._visible_tiles(s)
+        # (31/10) Exact Y (heavy): the tiles nearest the centre first, nothing asked
+        # while the zoom animates (the scales it passes through are not wanted)
+        exact = noise and self.ov.get("noise") == "Exact Y"
+        if exact and animating:
+            fetch = False
         for i, (tx, tz) in enumerate(tiles):
             sx, sy = self.to_screen(tx * span, tz * span)
             size = span / self.bpp
             target = QRectF(sx, sy, size + 0.6, size + 0.6)       # +0.6: no seams
-            pm = self._get(noise, s, tx, tz, (10 if i < 4 else 6) + boost, fetch)
+            prio = (max(2, 30 - i) if exact else (10 if i < 4 else 6)) + boost
+            pm = self._get(noise, s, tx, tz, prio, fetch)
             if pm is not None:
                 p.drawPixmap(target, pm, QRectF(pm.rect()))
             else:
                 self._paint_fallback(p, noise, s, tx, tz, target)
-        if not animating and fetch:                                # prefetch ring
+        if not animating and fetch and not exact:                  # prefetch ring
             ring, _ = self._visible_tiles(s, ring=1)
             seen = set(tiles)
             for (tx, tz) in ring:
@@ -674,12 +743,27 @@ class MapView(QWidget):
     F116_DOT_BPP = F116_MAX_BPP                           # (legend, older callers)
 
     def f116_yrange(self):
-        lo, hi = self.ov.get("f116_y", (0, 255))
+        lo, hi = self.ov.get("f116_y", (-64, 319))
+        if (int(lo), int(hi)) == (0, 255):           # (30/10) the old 1.16 « all »
+            return -64, 319
         return int(lo), int(hi)
 
+    F116_MODERN_BPP = 2.0      # (30/10) 1.18+ dungeons: Python decoration, ~5 s a block
+
     def f116_max_bpp(self, key):
+        try:                                   # (31/10) Settings → Map, per structure
+            from . import prefs
+            own = prefs.struct_limits().get(key)
+        except Exception:
+            own = None
+        v = self._f116_max_bpp(key)
+        return v if own is None else min(v, float(own))
+
+    def _f116_max_bpp(self, key):
         if self.engine.seed_view:
             return self.F116_SEED_BPP[key]
+        if key == "dungeon" and int(self.world.mc) >= 22:
+            return self.F116_MODERN_BPP
         if key == "lava_lake" and self.ov.get("f116_surface_only", False):
             return self.F116_SURF_BPP
         return self.F116_MAX_BPP[key]
@@ -690,7 +774,7 @@ class MapView(QWidget):
         the layers panel's Y range / « surface only » hide the others. Hover /
         right-click read self._f116_hits."""
         self._f116_hits = []
-        if int(self.world.mc) not in (19, 20):
+        if not self.world.structure_available("dungeon"):     # (30/10) 1.16 → 26.3
             return
         from .struct_boxes import grad_rgb
         import feature116 as f116
@@ -702,7 +786,8 @@ class MapView(QWidget):
         self.engine.f116_centre = (self.cx, self.cz)
         surf_only = self.ov.get("f116_surface_only", False)
         for key in ("lava_lake", "dungeon"):
-            if not self.visible.get(key) or self.bpp > self.f116_max_bpp(key):
+            if not self.visible.get(key) or self.bpp > self.f116_max_bpp(key) \
+                    or not self.world.structure_available(key):
                 continue
             icons = (not sv) or self.bpp <= self.F116_ICON_BPP[key]
             labels = self.bpp <= self.F116_ICON_BPP[key]
@@ -737,12 +822,13 @@ class MapView(QWidget):
                         continue
                     fy = f.y if ry is None else ry
                     sx, sy = self.to_screen(f.x + 0.5, f.z + 0.5)
-                    r, g, b = grad_rgb(min(1.0, max(0.0, fy / 80.0)))
+                    r, g, b = grad_rgb(min(1.0, max(0.0, (fy - (-64 if int(self.world.mc) >= 22 else 0))
+                                                    / (144.0 if int(self.world.mc) >= 22 else 80.0))))
                     col = QColor(r, g, b)
                     if x0 <= f.x <= x1 and z0 <= f.z <= z1:
                         counts[key] = counts.get(key, 0) + 1
-                    if labels and ok is None:
-                        unchecked.append(f)
+                    if labels and ok is None and int(self.world.mc) in (19, 20):
+                        unchecked.append(f)          # (30/10) the 1.16.1 check: 1.16 only
                     self._f116_hits.append((sx, sy, f))
                     if key == "lava_lake" and labels and (not f.surface or f.exact):
                         self._draw_lake_cols(p, f, cols.get((f.ox, f.oz)))
@@ -910,6 +996,8 @@ class MapView(QWidget):
         kind, data = self._cv_pieces(key, x, z)
         if not data:
             return None
+        for b_ in ([data] if kind == "bb" else data):              # (31/10) right-click
+            self._area_hits.append((b_[0], b_[1], b_[2], b_[3], key, int(x), int(z), None))
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -941,31 +1029,263 @@ class MapView(QWidget):
     def _draw_footprint(self, p: QPainter, key, x, z):
         """Real size of a structure: solid = exact, dashed = approximate."""
         from .struct_boxes import footprint
-        fp = footprint(key, x, z, self.world.seed)
+        fp = footprint(key, x, z, self.world.seed, getattr(self.world, "mc", None))
         if fp is None:
             return
-        bx0, bz0, bx1, bz1, exact = fp
+        for one in (fp if isinstance(fp, list) else [fp]):
+            self._draw_box(p, *one)
+            self._area_hits.append((one[0], one[1], one[2], one[3], key, int(x), int(z), None))
+
+    _JIG_COL = {"street": (150, 140, 120), "center": (255, 200, 60), "house": (255, 110, 60),
+                "deco": (120, 200, 120),
+                # (29/10) mineshafts
+                "room": (230, 170, 90), "corridor": (180, 130, 70), "crossing": (210, 150, 80),
+                "stairs": (160, 120, 90),
+                # (30/10) ruined portals
+                "portal": (190, 90, 240)}
+
+    # ── (31/10) the top view of a village / outpost / camp (jigsaw_plan) ──
+    def _plan_layer(self, plan):
+        """(31/10) (image bytes, chests) to show: a mansion's X-ray floor (Layers
+        panel: ov « mansion_floor », 0 = the roof) or the plan itself."""
+        fl = plan.get("floors")
+        if fl:
+            f = int(plan.get("sel_floor", 0) or 0)      # (31/10) chosen in its bubble
+            if f in fl:
+                return fl[f], plan.get("floor_chests", {}).get(f, []), f
+            if f:
+                return None, [], f                 # no such floor here: nothing
+        return plan["rgba"], plan.get("chests", []), 0
+
+    def _plan_pixmap(self, plan, which=0, raw=None):
+        cache = self.__dict__.setdefault("_plan_pm", {})
+        k = (id(plan), which)
+        got = cache.get(k)
+        if got is None or got[0] is not plan:
+            from PySide6.QtGui import QImage
+            img = QImage(raw if raw is not None else plan["rgba"], plan["w"], plan["h"], plan["w"] * 4,
+                         QImage.Format.Format_RGBA8888).copy()
+            if len(cache) > 300:
+                cache.clear()
+            got = cache[k] = (plan, QPixmap.fromImage(img))
+        return got[1]
+
+    def _plan_hd(self, plan):
+        """(05/11) the plan's HD pixmap (jigsaw_plan.hd_image), the last 40 kept."""
+        if "nm" not in plan and "pc" not in plan:
+            return None
+        cache = self.__dict__.setdefault("_plan_hd_pm", {})
+        got = cache.get(id(plan))
+        if got is not None and got[0] is plan:
+            return got[1]
+        try:
+            import jigsaw_plan
+            r = jigsaw_plan.hd_image(plan)
+        except Exception:
+            r = None
+        if r is None:
+            plan.pop("nm", None)
+            plan.pop("pc", None)
+            return None
+        from PySide6.QtGui import QImage
+        img = QImage(r[0], r[1], r[2], r[1] * 4, QImage.Format.Format_RGBA8888).copy()
+        while len(cache) >= 40:
+            cache.pop(next(iter(cache)))
+        cache[id(plan)] = (plan, QPixmap.fromImage(img))
+        return cache[id(plan)][1]
+
+    def _draw_plan(self, p: QPainter, key, x, z, plan):
+        x0, z0, w, h = plan["x0"], plan["z0"], plan["w"], plan["h"]
+        sx0, sy0 = self.to_screen(x0, z0)
+        sx1, sy1 = self.to_screen(x0 + w, z0 + h)
+        if sx1 < 0 or sy1 < 0 or sx0 > self.width() or sy0 > self.height():
+            return
+        raw, chests, which = self._plan_layer(plan)
+        if raw is None:
+            return
+        hd = self._plan_hd(plan) if self.bpp <= PLAN_HD_BPP and which == 0 else None
+        self._area_hits.append((x0, z0, x0 + w - 1, z0 + h - 1, key, int(x), int(z), (plan, raw)))
+        p.save()
+        if hd is not None:                # (05/11) zoomed in: the blocks' textures (4 px / block)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.bpp > 1.0 / 4)
+            p.drawPixmap(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0), hd, QRectF(0, 0, hd.width(), hd.height()))
+        else:
+            pm = self._plan_pixmap(plan, which, raw)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.bpp > 1.0)
+            p.drawPixmap(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0), pm, QRectF(0, 0, w, h))
+        if self.bpp <= PLAN_CHEST_BPP and chests:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            s = 1.0 / self.bpp
+            dark = QColor(24, 18, 4, 230)
+            for ch in chests:
+                cx_, cy_ = self.to_screen(ch[0], ch[2])
+                if s >= 5:                         # zoomed in: the chest block itself
+                    p.setPen(QPen(dark, max(1.0, s / 8)))
+                    p.setBrush(CHEST_COL)
+                    r = QRectF(cx_ + s * 0.08, cy_ + s * 0.08, s * 0.84, s * 0.84)
+                    p.drawRoundedRect(r, s * 0.15, s * 0.15)
+                    p.setPen(QPen(dark, max(1.0, s / 10)))
+                    p.drawLine(QPointF(r.left(), r.top() + r.height() * 0.42),
+                               QPointF(r.right(), r.top() + r.height() * 0.42))
+                    hx, hy = cx_ + s / 2, cy_ + s / 2
+                else:                              # a yellow dot with a soft halo
+                    hx, hy = cx_ + s / 2, cy_ + s / 2
+                    rr = max(2.3, min(3.6, 1.1 * s))
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QColor(255, 201, 40, 70))
+                    p.drawEllipse(QPointF(hx, hy), rr + 2.6, rr + 2.6)
+                    p.setPen(QPen(dark, 1.1))
+                    p.setBrush(CHEST_COL)
+                    p.drawEllipse(QPointF(hx, hy), rr, rr)
+                self._chest_hits.append((hx, hy, key, x, z, ch))
+        p.restore()
+
+    def chest_hit_at(self, sx, sy):
+        best, bd = None, max(7.0, 0.6 / self.bpp) ** 2
+        for h in getattr(self, "_chest_hits", ()):
+            d = (h[0] - sx) ** 2 + (h[1] - sy) ** 2
+            if d <= bd:
+                best, bd = h, d
+        return best
+
+    def open_chest(self, hit):
+        """The loot window of the chest's structure, scrolled to that chest."""
+        _sx, _sy, key, x, z, ch = hit
+        seed, mc, _large = self.world.key
+        from . import struct_icons
+        from .loot_dialog import LootDialog
+        from .struct_bubble import loot_key
+        lk = loot_key(key) or key
+        d = LootDialog(lk, seed, mc, x, z, f"{struct_icons.label(key)}  X {x}  Z {z}", self.window(),
+                       focus=(ch[0], ch[1], ch[2]))
+        d.show()
+
+    @staticmethod
+    def chest_label(table):
+        n = str(table).split("/")[-1].replace("village_", "").replace("bastion_", "bastion ")
+        n = n.replace("_", " ").replace("bastion other", "bastion").replace("ancient city ice box", "ice box")
+        if n == "abandoned mineshaft":
+            return "Minecart chest"
+        if n == "nether bridge":
+            return "Fortress chest"
+        if n == "woodland mansion":
+            return "Mansion chest"
+        return n[:1].upper() + n[1:] + " chest"
+
+    def _draw_jigsaw(self, p: QPainter, boxes):
+        """(24/10) the exact pieces of a village / pillager outpost (jigsaw.py),
+        (29/10) of a mineshaft. Drawn once per zoom into a pixmap (a mineshaft:
+        ~90 pieces, dozens on screen), blitted while panning."""
+        if not boxes:
+            return
+        if self._anim.isActive():
+            return self._draw_jigsaw_(p, boxes)
+        x0 = min(b[0] for b in boxes); z0 = min(b[1] for b in boxes)
+        x1 = max(b[2] for b in boxes) + 1; z1 = max(b[3] for b in boxes) + 1
+        sx0, sy0 = self.to_screen(x0, z0)
+        sx1, sy1 = self.to_screen(x1, z1)
+        if sx1 < 0 or sy1 < 0 or sx0 > self.width() or sy0 > self.height():
+            return
+        wpx, hpx = (x1 - x0) / self.bpp + 4, (z1 - z0) / self.bpp + 4
+        if wpx > 1600 or hpx > 1600:
+            return self._draw_jigsaw_(p, boxes)
+        cache = self.__dict__.setdefault("_jig_pm", {})
+        dpr = max(1.0, self.devicePixelRatioF())
+        k = (id(boxes), len(boxes), x0, z0, self.bpp, dpr)
+        pm = cache.get(k)
+        if pm is None:
+            pm = QPixmap(int(wpx * dpr) + 1, int(hpx * dpr) + 1)
+            pm.setDevicePixelRatio(dpr)
+            pm.fill(Qt.GlobalColor.transparent)
+            q = QPainter(pm)
+            cx_, cz_ = self.cx, self.cz
+            # draw as if the view's corner were (x0, z0) - 2 px
+            self.cx = x0 - 2 * self.bpp + self.width() / 2 * self.bpp
+            self.cz = z0 - 2 * self.bpp + self.height() / 2 * self.bpp
+            try:
+                self._draw_jigsaw_(q, boxes, clip=False)
+            finally:
+                self.cx, self.cz = cx_, cz_
+            q.end()
+            if len(cache) > 400:
+                cache.clear()
+            cache[k] = pm
+        p.drawPixmap(int(round(sx0)) - 2, int(round(sy0)) - 2, pm)
+
+    def _draw_jigsaw_(self, p: QPainter, boxes, clip=True):
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        for (bx0, bz0, bx1, bz1, kind, _y0, _y1) in boxes:
+            sx0, sy0 = self.to_screen(bx0, bz0)
+            sx1, sy1 = self.to_screen(bx1 + 1, bz1 + 1)
+            if clip and (sx1 < 0 or sy1 < 0 or sx0 > self.width() or sy0 > self.height()):
+                continue
+            r, g, b = self._JIG_COL.get(kind, (255, 110, 60))
+            col = QColor(r, g, b, 200 if kind != "street" else 150)
+            p.setPen(QPen(col, 1.0 if kind == "street" else 1.4))
+            fill = QColor(r, g, b, 60 if kind != "street" else 45)
+            p.setBrush(fill)
+            p.drawRect(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0))
+        p.restore()
+
+    _BOX_PENS = {}
+
+    def _draw_box(self, p: QPainter, bx0, bz0, bx1, bz1, exact):
         sx0, sy0 = self.to_screen(bx0, bz0)
         sx1, sy1 = self.to_screen(bx1 + 1, bz1 + 1)
         if sx1 < 0 or sy1 < 0 or sx0 > self.width() or sy0 > self.height():
             return
-        col = QColor(255, 110, 60, 230 if exact else 170)
-        pen = QPen(col, 1.6 if exact else 1.2)
-        if not exact:
-            pen.setStyle(Qt.PenStyle.DashLine)
-        p.save()
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        p.setPen(pen)
-        fill = QColor(col); fill.setAlpha(28 if exact else 14)
-        p.setBrush(fill)
+        if sx1 - sx0 < 3 and sy1 - sy0 < 3:          # (29/10) under the icon anyway
+            return
+        st = self._BOX_PENS.get(bool(exact))
+        if st is None:
+            col = QColor(255, 110, 60, 230 if exact else 170)
+            pen = QPen(col, 1.6 if exact else 1.2)
+            if not exact:
+                pen.setStyle(Qt.PenStyle.DashLine)
+            fill = QColor(col); fill.setAlpha(28 if exact else 14)
+            st = self._BOX_PENS[bool(exact)] = (pen, fill)
+        if self._box_state is not st:                  # (29/10) no save / restore per box
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            p.setPen(st[0])
+            p.setBrush(st[1])
+            self._box_state = st
         p.drawRect(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0))
-        p.restore()
 
     # (18/10) the special piece of each kind: stronghold portal room, End ship
     _PIECE_KINDS = {
         "stronghold": dict(special=None, col=(63, 214, 160), label="Portal Y"),
         "end_city": dict(special=END_SHIP_PIECE, col=(206, 150, 255), label="Ship Y"),
     }
+
+    def _piece_legend(self, pieces, kind="stronghold", chips=False):
+        """The height legend (max Y, portal room / ship) of the stronghold / End
+        city nearest to the centre; pieces: (x0, y0, z0, x1, y1, z1, type)."""
+        import stronghold_eyes as se
+        special = se.PORTAL_ROOM if kind == "stronghold" else self._PIECE_KINDS[kind]["special"]
+        d = min(abs(q[0] - self.cx) + abs(q[2] - self.cz) for q in pieces)
+        if d < getattr(self, "_legend_d", 1e18):
+            self._legend_d = d
+            self._legend_range = (min(q[4] for q in pieces), max(q[4] for q in pieces))
+            self._legend_kind = kind
+            pr = next((q for q in pieces if q[6] == special), None)
+            self._legend_portal = ((pr[4], pr[1] + 3) if kind == "stronghold" else (pr[4], pr[1])) \
+                if pr else None
+        self._pieces_shown = True
+        if chips:                         # (05/11) over a plan: the same labels
+            from .struct_boxes import grad_rgb
+            spec = self._PIECE_KINDS[kind]
+            ylo = min(q[4] for q in pieces); span = max(1, max(q[4] for q in pieces) - ylo)
+            top = max(pieces, key=lambda q: q[4])
+            pr = next((q for q in pieces if q[6] == special), None)
+            if pr is not None:
+                same = top is pr or pr[4] == top[4] and (top[0], top[2]) == (pr[0], pr[2])
+                self._chips.append((self._srect(pr[0], pr[2], pr[3], pr[5]),
+                                    f"{spec['label']} {pr[4]}" + (" = max" if same else ""),
+                                    QColor(*spec["col"])))
+            if pr is None or top is not pr:
+                self._chips.append((self._srect(top[0], top[2], top[3], top[5]), f"max Y {top[4]}",
+                                    QColor(*grad_rgb((top[4] - ylo) / span))))
 
     def _draw_pieces(self, p: QPainter, pieces, kind="stronghold"):
         """Every piece of a stronghold / an End city (18/10) (like
@@ -983,15 +1303,7 @@ class MapView(QWidget):
 
         def height_rgb(y):
             return grad_rgb((y - ylo) / span)
-        # legend: the stronghold nearest to the centre
-        d = min(abs(q[0] - self.cx) + abs(q[2] - self.cz) for q in pieces)
-        if d < getattr(self, "_legend_d", 1e18):
-            self._legend_d = d
-            self._legend_range = (ylo, yhi)
-            self._legend_kind = kind
-            pr = next((q for q in pieces if q[6] == special), None)
-            self._legend_portal = ((pr[4], pr[1] + 3) if kind == "stronghold" else (pr[4], pr[1])) \
-                if pr else None
+        self._piece_legend(pieces, kind)
         top_piece = max(pieces, key=lambda q: q[4])
         portal = None
         for pc in sorted(pieces, key=lambda q: q[4]):          # higher pieces on top
@@ -1116,21 +1428,168 @@ class MapView(QWidget):
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, txt)
         p.restore()
 
+    def _block_icons(self, key, bx, bz, fetch, show_z):
+        """[(x, z, icon key)] of one structure type in one structure block, or
+        None while it is computed."""
+        pts = self.engine.structures(key, bx, bz, fetch)
+        if pts is None:
+            return None, None
+        zset = self.engine.abandoned(bx, bz) if key == "village" and pts else ()
+        bset = self.engine.with_basement(bx, bz) if key == "igloo" and pts else ()
+        sset = self.engine.with_ship(bx, bz) if key == "end_city" and pts else ()
+        out = []
+        for (x, z) in pts:
+            k = key
+            if sset and (x, z) in sset:
+                k = "end_city_ship"
+            elif zset and (x, z) in zset:
+                k = "zombie_village"
+                if not show_z:
+                    continue
+            elif key == "village" and not self.visible.get("village"):
+                continue
+            elif bset and (x, z) in bset:
+                k = "igloo_basement"
+            out.append((x, z, k))
+        return out, (id(pts), id(zset), id(bset), id(sset))
+
+    def _paint_icon_blocks(self, p, x0, z0, x1, z1, counts, fetch, show_z, dim_types):
+        """(29/10) zoomed out: the icons of each structure block drawn once into a
+        pixmap (per zoom / icon size / layers / data), then blitted; while the zoom
+        animates, the last pixmap of the block is drawn scaled."""
+        B = self.engine.STRUCT_BLOCK
+        cache = self.__dict__.setdefault("_iblk", {})
+        last = self.__dict__.setdefault("_iblk_last", {})
+        keys = [k for k, on in self.visible.items()
+                if on and not k.startswith("__") and k in dim_types and self.world.structure_available(k)]
+        dpr = max(1.0, self.devicePixelRatioF())
+        m = self.icon_px                                   # pixel margin around the block
+        animating = self._anim.isActive()
+        base = (self.world.key, self.dim, self.engine.seed_view, self.icon_px, dpr, tuple(keys), show_z)
+        budget = [ANIM_ICON_BUDGET]
+        for bz in range(math.floor(z0 / B), math.floor(z1 / B) + 1):
+            for bx in range(math.floor(x0 / B), math.floor(x1 / B) + 1):
+                sig = []
+                for key in keys:
+                    pts = self.engine.structures(key, bx, bz, fetch)
+                    if pts is None:
+                        sig.append(None)
+                        continue
+                    sig.append((id(pts), len(pts),
+                                id(self.engine.abandoned(bx, bz)) if key == "village" else 0,
+                                id(self.engine.with_basement(bx, bz)) if key == "igloo" else 0,
+                                id(self.engine.with_ship(bx, bz)) if key == "end_city" else 0))
+                bsig = (bx, bz) + base + (tuple(sig),)
+                ck = bsig + (self.bpp,)
+                ent = cache.get(ck)
+                if ent is None and animating:
+                    lk = last.get(bsig)
+                    ent = cache.get(lk) if lk is not None else None
+                if ent is None:
+                    lists = [self._block_icons(key, bx, bz, False, show_z)[0] or [] for key in keys]
+                    ent = self._build_icon_block(bx, bz, lists, m, dpr)
+                    cache[ck] = ent
+                    last[bsig] = ck
+                    self._iblk_bytes = getattr(self, "_iblk_bytes", 0) + ent[3]
+                    while self._iblk_bytes > ICON_CACHE_BYTES and len(cache) > 1:
+                        old = next(iter(cache))
+                        self._iblk_bytes -= cache.pop(old)[3]
+                pm, ebpp, hits, _nb, tot = ent
+                sc = ebpp / self.bpp
+                sx, sy = self.to_screen(bx * B, bz * B)
+                if sc == 1.0:
+                    p.drawPixmap(int(round(sx)) - m, int(round(sy)) - m, pm)
+                elif len(hits) <= budget[0]:
+                    # (31/10) while the zoom animates: each icon at its own size (a
+                    # scaled block made them grow / shrink until the zoom stopped)
+                    budget[0] -= len(hits)
+                    h = self.icon_px / 2
+                    W, H = self.width() + h, self.height() + h
+                    for (wx, wz, k, _rx, _rz) in hits:
+                        ix, iy = self.to_screen(wx, wz)
+                        if -h <= ix <= W and -h <= iy <= H:
+                            ic = self._icon(k)
+                            if ic is not None:
+                                p.drawPixmap(int(ix - h), int(iy - h), ic)
+                else:
+                    w = pm.width() / pm.devicePixelRatio()
+                    p.drawPixmap(QRectF(sx - m * sc, sy - m * sc, w * sc, w * sc), pm,
+                                 QRectF(0, 0, pm.width(), pm.height()))
+                self._icon_hits_w.append(hits)
+                # the legend counts what is on screen
+                if x0 <= bx * B and bx * B + B - 1 <= x1 and z0 <= bz * B and bz * B + B - 1 <= z1:
+                    for k, n in tot.items():
+                        counts[k] = counts.get(k, 0) + n
+                else:
+                    for (wx, wz, k, _rx, _rz) in hits:
+                        if x0 <= wx <= x1 and z0 <= wz <= z1:
+                            counts[k] = counts.get(k, 0) + 1
+
+    def _build_icon_block(self, bx, bz, lists, m, dpr):
+        B = self.engine.STRUCT_BLOCK
+        side = int(math.ceil(B / self.bpp)) + 2 * m
+        pm = QPixmap(int(side * dpr), int(side * dpr))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        q = QPainter(pm)
+        hits, tot = [], {}
+        ox, oz = bx * B, bz * B
+        h = self.icon_px / 2
+        for icons in lists:
+            for (x, z, k) in icons:
+                ic = self._icon(k)
+                if ic is None:
+                    continue
+                lx, ly = (x - ox) / self.bpp + m, (z - oz) / self.bpp + m
+                q.drawPixmap(int(lx - h), int(ly - h), ic)
+                hits.append((x, z, k, int(math.floor(x)), int(math.floor(z))))
+                tot[k] = tot.get(k, 0) + 1
+        q.end()
+        return pm, self.bpp, hits, pm.width() * pm.height() * 4, tot
+
+    _box_state = None
+
     def _paint_structures(self, p: QPainter):
+        p.save()
+        self._box_state = None
+        try:
+            self._paint_structures_(p)
+        finally:
+            p.restore()
+            self._box_state = None
+
+    def _paint_structures_(self, p: QPainter):
         x0, z0 = self.to_world(0, 0)
         x1, z1 = self.to_world(self.width(), self.height())
         counts = self._struct_counts = {}
         self._chips = []                      # stronghold labels, drawn over the icons
         self._pieces_shown = False
         self._legend_d = 1e18
-        if self.bpp <= _struct_max():
+        # (22/10) Settings → Map: no structures at all over a noise / height layer
+        # (instant, nothing switched off: back on the biomes they are there again)
+        hide_all = _pref("hide_structs_on_noise", False) and self.noise_shown()
+        boxes_on = _pref("struct_boxes", True)
+        if hide_all:
+            self._f116_hits = []
+            return
+        if self.bpp <= _struct_max_any():
             B = self.engine.STRUCT_BLOCK
             fetch = not self._anim.isActive()
             # abandoned villages follow the Village switch (no switch of their
             # own, 01/10); they keep their own icon
             show_z = bool(self.visible.get("village"))
             dim_types = cw.DIM_STRUCTURE_TYPES[self.dim]          # (18/10) this dimension's
-            for key, on in self.visible.items():
+            # (31/10) each structure up to its own zoom (Settings → Map)
+            dim_types = {k: v for k, v in dim_types.items() if self.bpp <= _struct_limit(k)}
+            # (29/10) only what can show: the view + the icon (+ pieces / boxes zoomed in)
+            mg = self.icon_px * self.bpp + (PIECE_MARGIN if self.bpp <= BOX_MAX_BPP else 0)
+            vx0, vz0, vx1, vz1 = x0 - mg, z0 - mg, x1 + mg, z1 + mg
+            if self.bpp >= ICON_CACHE_BPP:
+                self._paint_icon_blocks(p, x0, z0, x1, z1, counts, fetch, show_z, dim_types)
+                dim_types = ()                            # done
+            # (31/10) the deepest structures first: the higher ones are drawn over
+            # them (a village over the ancient city under it)
+            for key, on in sorted(self.visible.items(), key=lambda kv: DRAW_DEPTH.get(kv[0], 0)):
                 if not on or key.startswith("__") or key not in dim_types:
                     continue
                 if not self.world.structure_available(key):
@@ -1142,6 +1601,8 @@ class MapView(QWidget):
                         bset = self.engine.with_basement(bx, bz) if key == "igloo" and pts else ()
                         sset = self.engine.with_ship(bx, bz) if key == "end_city" and pts else ()
                         for (x, z) in pts:
+                            if not (vx0 <= x <= vx1 and vz0 <= z <= vz1):
+                                continue
                             k = key
                             if sset and (x, z) in sset:
                                 k = "end_city_ship"
@@ -1156,6 +1617,19 @@ class MapView(QWidget):
                             if x0 <= x <= x1 and z0 <= z <= z1:
                                 counts[k] = counts.get(k, 0) + 1
                             ix, iz = x, z
+                            if key == "end_city" and self.bpp <= PLAN_MAX_BPP and boxes_on and \
+                                    isinstance(self.engine.jigsaw_pieces(key, x, z, fetch), dict):
+                                # (05/11) the city's top view (jigsaw_plan), no icon over it
+                                self._draw_plan(p, k, x, z, self.engine.jigsaw_pieces(key, x, z, False))
+                                self._box_state = None
+                                _k, pcs = self._cv_pieces(key, x, z)
+                                if pcs:                   # the legend (city top, ship Y)
+                                    self._piece_legend([(a0, y0_, c0, a1, y1_, c1, t_)
+                                                        for (a0, c0, a1, c1, t_, _r, y0_, y1_) in pcs],
+                                                       "end_city", chips=True)
+                                hsx, hsy = self.to_screen(ix, iz)
+                                self._icon_hits.append((hsx, hsy, k, int(x), int(z)))
+                                continue
                             if key == "end_city":
                                 # (18/10) coloured by height like the strongholds
                                 if self.bpp <= PIECES_MAX_BPP:
@@ -1164,15 +1638,109 @@ class MapView(QWidget):
                                         self._draw_pieces(p, [(a0, y0_, c0, a1, y1_, c1, t_)
                                                               for (a0, c0, a1, c1, t_, _r, y0_, y1_) in pcs],
                                                           kind="end_city")
+                                        for b_ in pcs:
+                                            self._area_hits.append((b_[0], b_[1], b_[2], b_[3], k, int(x),
+                                                                    int(z), None))
+                                        self._box_state = None
                                         self._pieces_shown = True
+                            elif key == "bastion" and self.bpp <= PLAN_MAX_BPP and boxes_on and \
+                                    self.engine.jigsaw_pieces(key, x, z, fetch):
+                                # (31/10) the bastion's top view (jigsaw_plan), no icon over it
+                                jp = self.engine.jigsaw_pieces(key, x, z, False)
+                                if isinstance(jp, dict):
+                                    self._draw_plan(p, k, x, z, jp)
+                                    self._box_state = None
+                                    hsx, hsy = self.to_screen(ix, iz)
+                                    self._icon_hits.append((hsx, hsy, k, int(x), int(z)))
+                                    continue
+                                if self.bpp <= JIG_MAX_BPP:
+                                    self._draw_jigsaw(p, jp)
+                                    self._box_state = None
+                            elif key == "fortress" and self.bpp <= PLAN_MAX_BPP and boxes_on and \
+                                    isinstance(self.engine.jigsaw_pieces(key, x, z, fetch), dict):
+                                # (31/10) the fortress's top view (jigsaw_plan), no icon over it
+                                self._draw_plan(p, k, x, z, self.engine.jigsaw_pieces(key, x, z, False))
+                                self._box_state = None
+                                hsx, hsy = self.to_screen(ix, iz)
+                                self._icon_hits.append((hsx, hsy, k, int(x), int(z)))
+                                continue
                             elif key in CV_PIECE_TYPES:
                                 # (18/10) cubiomes-viewer's red pieces / box
                                 if self.bpp < CV_BB_MAX_BPP:
                                     c = self._draw_cv_pieces(p, key, x, z)
+                                    self._box_state = None
                                     if c is not None:
                                         ix, iz = c
-                            elif self.bpp <= BOX_MAX_BPP:
-                                self._draw_footprint(p, key, x, z)
+                            elif key in ("ruined_portal", "shipwreck", "ocean_ruin", "igloo", "desert_pyramid",
+                                         "jungle_temple", "swamp_hut", "monument", "desert_well",
+                                         "trail_ruins", "trial_chambers", "ruined_portal_nether",
+                                         "end_gateway") and \
+                                    self.bpp <= PLAN_MAX_BPP and boxes_on and \
+                                    isinstance(self.engine.jigsaw_pieces(key, x, z, fetch), dict):
+                                # (05/11) their top view (jigsaw_plan), no icon over it
+                                self._draw_plan(p, k, x, z, self.engine.jigsaw_pieces(key, x, z, False))
+                                self._box_state = None
+                                hsx, hsy = self.to_screen(ix, iz)
+                                self._icon_hits.append((hsx, hsy, k, int(x), int(z)))
+                                continue
+                            elif self.bpp <= BOX_MAX_BPP and boxes_on:
+                                jp = None
+                                if key in ("village", "pillager_outpost", "abandoned_camp") and \
+                                        self.bpp <= PLAN_MAX_BPP and _jig_mc(self.world.mc):
+                                    jp = self.engine.jigsaw_pieces(key, x, z, fetch)
+                                    if isinstance(jp, dict):      # (31/10) the top view
+                                        self._draw_plan(p, k, x, z, jp)
+                                        self._box_state = None
+                                        jp = None
+                                        # (31/10) no icon over the plan: still clickable
+                                        hsx, hsy = self.to_screen(ix, iz)
+                                        self._icon_hits.append((hsx, hsy, k, int(x), int(z)))
+                                        continue
+                                elif key == "mineshaft" and self.bpp <= PLAN_MAX_BPP:
+                                    jp = self.engine.jigsaw_pieces(key, x, z, fetch)
+                                    if isinstance(jp, dict):      # (31/10) the top view
+                                        if self.bpp <= PLAN_CHEST_BPP and not jp.get("chests"):
+                                            mc_ = self.engine.mineshaft_chests(x, z, fetch)
+                                            if mc_:
+                                                jp["chests"] = mc_
+                                        self._draw_plan(p, k, x, z, jp)
+                                        self._box_state = None
+                                        hsx, hsy = self.to_screen(ix, iz)
+                                        self._icon_hits.append((hsx, hsy, k, int(x), int(z)))
+                                        continue
+                                    if self.bpp > MS_MAX_BPP:
+                                        jp = None
+                                elif key == "ancient_city" and self.dim == 0 and \
+                                        self.bpp <= PLAN_MAX_BPP and int(self.world.mc) >= 23:
+                                    jp = self.engine.jigsaw_pieces(key, x, z, fetch)
+                                    if isinstance(jp, dict):      # (31/10) the top view
+                                        self._draw_plan(p, k, x, z, jp)
+                                        self._box_state = None
+                                        hsx, hsy = self.to_screen(ix, iz)
+                                        self._icon_hits.append((hsx, hsy, k, int(x), int(z)))
+                                        continue
+                                    if self.bpp > JIG_MAX_BPP:
+                                        jp = None
+                                elif key == "mansion" and self.dim == 0 and self.bpp <= PLAN_MAX_BPP:
+                                    jp = self.engine.jigsaw_pieces(key, x, z, fetch)
+                                    if isinstance(jp, dict):      # (31/10) the top view
+                                        self._draw_plan(p, k, x, z, jp)
+                                        self._box_state = None
+                                        hsx, hsy = self.to_screen(ix, iz)
+                                        self._icon_hits.append((hsx, hsy, k, int(x), int(z)))
+                                        continue
+                                    if self.bpp > JIG_MAX_BPP:
+                                        jp = None
+                                elif key == "ruined_portal" and self.dim == 0:
+                                    jp = self.engine.jigsaw_pieces(key, x, z, fetch)
+                                if jp:
+                                    self._draw_jigsaw(p, jp)
+                                    self._box_state = None
+                                    for b_ in jp:
+                                        self._area_hits.append((b_[0], b_[1], b_[2], b_[3], k, int(x),
+                                                                int(z), None))
+                                else:
+                                    self._draw_footprint(p, key, x, z)
                             self._draw_icon(p, k, ix, iz, ref=(x, z))
         if self.dim != 0:                 # (18/10) no 1.16 features / landmarks there
             self._f116_hits = []
@@ -1189,10 +1757,30 @@ class MapView(QWidget):
             for (x, z) in lm.get("strongholds", ()):
                 if x0 <= x <= x1 and z0 <= z <= z1:
                     counts["stronghold"] = counts.get("stronghold", 0) + 1
-                if pieces_on and x0 - 200 <= x <= x1 + 200 and z0 - 200 <= z <= z1 + 200:
+                near = x0 - 200 <= x <= x1 + 200 and z0 - 200 <= z <= z1 + 200
+                if near and self.bpp <= PLAN_MAX_BPP and \
+                        isinstance(self.engine.jigsaw_pieces("stronghold", x, z,
+                                                             not self._anim.isActive()), dict):
+                    # (31/10) the X-ray plan (jigsaw_plan), no icon over it
+                    self._draw_plan(p, "stronghold", x, z,
+                                    self.engine.jigsaw_pieces("stronghold", x, z, False))
+                    hsx, hsy = self.to_screen(x, z)
+                    self.__dict__.setdefault("_icon_hits", []).append(
+                        (hsx, hsy, "stronghold", int(x), int(z)))
+                    pcs = self.engine.stronghold_pieces(x, z, not self._anim.isActive())
+                    if pcs:                       # the legend (max Y, portal Y) stays
+                        self._piece_legend(pcs, chips=True)
+                    ei = info.get((x, z))
+                    if show_eyes and ei is not None:
+                        self._draw_eye_badge(p, x, z, int(ei[0]))
+                    continue
+                if pieces_on and near:
                     pcs = self.engine.stronghold_pieces(x, z, not self._anim.isActive())
                     if pcs:
                         self._draw_pieces(p, pcs)
+                        for q in pcs:
+                            self._area_hits.append((q[0], q[2], q[3], q[5], "stronghold", int(x),
+                                                    int(z), None))
                         self._pieces_shown = True
                 self._draw_icon(p, "stronghold", x, z)
                 ei = info.get((x, z))
@@ -1283,6 +1871,8 @@ class MapView(QWidget):
                     rect = QRectF(rect.center().x() - 3, rect.center().y() - 3, 6, 6)
                 p.drawRect(rect)
                 tl = rect.topLeft()
+            if zn.get("grid"):
+                self._paint_spiral_grid(p, zn)
             lab = zn.get("label")
             if lab:
                 fm = p.fontMetrics()
@@ -1312,6 +1902,57 @@ class MapView(QWidget):
             p.drawRoundedRect(box, 6, 6)
             p.setPen(QColor(theme.TEXT))
             p.drawText(box, Qt.AlignmentFlag.AlignCenter, hint)
+        p.restore()
+
+    SPIRAL_MAX_MARKS = 6000
+
+    def _paint_spiral_grid(self, p: QPainter, zn):
+        """(22/10) Every position a spiral iterator tests: a small black « + »
+        (cell × step, inside its square or circle), when they are far enough
+        apart on screen to be told apart."""
+        g = zn["grid"]
+        st = max(1, int(g["step"]))
+        if st / self.bpp < 6:                         # too dense to read: nothing
+            return
+        vx0, vz0 = self.to_world(0, 0)
+        vx1, vz1 = self.to_world(self.width(), self.height())
+        if zn["shape"] == "circle":
+            r = zn["r"]
+            x1, z1, x2, z2 = zn["cx"] - r, zn["cz"] - r, zn["cx"] + r, zn["cz"] + r
+        else:
+            x1, z1, x2, z2 = zn["x1"], zn["z1"], zn["x2"], zn["z2"]
+        x1, z1 = max(x1, math.floor(vx0)), max(z1, math.floor(vz0))
+        x2, z2 = min(x2, math.ceil(vx1)), min(z2, math.ceil(vz1))
+        if x1 > x2 or z1 > z2:
+            return
+        ix1, ix2 = -(-x1 // st), x2 // st
+        iz1, iz2 = -(-z1 // st), z2 // st
+        n = (ix2 - ix1 + 1) * (iz2 - iz1 + 1)
+        if n <= 0 or n > self.SPIRAL_MAX_MARKS:
+            return
+        rsq = g.get("rmax_sq")
+        ax, az = g["ax"], g["az"]
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        pts = []
+        for iz in range(iz1, iz2 + 1):
+            for ix in range(ix1, ix2 + 1):
+                wx, wz = ix * st, iz * st
+                if rsq and (wx - ax) ** 2 + (wz - az) ** 2 >= rsq:
+                    continue
+                sx, sy = self.to_screen(wx + 0.5, wz + 0.5)
+                # (22/10) snapped to whole pixels: every « + » drawn the same
+                # (fractional positions were rounded differently, one darker on
+                # the left, the next on the right…)
+                pts.append((int(math.floor(sx)), int(math.floor(sy))))
+        from PySide6.QtCore import QRect
+        halo, ink = QColor(255, 255, 255, 150), QColor(0, 0, 0, 235)
+        for sx, sy in pts:                            # 1-px black + on a 3-px white halo
+            p.fillRect(QRect(sx - 4, sy - 1, 9, 3), halo)
+            p.fillRect(QRect(sx - 1, sy - 4, 3, 9), halo)
+        for sx, sy in pts:
+            p.fillRect(QRect(sx - 3, sy, 7, 1), ink)
+            p.fillRect(QRect(sx, sy - 3, 1, 7), ink)
         p.restore()
 
     # ── result overlay: numbered hits ───────────────────────────────────────
@@ -1570,9 +2211,34 @@ class MapView(QWidget):
         p.restore()
 
     # ── (18/10) a clicked structure: bigger icon + bubble with its details ──
+    def _iter_hits(self):
+        """(screen x, screen y, key, x, z) of the icons of the last paint: the ones
+        drawn one by one, then the cached blocks' (world positions, 29/10)."""
+        yield from getattr(self, "_icon_hits", ())
+        for hits in getattr(self, "_icon_hits_w", ()):
+            for (wx, wz, key, x, z) in hits:
+                sx, sy = self.to_screen(wx, wz)
+                yield sx, sy, key, x, z
+
+    def area_hit_at(self, sx, sy):
+        """(31/10) the structure drawn under a screen point (its plan where it is not
+        transparent, its pieces / footprint boxes): (key, x, z) — the last drawn wins."""
+        wx, wz = self.to_world(sx, sy)
+        bx, bz = int(math.floor(wx)), int(math.floor(wz))
+        for (x0, z0, x1, z1, key, x, z, pl) in reversed(getattr(self, "_area_hits", ())):
+            if not (x0 <= bx <= x1 and z0 <= bz <= z1):
+                continue
+            if pl is not None:
+                plan, raw = pl
+                i = ((bz - plan["z0"]) * plan["w"] + (bx - plan["x0"])) * 4 + 3
+                if not (0 <= i < len(raw)) or raw[i] == 0:
+                    continue
+            return key, x, z
+        return None
+
     def icon_hit_at(self, sx, sy):
         best, bd = None, max(10.0, self.icon_px * 0.6) ** 2
-        for (hx, hy, key, x, z) in getattr(self, "_icon_hits", ()):
+        for (hx, hy, key, x, z) in self._iter_hits():
             d = (hx - sx) ** 2 + (hy - sy) ** 2
             if d <= bd:
                 best, bd = (key, x, z), d
@@ -1584,9 +2250,85 @@ class MapView(QWidget):
             from .struct_bubble import StructBubble
             b = self._sbubble = StructBubble(self)
             b.closed.connect(lambda: self.select_structure(None))
+            b.lootRequested.connect(self._open_loot)
+            b.lootTableRequested.connect(self._open_loot_table)
+            b.floorRequested.connect(self._set_mansion_floor)
             bus = self._sel_bus = _SelBus(self)
             bus.done.connect(self._sel_details)
         return b
+
+    def _mansion_plan(self, tok):
+        """(31/10) the selected structure's plan when it has floors to choose (a
+        mansion; (05/11) an igloo with its basement)."""
+        if tok is None or tok[0] not in ("mansion", "igloo", "igloo_basement"):
+            return None
+        ek = "igloo" if tok[0].startswith("igloo") else tok[0]
+        jp = self.engine.jigsaw_pieces(ek, tok[1], tok[2], False)
+        return jp if isinstance(jp, dict) and jp.get("floors") else None
+
+    def _floor_kw(self, tok, f=None):
+        jp = self._mansion_plan(tok)
+        if jp is None:
+            return {}
+        return dict(floor=int(jp.get("sel_floor", 0) or 0) if f is None else int(f),
+                    floor_labels=jp.get("floor_labels"))
+
+    def _floor_of_sel(self, tok):
+        """The floor shown for the selected mansion (None: not a mansion plan)."""
+        jp = self._mansion_plan(tok)
+        return None if jp is None else int(jp.get("sel_floor", 0) or 0)
+
+    def _set_mansion_floor(self, f):
+        """(31/10) the bubble's Roof / Floor 1-3: that mansion's view on the map."""
+        tok = getattr(self, "selected", None)
+        jp = self._mansion_plan(tok)
+        if jp is None:
+            return
+        jp["sel_floor"] = int(f)
+        got = self.__dict__.get("_sel_cache", {}).get(tok)
+        if got is not None:
+            self._bubble().show_for(tok[0], got["rows"], got["tps"], subtitle=self._sel_sub(tok),
+                                    **self._floor_kw(tok, f))
+            self._place_bubble()
+        self.update()
+
+    def _open_loot(self):
+        """(25/10) The loot of the selected structure's chests."""
+        sel = getattr(self, "selected", None)
+        if sel is None:
+            return
+        key, x, z = sel[:3]
+        seed, mc, _large = self.world.key
+        from . import struct_icons
+        from .loot_dialog import LootDialog
+        from .struct_bubble import loot_key
+        lk = loot_key(key)
+        if lk is None:
+            return
+        d = LootDialog(lk, seed, mc, x, z, f"{struct_icons.label(key)}  X {x}  Z {z}", self.window())
+        d.show()
+
+    def _open_loot_table(self):
+        """(06/11) The loot tables of the selected structure's chests."""
+        sel = getattr(self, "selected", None)
+        if sel is None:
+            return
+        seed, mc, _large = self.world.key
+        import loot_engine as le
+        from .loot_table_dialog import LootTableDialog
+        from .struct_bubble import loot_key
+        sub = None
+        try:
+            from .world import current_exact
+            ex = current_exact()
+            if ex in (le.MC_SUBVERSIONS.get(int(mc)) or []):
+                sub = ex
+        except Exception:                                # noqa: BLE001
+            pass
+        lk = loot_key(sel[0]) or sel[0]
+        d = LootTableDialog(le.loot_version(int(mc), sub), None, self.window(), structure=lk,
+                            compute=(seed, int(mc), sel[1], sel[2], sub) if loot_key(sel[0]) else None)
+        d.show()
 
     def _sel_sub(self, tok):
         key, x, z, dim = tok[:4]
@@ -1606,7 +2348,8 @@ class MapView(QWidget):
         self.selected = tok
         got = self.__dict__.setdefault("_sel_cache", {}).get(tok)
         if got is not None:
-            b.show_for(key, got["rows"], got["tps"], subtitle=self._sel_sub(tok))
+            b.show_for(key, got["rows"], got["tps"], subtitle=self._sel_sub(tok),
+                       **self._floor_kw(tok))
         else:
             b.show_for(key, [], [("Here", self.tp_command(x, z))], loading=True,
                        subtitle=self._sel_sub(tok))
@@ -1636,7 +2379,8 @@ class MapView(QWidget):
             cache.clear()
         cache[tok] = res
         if tok == getattr(self, "selected", None):
-            self._bubble().show_for(tok[0], res["rows"], res["tps"], subtitle=self._sel_sub(tok))
+            self._bubble().show_for(tok[0], res["rows"], res["tps"], subtitle=self._sel_sub(tok),
+                                    **self._floor_kw(tok))
             self._place_bubble()
 
     def _sel_screen(self):
@@ -1644,7 +2388,7 @@ class MapView(QWidget):
         if sel is None:
             return None
         key, x, z = sel[:3]
-        for (hx, hy, k, rx, rz) in getattr(self, "_icon_hits", ()):
+        for (hx, hy, k, rx, rz) in self._iter_hits():
             if (rx, rz) == (x, z) and (k == key or k.startswith(key) or key.startswith(k)):
                 return hx, hy, k
         sx, sy = self.to_screen(x, z)
@@ -1763,13 +2507,13 @@ class MapView(QWidget):
             rows.append(("spawn", "Spawn", None))
         if ow and self.visible.get("__strongholds") and lm.get("strongholds"):
             rows.append(("stronghold", "Stronghold", self._struct_counts.get("stronghold", 0)))
-        zoomed_out = self.bpp > _struct_max()
         dim_types = cw.DIM_STRUCTURE_TYPES[self.dim]
         for key, on in self.visible.items():
             if not on or key.startswith("__") or key not in dim_types:
                 continue
             if not self.world.structure_available(key):
                 continue
+            zoomed_out = self.bpp > _struct_limit(key)
             rows.append((key, struct_icons.label(key),
                          None if zoomed_out else self._struct_counts.get(key, 0)))
             if key == "village":
@@ -1785,16 +2529,53 @@ class MapView(QWidget):
             if self.visible.get(key) and self.world.structure_available(key):
                 far = self.bpp > self.f116_max_bpp(key)
                 lo, hi = self.f116_yrange()
-                lab = struct_icons.label(key) + ("" if (lo, hi) == (0, 255) else f" · Y {lo}–{hi}")
+                lab = struct_icons.label(key) + ("" if (lo, hi) == (-64, 319) else f" · Y {lo}–{hi}")
                 rows.append((key, lab, None if far else self._struct_counts.get(key, 0)))
-        return rows, zoomed_out
+        return rows, self.bpp > _struct_max_any()
 
     def _paint_struct_legend(self, p: QPainter):
+        """(29/10) drawn into a pixmap, redrawn when its rows change — at most
+        every 0.2 s while the counts change (panning)."""
         if not self.legend_on() or self._pick is not None:
             return
         rows, zoomed_out = self._legend_rows_struct()
         if not rows:
             return
+        dpr = max(1.0, self.devicePixelRatioF())
+        geo = (self._controls.geometry().bottom(), self.height(), dpr, theme.BG1, theme.TEXT,
+               zoomed_out)
+        shape = (tuple((k, l) for k, l, _n in rows), geo)
+        full = (tuple(rows), geo)
+        c = getattr(self, "_legend_pm", None)
+        now = time.monotonic()
+        if c is not None and (c[0] == full or (c[1] == shape and now - c[2] < 0.2)):
+            p.drawPixmap(c[4], c[5], c[3])
+            return
+        top = self._controls.geometry().bottom() + 12
+        y0 = max(0, top - 2)
+        hh = max(1, min(self.height(), int(top + 22 + 19 * (len(rows) + 1) + 12)) - y0)
+        pm = QPixmap(int((self._legend_w(rows, zoomed_out) + 8) * dpr), int(hh * dpr))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        q = QPainter(pm)
+        q.translate(-10, -y0)                      # only the legend's box, not the map
+        self._paint_struct_legend_(q, rows, zoomed_out)
+        q.end()
+        self._legend_pm = (full, shape, now, pm, 10, y0)
+        p.drawPixmap(10, y0, pm)
+
+    def _legend_w(self, rows, zoomed_out):
+        fb = theme.ui_font(8.3); fh = theme.ui_font(7.2, QFont.Weight.Bold); fn = theme.mono_font(7.8)
+        from PySide6.QtGui import QFontMetrics
+        fm = QFontMetrics(fb)
+        w = 10 + 16 + 7 + max(fm.horizontalAdvance(r[1]) for r in rows) + 12 + \
+            QFontMetrics(fn).horizontalAdvance("0000000") + 10
+        w = max(w, QFontMetrics(fh).horizontalAdvance("ON SCREEN") + 20)
+        if zoomed_out:
+            w = max(w, fm.horizontalAdvance("zoom in for structures") + 20)
+        return w
+
+    def _paint_struct_legend_(self, p: QPainter, rows, zoomed_out):
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         fb = theme.ui_font(8.3); fh = theme.ui_font(7.2, QFont.Weight.Bold); fn = theme.mono_font(7.8)
@@ -1825,7 +2606,7 @@ class MapView(QWidget):
         y = box.top() + 22
         for key, label, n in shown:
             pm = struct_icons.pixmap(key, ic, max(2.0, self.devicePixelRatioF()))
-            dim = (n == 0) or (n is None and key not in ("spawn",) and zoomed_out)
+            dim = (n == 0) or (n is None and key not in ("spawn",))
             p.setOpacity(0.45 if dim else 1.0)
             if pm is not None:
                 p.drawPixmap(int(box.left() + 10), int(y + (row_h - ic) / 2), pm)
@@ -2213,6 +2994,11 @@ class MapView(QWidget):
             d = e.position() - start
             if abs(d.x()) + abs(d.y()) < 5 and not self.measuring:
                 # (18/10) a click (not a drag): select the structure under it
+                ch = self.chest_hit_at(e.position().x(), e.position().y())   # (31/10) a chest
+                if ch is not None:
+                    self.open_chest(ch)
+                    self._vel = (0.0, 0.0)
+                    return
                 self.select_structure(self.icon_hit_at(e.position().x(), e.position().y()))
                 self._vel = (0.0, 0.0)
                 return
@@ -2317,20 +3103,26 @@ class MapView(QWidget):
         # (18/10) a structure under the cursor: its bubble only (no menu as well:
         # two bubbles at once, Édouard) — the /tp are copied from the bubble
         shit = self.icon_hit_at(e.pos().x(), e.pos().y())
+        if shit is None:                              # (31/10) on its plan / pieces
+            shit = self.area_hit_at(e.pos().x(), e.pos().y())
         if shit is not None:
             self.select_structure(shit)
             return
         s_acts = {}
         # (10/10) a 1.16 dungeon / lava lake under the cursor
         ft = self.feature116_at(e.pos().x(), e.pos().y())
-        a_ftp = a_fck = a_fall = None
+        a_ftp = a_fck = a_fall = a_floot = None
         if ft is not None:
             key = "dungeon" if ft.kind == 0 else "lava_lake"
             t = m.addAction(struct_icons.icon(key, 16), ft.text()); t.setEnabled(False)
+            if ft.kind == 0:                         # (30/10) its chests
+                a_floot = m.addAction("Loot of this dungeon…")
             a_ftp = m.addAction(f"Copy {ft.tp(self.world.seed)}")
-            a_fck = m.addAction("Check it with Minecraft 1.16.1")
+            if int(self.world.mc) in (19, 20):
+                a_fck = m.addAction("Check it with Minecraft 1.16.1")
             m.addSeparator()
-        n_vis = sum(1 for _x, _y, f in getattr(self, "_f116_hits", ()) if not f.real)
+        n_vis = sum(1 for _x, _y, f in getattr(self, "_f116_hits", ()) if not f.real) \
+            if int(self.world.mc) in (19, 20) else 0
         if n_vis:                                # (10/10 bis) the uncertain ones only
             a_fall = m.addAction(f"Check the {min(n_vis, 300)} unsure dungeons / lava lakes on screen "
                                  "with Minecraft")
@@ -2383,6 +3175,13 @@ class MapView(QWidget):
         if act is not None and act is a_pin:
             self.clear_pin(); return
         cb = QGuiApplication.clipboard()
+        if act is not None and act is a_floot:
+            seed, mc, _large = self.world.key
+            from .loot_dialog import LootDialog
+            d = LootDialog("dungeon", seed, mc, ft.x, ft.z,
+                           f"Dungeon  X {ft.x}  Y {ft.y}  Z {ft.z}", self.window())
+            d.show()
+            return
         if act is not None and act is a_ftp:
             cb.setText(ft.tp(self.world.seed)); return
         if act is not None and act is a_fck:
@@ -2463,9 +3262,13 @@ class MapView(QWidget):
         noise = self.ov["noise"]
         try:
             if noise in CLIMATE:
-                v = float(octave_arrays(self._ui_noise(noise), x, z, 1, 1, 1, self.ov["octave"])[0, 0])
+                # (22/10) at the spot's 1:4 cell, like the search conditions and the
+                # small T H C E W read-out (was the block-level value: a few
+                # hundredths apart from it)
+                v = float(octave_arrays(self._ui_noise(noise), x >> 2, z >> 2, 1, 1, 4,
+                                        self.ov["octave"])[0, 0])
                 reg = "" if self.ov["octave"] else npal.regime_label_at(noise, v)
-                return f"{noise} {v:+.3f}" + (f" · {reg}" if reg else "")
+                return f"{noise} {v:+.4f}" + (f" · {reg}" if reg else "")
             if noise == "Approx height":
                 key = (self.world.key, "height")
                 hm = self._ui_libs.get(key)
@@ -2513,6 +3316,11 @@ class MapView(QWidget):
                 "  ✓ exact terrain" if (ft.real and ok) else
                 (f"  ✓ in Minecraft" + (f", top lava Y {ry}" if ry is not None else ""))
                 if ok else ("  ✗ not generated" if ok is False else "  ? potential (not checked)"))
+        chh = self.chest_hit_at(self._hover_pos.x(), self._hover_pos.y())       # (31/10)
+        if chh is not None:
+            c = chh[5]
+            extra = (extra + "    ·    " if extra else "") + \
+                f"{self.chest_label(c[3])}  X {c[0]} Y {c[1]} Z {c[2]}  —  click: its loot"
         base = f"X {x}    Z {z}    ·    {name}" + (f"    ·    {extra}" if extra else "")
         clim = self._climate_readout(x, z)
         if clim:
@@ -2544,11 +3352,27 @@ class MapView(QWidget):
         np6 = list(r[1]); np6[4] = 0
         return np6
 
+    def climate_raw(self, x, z):
+        """(22/10) the 5 climate noises at the spot's 1:4 cell, as the noise maps
+        and the search conditions (climate min/max, GPU tests) read them: no
+        biome shift. ×10000, or None outside a 1.18+ overworld."""
+        if self.dim != 0 or self.world.mc < cw.MC_VERSIONS["Java 1.18"]:
+            return None
+        out = {}
+        try:
+            for k, nm in (("T", "Temperature"), ("H", "Humidity"), ("C", "Continentalness"),
+                          ("E", "Erosion"), ("W", "Weirdness")):
+                v = float(self._ui_noise(nm).gen_noise_grid(x >> 2, z >> 2, 1, 1, 4)[0, 0])
+                out[k] = int(round(v * 10000))
+        except Exception:
+            return None
+        return out
+
     def _climate_readout(self, x, z):
-        p = self.climate_point(x, z)
+        p = self.climate_raw(x, z)
         if p is None:
             return ""
-        return "  ".join(f"{k} {p[i]:+d}" for k, i in (("T", 0), ("H", 1), ("C", 2), ("E", 3), ("W", 5)))
+        return "  ".join(f"{k} {p[k]:+d}" for k in ("T", "H", "C", "E", "W"))
 
     def _update_readout(self, pos):          # kept for tests / external callers
         self._hover_pos = pos

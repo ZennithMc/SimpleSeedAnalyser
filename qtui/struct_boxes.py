@@ -11,7 +11,12 @@ cubiomes-viewer):
     shipwrecks, ruins, ruined portals, ancient cities, trial chambers…): a box of
     their usual size, not their real pieces.
 
-  footprint(key, x, z, seed) -> (x0, z0, x1, z1, exact) | None   (blocks, inclusive)
+  * (24/10) EXACT too: shipwrecks (their template, rotation and beached / ocean
+    variant, as scattered_loot draws them), ocean ruins (the big ruin and its
+    cluster of small ones: a LIST of boxes) and igloos (the dome, igloo/top 7 × 8
+    rotated around (3, 5)).
+
+  footprint(key, x, z, seed, mc) -> (x0, z0, x1, z1, exact) | None   (blocks, inclusive)
 """
 from __future__ import annotations
 
@@ -45,9 +50,42 @@ def _direction(seed, cx, cz):
     return r.nextInt_bound(4)
 
 
-def footprint(key, x, z, seed):
+@lru_cache(maxsize=8192)
+def _ship(seed, mc, cx, cz):
+    try:
+        import scattered_loot as sc
+        return sc.shipwreck_box(int(seed), int(mc), cx, cz)[0]
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=8192)
+def _ruins(seed, mc, cx, cz):
+    try:
+        import scattered_loot as sc
+        return tuple(sc.ocean_ruin_boxes(int(seed), int(mc), cx, cz))
+    except Exception:
+        return None
+
+
+def footprint(key, x, z, seed, mc=None):
     cx, cz = int(x) >> 4, int(z) >> 4
     ox, oz = cx << 4, cz << 4
+    if key == "shipwreck" and mc is not None and int(mc) >= 19:
+        b = _ship(seed, int(mc), cx, cz)
+        if b is not None:
+            return b[0], b[1], b[2], b[3], True
+    if key == "ocean_ruin" and mc is not None and int(mc) >= 19:
+        parts = _ruins(seed, int(mc), cx, cz)
+        if parts:
+            return [(b[0], b[1], b[2], b[3], True) for b in parts]
+    if key == "igloo":
+        import scattered_loot as sc
+        rot = sc.igloo_layout(seed, cx, cz)[0]
+        pts = [sc._rot(a, b, rot, 3, 5) for a in (0, 6) for b in (0, 7)]
+        xs = [ox + a for a, _ in pts]
+        zs = [oz + b for _, b in pts]
+        return min(xs), min(zs), max(xs), max(zs), True
     if key in _SCATTERED:
         w, d = _SCATTERED[key]
         if w != d and _direction(seed, cx, cz) in (1, 3):     # east / west: rotated

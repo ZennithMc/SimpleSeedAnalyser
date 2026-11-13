@@ -34,6 +34,9 @@ import threading
 from dataclasses import dataclass
 
 VERSIONS = (19, 20)                 # cubiomes MC_1_16_1, MC_1_16_5
+# (30/10) the map's dungeons: 1.17.1 (the C exact terrain, ssa_features116x) and
+# 1.18 → 26.3 (dungeon_loot / prefeatures118, Python: modern_dungeons)
+MAP_DUNGEON_VERSIONS = tuple(range(19, 36))
 KINDS = ("dungeon", "lava_lake")
 
 
@@ -202,6 +205,18 @@ def features_exact(mc, seed, x1, z1, x2, z2, threads=0):
             _XCACHE.clear()
         _XCACHE[key] = v
     return v
+
+
+def modern_dungeons(mc, seed, x1, z1, x2, z2):
+    """(30/10) 1.18 → 26.3: the dungeons that generate in a box, each chunk decorated
+    alone (geodes, mineshafts, then its monster_room attempts; dungeon_loot.area) —
+    as Feat (kind 0, flags 16: exact; attempt unknown). Runs in a helper process."""
+    import dungeon_loot as dl
+    out = []
+    for d in dl.area(seed, mc, x1, z1, x2, z2):
+        out.append(Feat(0, d[0], d[1], d[2], d[3], d[4], 16, d[0], d[1], d[2]))
+    out.sort(key=lambda f: (f.z, f.x, f.y))
+    return tuple(out)
 
 
 def features(mc, seed, kind, x1, z1, x2, z2, exact=True, cap=200000, threads=0):

@@ -713,6 +713,12 @@ QLineEdit:hover, QSpinBox:hover, QComboBox:hover {{ border-color: {HOVER_LINE}; 
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTimeEdit:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
 QLineEdit#SeedEdit {{ font-family: "{mono}"; font-size: 10pt; padding-left: 10px; }}
 QComboBox::drop-down {{ border: 0; width: 20px; }}
+QToolButton#VersionButton {{
+    background: {BG2}; border: 1px solid {LINE2}; border-radius: {RADIUS}px;
+    padding: 4px 22px 4px 8px; min-height: 18px; text-align: left;
+}}
+QToolButton#VersionButton:hover {{ border-color: {HOVER_LINE}; }}
+QToolButton#VersionButton::menu-indicator {{ subcontrol-origin: padding; subcontrol-position: right center; right: 6px; }}
 QComboBox::down-arrow {{ width: 12px; height: 12px; image: url("{A['down']}"); }}
 QComboBox QAbstractItemView {{ background: {BG2}; border: 1px solid {LINE2}; selection-background-color: {ACCENT_SOFT}; selection-color: {TEXT}; padding: 4px; }}
 QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button, QTimeEdit::up-button, QTimeEdit::down-button {{ width: 16px; border: 0; }}
@@ -902,11 +908,10 @@ def _mix_hex(a: str, b: str, t: float) -> str:
                   int(ca.blue() + (cb.blue() - ca.blue()) * t)).name()
 
 
-def create_image_theme(src: str, name: str | None = None) -> str:
-    """New theme from a picture: copies it to the configuration folder and
-    derives the colours (dark or light from its brightness, tinted with its
-    average colour, accent = its most present vivid colour). Returns the name."""
-    import shutil
+def _image_tokens(src: str, accent: str | None = None):
+    """(22/10) The colours of a theme drawn from a picture: dark or light from
+    its brightness, tinted with its average colour, accent = its most present
+    vivid colour (or `accent`). -> (tokens, light)"""
     avg, acc, light = _image_colours(src)
     is_light = light > 0.62
     base = dict(BUILTIN["Daylight" if is_light else "Slate"])
@@ -922,7 +927,17 @@ def create_image_theme(src: str, name: str | None = None) -> str:
         h, s_, v, _x = a.getHsvF()
         a.setHsvF(max(h, 0), min(1.0, max(s_, 0.55)), 0.62 if is_light else 0.95)
         t["accent"] = a.name()
+    if accent:
+        t["accent"] = accent
     t["accent"] = readable(t["accent"], t["text"], [t["bg1"], t["bg2"]], 3.0)
+    return t, is_light
+
+
+def create_image_theme(src: str, name: str | None = None) -> str:
+    """New theme from a picture: copies it to the configuration folder and
+    derives the colours (see _image_tokens). Returns the name."""
+    import shutil
+    t, is_light = _image_tokens(src)
     d = os.path.join(os.path.dirname(_config_path()), "theme_images")
     os.makedirs(d, exist_ok=True)
     stem = os.path.splitext(os.path.basename(src))[0][:28] or "Picture"
@@ -944,6 +959,32 @@ def create_image_theme(src: str, name: str | None = None) -> str:
     return name
 
 
+def rename_image_theme(old: str, new: str) -> str:
+    """(22/10) Renames a picture theme; returns the name kept (stripped).
+    Raises ValueError if the name is empty or already used."""
+    new = " ".join((new or "").split())[:40]
+    if not new:
+        raise ValueError("The name is empty.")
+    if new == old:
+        return old
+    if new in BUILTIN or new in image_themes():
+        raise ValueError(f"A theme called « {new} » already exists.")
+    data = _raw_config()
+    imgs = data.get(IMAGE_KEY) if isinstance(data.get(IMAGE_KEY), dict) else {}
+    if old not in imgs:
+        raise ValueError("Only your picture themes can be renamed.")
+    imgs[new] = imgs.pop(old)
+    data[IMAGE_KEY] = imgs
+    _write_config(data)
+    BUILTIN.pop(old, None); EXTRAS.pop(old, None)
+    _register_image_themes()
+    from PySide6.QtCore import QSettings
+    qs = QSettings("SSA", "SimpleSeedAnalyser")
+    if str(qs.value("ui/theme", "") or "") == old:
+        qs.setValue("ui/theme", new)
+    return new
+
+
 def delete_image_theme(name: str) -> None:
     data = _raw_config()
     imgs = data.get(IMAGE_KEY) if isinstance(data.get(IMAGE_KEY), dict) else {}
@@ -957,6 +998,45 @@ def delete_image_theme(name: str) -> None:
         except OSError:
             pass
 
+
+# ── (22/10) Landscapes: built-in photo themes ────────────────────────────────
+# Free photos shipped in assets/landscapes (credits: THIRD_PARTY_LICENSES.txt).
+# The colours come from the picture like a picture theme, with a hand-picked accent.
+LANDSCAPES = [
+    # name, file, accent, description
+    ("Mountain Lake", "mountain_lake.jpg", "#4fa3e0", "A calm lake under snowy peaks"),
+    ("Fern Forest", "fern_forest.jpg", "#5cc27a", "Deep green ferns in the shade"),
+    ("Ocean Shore", "ocean_shore.jpg", "#33b5d6", "Waves rolling onto the sand, from above"),
+    ("Pier at Dusk", "pier_dusk.jpg", "#f08a5d", "A wooden pier on a still lake at sunset"),
+    ("Desert Night", "desert_night.jpg", "#e2b26f", "Sand dunes under the first stars"),
+]
+LANDSCAPE_NAMES = [n for n, *_r in LANDSCAPES]
+
+
+def landscape_dir() -> str:
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "assets", "landscapes")
+
+
+def _register_landscapes() -> None:
+    for name, fn, acc, desc in LANDSCAPES:
+        path = os.path.join(landscape_dir(), fn)
+        if not os.path.exists(path):
+            continue
+        try:
+            toks, light = _image_tokens(path, acc)
+        except Exception:
+            continue
+        BUILTIN[name] = toks
+        EXTRAS[name] = dict(desc=desc, accent2=_shade(toks["accent"], 1.25),
+                            panel=0.86 if light else 0.80,
+                            backdrop=dict(kind="image", path=path, stamp=1, light=bool(light)))
+
+
+try:
+    _register_landscapes()
+except Exception:
+    pass
 
 try:
     _register_image_themes()

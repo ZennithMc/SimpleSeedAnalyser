@@ -1,4 +1,4 @@
-## SimpleSeedAnalyser (SSA)  v1.0.0
+## SimpleSeedAnalyser (SSA)  v1.2.0
 A free seedfinding tool for Minecraft Java (1.16 → 26.3, Overworld, Large Biomes), built on **Cubiomes**.
 Think of it as an improved Cubiomes Viewer: many additional seedfinding features, and it will keep getting updates.
 
@@ -23,6 +23,8 @@ And many smaller quality-of-life features like a button to check every stronghol
 - **Linux x86-64** (glibc 2.34+): `SimpleSeedAnalyser-linux-x86_64.tar.gz` — extract and run `./SimpleSeedAnalyser/SimpleSeedAnalyser`.
 - CPU with AVX2. GPU optional: NVIDIA RTX 20 series or newer, driver 580+.
 
+The changes of each version are listed in `Updates.txt`.
+
 
 ## License & Credits
 
@@ -35,10 +37,11 @@ SimpleSeedAnalyser stands on the shoulders of the Minecraft seedfinding communit
 - **[Cubiomes](https://github.com/Cubitect/cubiomes)** by Cubitect (MIT) — the C library that powers biome generation, structure placement and noise sampling, compiled into SSA's engine. Terrain height uses the **[xpple fork](https://github.com/xpple/cubiomes)**.
 - **[Cubiomes Viewer](https://github.com/Cubitect/cubiomes-viewer)** by Cubitect — the reference seedfinder that inspired SSA's condition system, area modes and noise overlays, and whose `.session` files SSA can import. SSA's code is written from scratch.
 - **[12-eye](https://github.com/Gaider10/12-eye)** by Gaider10 — the stronghold piece simulator used to find exact portal rooms (CPU and GPU layout search).
+- **[TreeCracker](https://github.com/Gaider10/TreeCracker)** / **PopulationCrr** by Gaider10, **[tree-cracker](https://github.com/Nel-S/tree-cracker)** by NelS and **[SeedCrackerX](https://github.com/19MisterX98/SeedcrackerX)** by 19MisterX98 — the methods that SSA's Crack tab follows (its code is written from scratch; full list in `THIRD_PARTY_LICENSES.txt`).
 - **[seed-checker](https://github.com/jellejurre/seed-checker)** by jellejurre — runs the real Minecraft world generation to confirm results (broken portals, spawn checks). SSA ships a modified copy of its `SeedChunkGenerator.java` (`tools/checker/overrides`).
 - **[Qt / PySide6](https://www.qt.io)** (LGPL-3.0), **NumPy**, **Pillow**, **python-zstandard**, **PyInstaller**.
 - The **Minecraft seedfinding community** — for documenting the algorithms (LCG seeds, stronghold rings, biome noise) that make tools like SSA possible.
-- Minecraft is a trademark of **Mojang Studios / Microsoft**. SSA is an unofficial third-party tool, not affiliated with them.
+- Minecraft is a trademark of **Mojang Studios / Microsoft**. SSA is an unofficial third-party tool, not affiliated with them. The game data in `loot_tables/` (loot tables, structure templates) is Mojang's; textures are read from your own Minecraft installation, never shipped.
 
 ## Feedback
 If you are encountering any issue, contact me via Discord: @zennith7402

@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import sys
 
-from PySide6.QtCore import QRectF, QSize, Qt, QUrl, Signal
+from PySide6.QtCore import QRectF, QSize, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPainter
 from PySide6.QtWidgets import (QAbstractButton, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
@@ -238,6 +238,63 @@ class SettingsDialog(QDialog):
                                       (48.0, "48 blocks / pixel (default)"), (64.0, "64 blocks / pixel"),
                                       (96.0, "96 blocks / pixel"), (128.0, "128 blocks / pixel")],
                                      lambda v: f"{v:g} blocks / pixel"))
+        self._add(lay, "map", "Each structure's zoom",
+                  "Choose, structure by structure, from which zoom its icons disappear "
+                  "(the others follow the setting above).",
+                  self._button("Per structure…", self._struct_limits))
+        self._add(lay, "map", "Structure boxes",
+                  "The outline of each structure's size when zoomed in close.",
+                  self._switch("struct_boxes"))
+        self._add(lay, "map", "Hide structures on noise maps",
+                  "No structure icons while a noise or height layer is shown; they come back "
+                  "as soon as you return to the biomes.",
+                  self._switch("hide_structs_on_noise"))
+
+    def _struct_limits(self):
+        """(31/10) a window: one zoom per structure (« As above » by default)."""
+        from PySide6.QtWidgets import QDialogButtonBox, QGridLayout
+        import cubiomes_wrap as cw
+        from . import struct_icons
+        raw = self.pending.get("struct_max_bpp_by", prefs.get("struct_max_bpp_by"))
+        cur = {}
+        for part in str(raw).split(";"):
+            k, _s, v = part.partition("=")
+            try:
+                if k.strip():
+                    cur[k.strip()] = float(v)
+            except ValueError:
+                pass
+        d = QDialog(self); d.setWindowTitle("Each structure's zoom")
+        v = QVBoxLayout(d)
+        v.addWidget(body("Icons of a structure disappear when zoomed out further than its value "
+                         "(blocks per pixel).", small=True))
+        sc = QScrollArea(); sc.setWidgetResizable(True); inner = QWidget(); g = QGridLayout(inner)
+        g.setHorizontalSpacing(14); g.setVerticalSpacing(6)
+        keys = list(cw.ALL_STRUCTURE_TYPES) + ["dungeon", "lava_lake"]
+        vals = [None, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 48.0, 64.0, 96.0, 128.0]
+        combos = {}
+        for i, k in enumerate(keys):
+            lab = QLabel(); lab.setPixmap(struct_icons.pixmap(k, 18))
+            g.addWidget(lab, i, 0)
+            g.addWidget(QLabel(struct_icons.label(k)), i, 1)
+            cb = QComboBox(); cb.setMinimumWidth(170)
+            for val in vals:
+                cb.addItem("As above" if val is None else f"{val:g} blocks / pixel", val)
+            j = cb.findData(cur.get(k))
+            if j < 0 and cur.get(k) is not None:
+                cb.addItem(f"{cur[k]:g} blocks / pixel", cur[k]); j = cb.count() - 1
+            cb.setCurrentIndex(max(0, j))
+            g.addWidget(cb, i, 2)
+            combos[k] = cb
+        sc.setWidget(inner); sc.setMinimumSize(460, 420)
+        v.addWidget(sc, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(d.accept); bb.rejected.connect(d.reject)
+        v.addWidget(bb)
+        if d.exec() == QDialog.DialogCode.Accepted:
+            out = ";".join(f"{k}={cb.currentData():g}" for k, cb in combos.items()
+                           if cb.currentData() is not None)
+            self._set("struct_max_bpp_by", out)
 
     def _page_performance(self, lay):
         self._add(lay, "performance", "Use the NVIDIA GPU",
@@ -262,13 +319,22 @@ class SettingsDialog(QDialog):
             fr.addItem(text, v)
         fr.setCurrentIndex(max(0, fr.findData(theme.frame_style())))
 
+        self._frame0 = theme.frame_style()
+
         def _frame_save(c=fr):
             from PySide6.QtCore import QSettings
-            if c.currentData() != theme.frame_style():
+            theme.FRAME_OVERRIDE = None
+            if c.currentData() != self._frame0:
                 QSettings("SSA", "SimpleSeedAnalyser").setValue("theme/frame", c.currentData())
                 return True
             return False
-        fr.currentIndexChanged.connect(lambda _i: self._set("__frame", fr.currentData()))
+
+        def _frame_live(_i, c=fr):
+            # (22/10) previewed at once, like in the Themes window; Cancel undoes it
+            self._set("__frame", c.currentData())
+            theme.FRAME_OVERRIDE = c.currentData()
+            self._reapply_theme()
+        fr.currentIndexChanged.connect(_frame_live)
         self.extra_save.append(_frame_save)
         self._add(lay, "appearance", "Textured themes: frame",
                   "Veil: an even veil over the backdrop. Glass: lighter. Clear: the backdrop as it "
@@ -318,6 +384,20 @@ class SettingsDialog(QDialog):
         self._add(lay, "files", "Logs",
                   f"console.log, crash.log, selftest.txt — send them with a bug report: {ld}",
                   self._button("Open the folder", lambda: self._open_folder(ld)))
+
+        # (06/11) the game's textures for the loot (read from the player's Minecraft)
+        from .mc_folder import choose_minecraft_folder, status as mc_status
+        lab = {}
+
+        def _pick():
+            if choose_minecraft_folder(self) and lab.get("w") is not None:
+                lab["w"].setText(mc_status())
+        box = QWidget(); hb = QHBoxLayout(box); hb.setContentsMargins(0, 0, 0, 0); hb.setSpacing(8)
+        lw = QLabel(mc_status()); lw.setObjectName("Muted"); lab["w"] = lw
+        hb.addWidget(lw); hb.addWidget(self._button("Choose…", _pick))
+        self._add(lay, "files", "Minecraft (item textures)",
+                  "The loot shows the game's own items, read from your Minecraft "
+                  "(official launcher, Modrinth, Prism, CurseForge — found by itself).", box)
 
         def _clear():
             from .backdrops import clear_cache
@@ -379,6 +459,20 @@ class SettingsDialog(QDialog):
         prefs.reset()
         self.pending.clear()
         self.accept()
+
+    def _reapply_theme(self):
+        from PySide6.QtWidgets import QApplication
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            theme.apply(QApplication.instance(), theme.THEME)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def reject(self):
+        if theme.FRAME_OVERRIDE is not None:          # (22/10) undo the live preview
+            theme.FRAME_OVERRIDE = None
+            self._reapply_theme()
+        super().reject()
 
     def _save(self):
         restart = False

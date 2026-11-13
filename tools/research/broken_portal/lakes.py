@@ -1,5 +1,5 @@
 """1.16 lake predictor (water + lava) — exact RNG of LakeFeature, terrain checks NOT done."""
-import sys; sys.path.insert(0,'/home/claude/ssa')
+import sys; import os; sys.path.insert(0,os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','..'))
 M=(1<<48)-1
 class JR:
     def __init__(s,seed): s.s=(seed^0x5DEECE66D)&M

@@ -17,7 +17,7 @@ import uuid
 import numpy as np
 from PySide6.QtCore import QRect, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
-from .widgets import user_path, remember_path
+from .widgets import user_path
 from PySide6.QtWidgets import (QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
                                QPushButton, QVBoxLayout)

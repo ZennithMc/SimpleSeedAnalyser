@@ -24,8 +24,10 @@ sec("cubiomes fork by xpple (MIT) — terrain / surface height (compiled into te
     "https://github.com/xpple/cubiomes", read(os.path.join(ROOT, "cubiomes_terrain", "LICENSE_xpple_cubiomes")))
 sec("12-eye / stronghold generator — Gaider10 (compiled into gaider_layouts)\n"
     "https://github.com/Gaider10/12-eye",
-    "Stronghold piece generator used to simulate portal rooms. Used with credit;\n"
-    "licence to be confirmed with the author before a public release.")
+    "Stronghold piece generator used to simulate portal rooms. The upstream\n"
+    "repository does not state a licence. Used with credit.")
+sec('Seedcracking from trees (tree_crack.py, cubiomes_src/treecrack*, tree_cuda.cu)',
+    "SSA's tree cracker is a new implementation written for SSA, following the method\nof these tools (no code copied from them):\n\n  * TreeCracker and PopulationCrr — Andrew (Gaider10)\n    https://github.com/Gaider10/TreeCracker\n    https://github.com/Gaider10/PopulationCrr\n    The lattice over the first tree, the position / attribute windows, the exact\n    replay of the chunk's trees and the population chunk reversal. The upstream\n    repositories do not state a licence. Used with credit.\n  * tree-cracker — NelS (fork of the above, information estimates, 1.17 salt)\n    https://github.com/Nel-S/tree-cracker\n  * TreeCracking documentation — Epic10l2, with Edd (humhue)\n  * Tree decorator salts — Neil (hube12)\n  * Earlier tree crackers — Cortex (MCRcortex), TatertotGr8\n  * TextureRotations — 19MisterX98 (finding a forest's coordinates)\n    https://github.com/19MisterX98/TextureRotations\n  * SeedCandy — WearBlackAllDay (structure seed → world seeds)\n    https://github.com/WearBlackAllDay/SeedCandy\n\nThe tree models were checked against real Java 1.16.1, 1.16.5 and 1.17.1 worlds.\n\nStructures and End pillars (struct_crack.py, cubiomes_src/structcrack_core.h,\nend_pillars.py) — also new code, following:\n\n  * SeedCrackerX — 19MisterX98, after KaptainWutax's SeedCracker\n    https://github.com/19MisterX98/SeedcrackerX\n    Lifting the 20 low bits of the structure seed from the structures whose chunk\n    range is even, then searching the 28 high bits; the End pillar seed.\n  * cubiomes — Cubitect (structure configurations, positions and biome viability,\n    used to check every result)\n\nStructure anchors and the pillar model were checked on Java 1.16.1 – 1.21.4 servers.")
 sec("seed-checker — jellejurre (Minecraft check, tools/checker)\n"
     "https://github.com/jellejurre/seed-checker",
     "Used to confirm results with the real Minecraft world generation. SSA ships a\n"
@@ -56,6 +58,22 @@ sec("GCC runtime (libgomp, libgcc) — GPL-3.0 with the GCC Runtime Library Exce
     "The OpenMP runtime (libgomp) and GCC support libraries are distributed under the\n"
     "GNU GPL v3 with the GCC Runtime Library Exception, which allows shipping them with\n"
     "programs under any licence. https://www.gnu.org/licenses/gcc-exception-3.1.html")
+sec("Landscape photos — Unsplash (CC0 / Unsplash License)",
+    """The five Landscapes themes use these photos (resized to 2560 px, assets/landscapes):
+
+  Mountain Lake  — "A Large Body of Water Surrounded By Mountains", Peter Thomas
+                   https://unsplash.com/photos/Dxod5pdRtsk — Unsplash License
+  Fern Forest    — "Morskie Oko", https://unsplash.com/photos/_1UF_3TlKcQ — Unsplash License
+  Ocean Shore    — Nattu Adnan, https://unsplash.com/photos/Ai2TRdvI6gM — Unsplash License
+  Pier at Dusk   — "Sunset by the Pier", https://unsplash.com/photos/ces8_Bo7bhQ — CC0
+  Desert Night   — Jared Evans, https://unsplash.com/photos/Wwg1TzCuV9E — CC0
+
+Unsplash photos published before June 8, 2017 are CC0 (public domain). The later
+ones are under the Unsplash License (https://unsplash.com/license): free to use,
+modify and redistribute, not to be sold as they are. Sources and licences as listed
+by the elementary OS and Pop!_OS wallpaper collections.""")
+sec('Minecraft game data — Mojang Studios (loot_tables/)',
+    "SSA reproduces Minecraft's world generation. To do so, loot_tables/ holds data\nread from the game's files (loot tables, structure templates' sizes, jigsaw pools\nand block lists, enchantment tables) and tests/server_truth/ holds what real\nservers generated. This data belongs to Mojang Studios / Microsoft; it is not\ncovered by SSA's GPL licence and is only used for compatibility. No game code,\ntexture or sound is shipped: the item and block pictures are read from the user's\nown Minecraft installation. SSA is not affiliated with Mojang Studios or Microsoft.")
 sec("PyInstaller bootloader — GPL-2.0 with the PyInstaller bootloader exception",
     "The executable launcher is PyInstaller's bootloader, distributed under the GPL v2\n"
     "with an exception allowing it to be used with any program. https://pyinstaller.org")

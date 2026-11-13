@@ -15,7 +15,7 @@ import threading
 
 from PySide6.QtCore import QObject, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
-from PySide6.QtWidgets import (QAbstractButton, QApplication, QColorDialog, QDialog, QGridLayout,
+from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QGridLayout,
                                QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 from . import theme
@@ -159,6 +159,7 @@ class ThemeDialog(QDialog):
                               "Arctic", "Glacier"]),
                   ("Minecraft", ["Deepslate", "Nether", "The End", "Mesa", "Amethyst",
                                  "Prismarine", "Jungle", "Sculk", "Redstone", "Honeycomb"]),
+                  ("Landscapes", list(theme.LANDSCAPE_NAMES)),      # (22/10) real photos
                   ("Sky & nature", ["Aurora", "Nebula", "Sunset Dune", "Abyss", "Sakura", "Ember",
                                     "Lavender Dusk"]),
                   ("Wood", ["Oak", "Dark Oak", "Cherry", "Crimson", "Warped"]),
@@ -185,6 +186,10 @@ class ThemeDialog(QDialog):
                                "and the colours of the theme are taken from it.")
                 add.clicked.connect(self._new_picture)
                 prow.addWidget(add)
+                self.pic_ren = QPushButton("Rename…"); self.pic_ren.setProperty("kind", "ghost")
+                self.pic_ren.setToolTip("Rename this picture theme")
+                self.pic_ren.clicked.connect(self._rename_picture)
+                prow.addWidget(self.pic_ren)
                 self.pic_del = QPushButton("Delete this picture theme"); self.pic_del.setProperty("kind", "ghost")
                 self.pic_del.clicked.connect(self._delete_picture)
                 prow.addWidget(self.pic_del); prow.addStretch(1)
@@ -235,6 +240,8 @@ class ThemeDialog(QDialog):
             if self._stop:
                 return
             spec = theme.EXTRAS.get(n, {}).get("backdrop")
+            if spec and spec.get("kind") == "image" and n != self.current:
+                continue                              # already shown from the photo
             if spec:
                 p = backdrop_path(spec)
                 if p and not self._stop:
@@ -248,6 +255,9 @@ class ThemeDialog(QDialog):
 
     def _add_card(self, n, grid, i):
         c = ThemeCard(n)
+        spec = theme.EXTRAS.get(n, {}).get("backdrop") or {}
+        if spec.get("kind") == "image" and spec.get("path"):
+            c.set_thumb(spec["path"])                 # (22/10) photo themes: the photo itself
         c.clicked.connect(lambda _=False, n=n: self._select(n))
         self.cards[n] = c
         grid.addWidget(c, i // 4, i % 4)
@@ -273,6 +283,38 @@ class ThemeDialog(QDialog):
             if p:
                 c.set_thumb(p)
         self._select(name)
+
+    def _rename_picture(self):
+        """(22/10) Your picture themes can be renamed (they were named after the file)."""
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        old = self.current
+        if not theme.is_image_theme(old):
+            return
+        new, ok = QInputDialog.getText(self, "Rename the theme", "Name:", text=old)
+        if not ok:
+            return
+        try:
+            new = theme.rename_image_theme(old, new)
+        except ValueError as e:
+            QMessageBox.warning(self, "Rename the theme", str(e))
+            return
+        if new == old:
+            return
+        c = self.cards.pop(old, None)
+        if c is not None:
+            c.name = new
+            c.setToolTip(f"{new} — {theme.EXTRAS.get(new, {}).get('desc', '')}")
+            try:
+                c.clicked.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            c.clicked.connect(lambda _=False, n=new: self._select(n))
+            self.cards[new] = c
+        if self.original[0] == old:
+            self.original = (new, self.original[1])
+        if old in self.edits:
+            self.edits[new] = self.edits.pop(old)
+        self._select(new, apply=False)
 
     def _delete_picture(self):
         name = self.current
@@ -301,6 +343,7 @@ class ThemeDialog(QDialog):
         self.edit_box.setVisible(editable)
         if hasattr(self, "pic_del"):
             self.pic_del.setVisible(theme.is_image_theme(name))
+            self.pic_ren.setVisible(theme.is_image_theme(name))
         toks = self._tokens(name)
         for key, (sw, hexlab) in self.swatches.items():
             sw.setStyleSheet(f"QPushButton#Swatch {{ background: {toks[key]}; border: 1px solid {theme.LINE2}; }}")
@@ -324,8 +367,9 @@ class ThemeDialog(QDialog):
 
     def _pick(self, key):
         toks = dict(self._tokens(self.current))
-        col = QColorDialog.getColor(QColor(toks[key]), self, f"{key}")
-        if not col.isValid():
+        from .color_picker import pick_color          # (22/10) SSA's own picker
+        col = pick_color(self, QColor(toks[key]), f"{key}")
+        if col is None:
             return
         toks[key] = col.name()
         self.edits[self.current] = toks

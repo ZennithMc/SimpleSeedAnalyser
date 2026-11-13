@@ -29,6 +29,7 @@ import copy
 import ctypes
 import math
 import os
+import sys
 import threading
 import time
 
@@ -57,7 +58,7 @@ from cubiomes_wrap import (
     Desert_Pyramid, Jungle_Temple, Ruined_Portal, Ruined_Portal_N,
     Shipwreck, Treasure, Ancient_City, Trail_Ruins, Trial_Chambers,
     Abandoned_Camp,
-    Mineshaft, Ocean_Ruin, Desert_Well,
+    Ocean_Ruin, Desert_Well,
 )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -367,6 +368,37 @@ def _struct_collect_c(ctx, cond, at, maxn, stop_at, sums):
     return hits, pts
 
 
+def _village_filter_on(cond) -> bool:
+    """(05/11) a Village condition with houses / smiths bounds (village_filter);
+    (07/11) or a Ruined portal condition with its placement / type / crying obsidian /
+    completable filters (ruined_portal_filter). Both are checked in Python on each
+    position the engine finds, with the exact terrain (the whole seed)."""
+    t = cond.get("type")
+    try:
+        if t == "village":
+            import village_filter
+            return village_filter.active(cond.get("params", {}))
+        if t == "ruined_portal":
+            import ruined_portal_filter
+            return ruined_portal_filter.active(cond.get("params", {}))
+    except Exception:
+        return False
+    return False
+
+
+def _village_ok(ctx, cond, bx, bz) -> bool:
+    try:
+        from cubiomes_wrap import get_large_biomes
+        large = bool(get_large_biomes())
+    except Exception:
+        large = False
+    if cond.get("type") == "ruined_portal":
+        import ruined_portal_filter
+        return ruined_portal_filter.ok(cond.get("params", {}), ctx.seed, ctx.mc_version, bx, bz, large)
+    import village_filter
+    return village_filter.ok(cond.get("params", {}), ctx.seed, ctx.mc_version, bx, bz, large)
+
+
 def _struct_needs_c(cond) -> bool:
     """Structures whose rules only the C engine implements: Nether / End
     (their own generator, End city terrain) and the cubiomes-viewer variants
@@ -386,6 +418,15 @@ def _struct_collect(ctx, cond, at, maxn=1, stop_at=1, sums=False):
     hits = -1 if the structure is unknown for this version."""
     t = cond.get("type", "")
     if _struct_needs_c(cond):
+        if _village_filter_on(cond):               # (05/11) its positions, then the houses
+            r = _struct_collect_c(ctx, cond, at, _STRUCT_SPLIT_MAX, 0, True)
+            if r is None:
+                raise RuntimeError(f"{t}: needs the C engine (rebuild libcubiomes)")
+            pts = [p for p in r[1] if _village_ok(ctx, cond, p[0], p[1])]
+            hits = len(pts) if stop_at <= 0 else min(len(pts), stop_at)
+            pts_ = pts[:max(1, maxn)]
+            sm = (sum(p[0] for p in pts), sum(p[1] for p in pts))
+            return (hits, pts_, sm) if sums else (hits, pts_)
         r = _struct_collect_c(ctx, cond, at, maxn, stop_at, sums)
         if r is None:
             raise RuntimeError(f"{t}: needs the C engine (rebuild libcubiomes)")
@@ -400,6 +441,7 @@ def _struct_collect(ctx, cond, at, maxn=1, stop_at=1, sums=False):
         return (-1, [], (0, 0)) if sums else (-1, [])
     skip_ref = bool(cond.get("ignore_ref"))
     variant = cond.get("params", {}).get("variant", "any") or "any"
+    vfil = _village_filter_on(cond)
     mc = ctx.mc_version
     seed_u = ctypes.c_uint64(int(ctx.seed) & _U64)
     pos = Pos()
@@ -430,6 +472,8 @@ def _struct_collect(ctx, cond, at, maxn=1, stop_at=1, sums=False):
                         continue
             if mc >= 22 and not L.isViableStructureTerrain(stype, lib._gen, bx, bz):
                 continue                                   # MC_1_18 (1.18.2) = 22
+            if vfil and not _village_ok(ctx, cond, bx, bz):
+                continue                                   # (05/11) houses / smiths
             if len(out) < maxn:
                 out.append((bx, bz))
             sx += bx; sz += bz
@@ -451,11 +495,9 @@ def _get_box(cond: dict, px: int, pz: int):
     if rmax_b and rmax_b > 0:
         rb = rmax_b - 1
         return (px - rb, pz - rb, px + rb, pz + rb, rb * rb + 1)
-    return (
-        px + cond.get("x1", 0), pz + cond.get("z1", 0),
-        px + cond.get("x2", 0), pz + cond.get("z2", 0),
-        0,
-    )
+    x1, x2 = sorted((int(cond.get("x1", 0)), int(cond.get("x2", 0))))   # (05/11) any order
+    z1, z2 = sorted((int(cond.get("z1", 0)), int(cond.get("z2", 0))))
+    return (px + x1, pz + z1, px + x2, pz + z2, 0)
 
 
 class _RangeSeedList:
@@ -474,7 +516,7 @@ class _RangeSeedList:
     def __len__(self):
         if self.count > 0:
             return self.count
-        raise TypeError("range illimité")
+        raise TypeError("unbounded range")
 
     def __iter__(self):
         s = self.start
@@ -1112,14 +1154,31 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
 
     # ── Spawn ─────────────────────────────────────────────────────────
     if t == "spawn":
-        # exact spawn (getSpawn), as the C engine and cubiomes-viewer — the
-        # map's get_spawn() uses the fast estimate, which can differ.
-        try:
-            with ctx.lib._lock:
-                _p = ctx.lib._lib.getSpawn(ctx.lib._gen)
-            sp = (_p.x, _p.z)
-        except Exception:
-            sp = ctx.lib.get_spawn()
+        # the spawn as the C engine computes it (1.18+: ssa_spawn_exact, the game's
+        # algorithm on SSA's terrain; older: getSpawn, as cubiomes-viewer)
+        sp = None
+        if int(ctx.mc_version) >= 22:          # (12/11) the game's spawn, as the C engine
+            try:
+                import ctypes as _ct
+                import desert_well as _dw
+                _raw = ctx.lib._lib
+                if _dw.register_terrain(_raw) and hasattr(_raw, "ssa_spawn_exact"):
+                    _f = _raw.ssa_spawn_exact
+                    _f.restype = _ct.c_int
+                    _f.argtypes = [_ct.c_void_p, _ct.c_int, _ct.c_uint64, _ct.POINTER(_ct.c_int32)]
+                    _o = (_ct.c_int32 * 3)()
+                    with ctx.lib._lock:
+                        if _f(ctx.lib._gen, int(ctx.mc_version), int(ctx.seed) & _U64, _o):
+                            sp = (int(_o[0]), int(_o[2]))
+            except Exception:
+                sp = None
+        if sp is None:
+            try:
+                with ctx.lib._lock:
+                    _p = ctx.lib._lib.getSpawn(ctx.lib._gen)
+                sp = (_p.x, _p.z)
+            except Exception:
+                sp = ctx.lib.get_spawn()
         if sp is None:
             return False
         sx, sz = sp
@@ -1245,6 +1304,12 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
         if not r or not r[0]:
             return False
         ctx.push_position(cond_idx, (r[1], r[2]), r[3])
+        return True
+    if t == "elytra_spawn":                    # (24/10) C only (End coordinates)
+        r = _c_eval_single(ctx, cond, cond_idx, all_conds, px, pz)
+        if not r or not r[0]:
+            return False
+        ctx.push_position(cond_idx, (r[1], r[2]))
         return True
     if t == "spawn_feature116":
         r = _c_eval_single(ctx, cond, cond_idx, all_conds, px, pz)
@@ -1586,8 +1651,11 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
                 # explicit sampling stride (1/1, 1/4, 1/16 → 1, 2, 4); legacy
                 # conditions without it fall back to the capped auto grid.
                 step = max(1, int(_samp)) if _samp else max(1, (2 * r) // 64 + 1)
-                W = (2 * r) // step + 1; H = W
-                bx0 = at_x - r; bz0 = at_z - r
+                # (31/10) a grid centred on the zone (as the C batch): offsets
+                # k * step up to r — with r < step the old grid had no cell in it
+                k = r // step
+                W = 2 * k + 1; H = W
+                bx0 = at_x - k * step; bz0 = at_z - k * step
             # CPU EXACT (FP64), un contexte terrain par thread de recherche. Avant :
             # grille GPU FP32 (approchée) utilisée comme verdict final, et « False »
             # pour TOUTES les graines sur une machine sans GPU NVIDIA (0 résultat
@@ -1956,48 +2024,6 @@ def _eval_node(ctx: EvalContext, conditions: List[dict],
 # Public API
 # ─────────────────────────────────────────────────────────────────────────
 
-def evaluate_seed(conditions: List[dict], seed: int, mc_version: int,
-                   lib: CubiomesLib) -> Tuple[bool, str]:
-    """Evaluate all enabled conditions for one seed."""
-    enabled_indices = [i for i, c in enumerate(conditions)
-                       if c.get("enabled", True)]
-    if not enabled_indices:
-        return (False, "")
-
-    ctx = EvalContext(lib, mc_version, seed)
-
-    # Top-level nodes: those whose parent is world origin (relative == 0)
-    # and that are NOT children of another enabled condition
-    top_level = [
-        (i + 1) for i in enabled_indices
-        if conditions[i].get("relative", 0) == 0
-    ]
-    # Nodes referenced as children of a top-level spiral are evaluated
-    # recursively from _eval_node, not from here. Nodes with relative > 0
-    # that are NOT children of any other enabled condition are also top-level.
-    referenced_as_children = set()
-    for i in enabled_indices:
-        rel = conditions[i].get("relative", 0)
-        if rel > 0 and (rel - 1) in enabled_indices:
-            referenced_as_children.add(i + 1)  # 1-based
-
-    for cond_1idx in top_level:
-        if not _eval_node(ctx, conditions, cond_1idx, (0, 0)):
-            return (False, "")
-
-    # Also evaluate any enabled top-level nodes not yet covered
-    # (e.g. conditions with relative=0 that should be AND-chained)
-    # → all already handled above since top_level = all with relative==0
-
-    # Build summary string
-    parts = []
-    for i in enabled_indices[:4]:
-        p = ctx.positions[i + 1] if (i + 1) < len(ctx.positions) else None
-        if p is not None:
-            parts.append(f"{conditions[i].get('type', '?')}@({p[0]},{p[1]})")
-    return (True, "  ".join(parts))
-
-
 def _explain_seed_c(conditions, seed, mc_version, lib):
     """explain_seed through the C engine (ssa_explain_seed): the SAME evaluation
     as the search, so a result is always located where the search found it.
@@ -2109,6 +2135,10 @@ def explain_seed(conditions: List[dict], seed: int, mc_version: int, lib: Cubiom
     if any(c.get("type") == "first_stronghold" and _portal_anchor(c.get("params"))
            for c in active_conditions(conditions)):
         # End portal mode: the C engine only knows the ring point (03/10)
+        return _explain_seed_py(conditions, seed, mc_version, lib)
+    if any(_village_filter_on(c) for c in active_conditions(conditions)):
+        # (07/11) village houses / ruined portal filters: only the Python evaluator
+        # applies them (the C engine would locate a structure that fails them)
         return _explain_seed_py(conditions, seed, mc_version, lib)
     try:
         r = _explain_seed_c(conditions, seed, mc_version, lib)
@@ -2285,7 +2315,7 @@ def _run_scan128_range(min_eyes, min_max_y, seed_start, seed_count, mc,
     from stronghold_eyes import _seed_list_128_worker, _sl_native_init
 
     if not _sl_native_init():
-        print("[SCAN128] natif indisponible → repli", flush=True)
+        print("[SCAN128] native code unavailable → fallback", flush=True)
         return False
     print(f"[SCAN128] start min_eyes={min_eyes} maxY={min_max_y} "
           f"count={seed_count}", flush=True)
@@ -2441,6 +2471,7 @@ def _get_ctype_map(lib) -> dict:
         "logic_not":           "logic_not",
         "crunchiness":         "crunchiness",
         "spawn_feature116":    "spawn_feature",     # (09/10) 1.16 fallback point
+        "elytra_spawn":        "elytra_spawn",      # (24/10) End ship elytra -> End spawn
         "dungeon":             "feature116",        # (10/10) 1.16 per-chunk features
         "lava_lake":           "feature116",
     }
@@ -2614,6 +2645,12 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
         sz = int(lib.ssa_sizeof_ssacond())
     except AttributeError:
         return None
+    if any(c.get("type") == "desert_well" for c in conditions):
+        try:                     # (30/10) 1.18+ wells: the terrain library's surface
+            import desert_well as _dw
+            _dw.register_terrain(lib)
+        except Exception:
+            pass
 
     ctype_map = _get_ctype_map(lib)
     if not ctype_map:
@@ -2771,6 +2808,9 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
 
         # struct_type
         s.struct_type = STRUCT_TYPES.get(t, 0)
+        if t == "elytra_spawn":              # (24/10) struct_type = ortho (step = radius: below)
+            s.struct_type = 1 if params.get("ortho", True) else 0
+            s.min_count, s.exclude = 1, 0
         if t == "spawn_feature116":          # (09/10) kind: 0 dungeon, 1 lava lake
             s.struct_type = 1 if params.get("kind") == "lava_lake" else 0
             s.min_count, s.exclude = 1, 0
@@ -2794,6 +2834,11 @@ def _build_ssacond_array(conditions: List[dict], lib) -> Optional[object]:
         # spiral step. Default 0 → C uses 512 (cubiomes-viewer convention).
         try:    s.step = int(params.get("step", 0) or 0)
         except: s.step = 0
+        if t == "elytra_spawn":               # (24/10) the radius rides in step
+            try:
+                s.step = max(1000, min(30000, int(params.get("radius", 10000) or 10000)))
+            except (TypeError, ValueError):
+                s.step = 10000
 
         # biome lists
         def _fill_biomes(field, lst):
@@ -3314,6 +3359,19 @@ def _gpu_prof_rows():
     return [tuple(r) for r in rows], int(buf[5 * n])
 
 
+def _below_normal_priority():
+    """(22/10) The calling thread at a lower OS priority (search threads: the
+    interface thread is served first). Best effort, never raises."""
+    try:
+        if sys.platform == "win32":
+            k32 = ctypes.windll.kernel32
+            k32.SetThreadPriority(k32.GetCurrentThread(), -1)     # THREAD_PRIORITY_BELOW_NORMAL
+        elif hasattr(os, "setpriority") and hasattr(threading, "get_native_id"):
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 5)
+    except Exception:
+        pass
+
+
 def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
                  stop_event, on_progress, gpu_chunk=1 << 17, cpu_chunk=1 << 14):
     """Adaptive CPU+GPU co-processing over one seed range (work-stealing).
@@ -3334,7 +3392,7 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
     CPU threads are the `num_workers` validators (ed's 12-thread CPU rule). If the
     GPU fails mid-run, its current chunk is handed to the CPU and the CPU workers
     finish the whole range -> still correct, just CPU-speed."""
-    import threading, queue as _q, concurrent.futures as _cf, numpy as _np
+    import threading, queue as _q, concurrent.futures as _cf
     warmup()                       # build g_child_order single-threaded (then thread-safe)
     # Pause / Resume (08/10): a chunk counts once ALL its seeds are checked (its
     # GPU survivors validated, or its raw seeds full-tested) without a Stop in
@@ -3350,6 +3408,12 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
             try: _rmode(("resumable", True))
             except Exception: pass
     nw = max(1, int(num_workers or 0))   # all chosen threads (>=1 validator)
+    # (22/10) the GPU thread needs a core of its own (it launches and waits for
+    # the kernels): with every core validating, the window froze and Stop took
+    # seconds — one validator less when all the cores were asked for
+    _nc = os.cpu_count() or 1
+    if nw >= _nc and _nc > 2:
+        nw = _nc - 1
     take_lock = threading.Lock(); prog_lock = threading.Lock()
     st = {"next": int(seed_start), "end": int(seed_start) + int(total), "done": 0}
     survq = _q.Queue(maxsize=2 * nw + 4)          # bounded -> backpressure throttles GPU
@@ -3468,6 +3532,7 @@ def _hybrid_loop(gpu_scan, cpu_test, warmup, seed_start, total, num_workers,
 
     def _cpu_worker():
         _TSB_TLS.stop = _cstop
+        _below_normal_priority()      # (22/10) the window stays responsive at 100 % CPU+GPU
         try:
             _cpu_worker_run()
         finally:
@@ -4436,7 +4501,6 @@ def _run_structure_gpu_search(conditions, jobs, seed_start, seed_count,
     """
     import ctypes as ct
     import structure_cuda as _sc
-    import concurrent.futures as _cf
 
     raw = lib._lib
     import sys as _dbgsys
@@ -4756,14 +4820,14 @@ def _run_structure_gpu_search(conditions, jobs, seed_start, seed_count,
     _producer.join(timeout=2.0)
 
     if "too_broad" in _gpu_err:
-        _set_gpu_fail("GPU : condition trop large pour le pré-filtre ("
-                      + _gpu_err["too_broad"] + ") — recherche relancée sur le CPU.")
+        _set_gpu_fail("GPU: condition too broad for the pre-filter ("
+                      + _gpu_err["too_broad"] + ") — search restarted on the CPU.")
         return False
     if "err" in _gpu_err:
         import traceback
         traceback.print_exception(type(_gpu_err["err"]), _gpu_err["err"],
                                   _gpu_err["err"].__traceback__)
-        _set_gpu_fail(f"Erreur GPU : {_gpu_err['err']} — recherche relancée sur le CPU.")
+        _set_gpu_fail(f"GPU error: {_gpu_err['err']} — search restarted on the CPU.")
         return False
 
     if inc:
@@ -5301,6 +5365,13 @@ def _fam_opts(search_mode):
     return bool(o.get("hide_sisters")) or so, so
 
 
+_WHOLE_SEED_TYPES = {"precise_y", "height", "biome_filter", "biome_sample", "biome_center",
+                     "climate_minmax", "climate_center", "crunchiness", "noise_sample",
+                     "nether_biomes", "spawn", "spawn116_preset", "mansion_spawn116_preset",
+                     "elytra_spawn_preset", "spawn_feature116", "dungeon_spawn116_preset",
+                     "lavalake_spawn116_preset"}
+
+
 def struct_only_blocker(conditions):
     """Why "Structure seed only" cannot decide this session (10/10), or None.
     That mode only checks the 48-bit POSITIONS of the top-level structures: a
@@ -5314,9 +5385,17 @@ def struct_only_blocker(conditions):
     for c in act:
         if c.get("type") in ("dungeon", "lava_lake"):
             return "1.16 dungeons / lava lakes depend on the biomes (the whole seed)"
+    for c in act:                     # (31/10) terrain / biomes / climate: the 64 bits
+        if c.get("type") in _WHOLE_SEED_TYPES:
+            return "Exact Y, Approx Y, biomes and climate depend on the whole seed (64 bits)"
     for c in act:
         if int(c.get("relative", 0) or 0):
             return "it has linked conditions, which only a full test checks"
+    for c in act:                     # (05/11) houses: the layout follows the terrain
+        if _village_filter_on(c):
+            return ("a ruined portal's frame and placement depend on the terrain (the whole seed)"
+                    if c.get("type") == "ruined_portal" else
+                    "a village's houses depend on the terrain (the whole seed)")
     return None
 
 
@@ -5406,6 +5485,14 @@ class _ParallelPostFilter:
         self.th = threading.Thread(target=self._loop, name="ssa-postfilter", daemon=True)
         self.th.start()
 
+    def _batch_len(self):
+        """(05/11) a batch takes ~¼ s of a worker: 128 cheap seeds, a few costly ones
+        (village houses) — Stop / Pause then wait well under a second."""
+        if self.n_checked < 8 or self.secs <= 0:
+            return 8 if self.kind == "full" else self.BATCH
+        per = self.secs / self.n_checked
+        return max(1, min(self.BATCH, int(0.25 / max(per, 1e-6))))
+
     def _note(self, n, k, dt):
         with self.lock:
             self.n_checked += int(n); self.n_passed += int(k); self.secs += float(dt)
@@ -5462,10 +5549,12 @@ class _ParallelPostFilter:
             self.items.append((int(seed), details))
             if self.t_first is None:
                 self.t_first = time.time()
-            if len(self.items) >= self.BATCH:
+            if len(self.items) >= self._batch_len():
                 self._submit_locked()
             backlog = len(self.futs)
-        if backlog > 4 * self.nw:       # the engine waits for the checks (honest speed)
+        # (05/11) 2 batches per worker at most (was 4): with costly checks (village
+        # houses: ~30 ms a seed) Stop waited for ~4 × 128 seeds per worker
+        if backlog > 2 * self.nw:       # the engine waits for the checks (honest speed)
             self._collect(block=True)
 
     def _loop(self):
@@ -5636,7 +5725,9 @@ def _evaluate_session_impl0(
                 _sl = _RangeSeedList(seed_start, seed_count, stop_event)
             # scan_128 = CPU natif 128 (le pipeline GPU 128 est 1.13-1.17 only).
             _use_gpu = (bool(_p.get("eye_gpu", True)) and _mmy is None
-                        and not _scan_128(_p))
+                        and not _scan_128(_p)
+                        # the GPU layouts assume the portal room first in its chunk
+                        and not (int(mc_version) >= 22 and _p.get("eye_full")))
             if on_mode is not None:
                 on_mode(0)
             from broken_search import ResumeTracker
@@ -5650,9 +5741,9 @@ def _evaluate_session_impl0(
                     int(s), (_loc_text(_p, s, mc_version, a[1], a[2]) if len(a) >= 3 else "")),
                 stop_event=stop_event, progress_callback=on_progress,
                 num_workers=max(1, num_workers), mc_version=mc_version,
-                # 1.18+: ±15-chunk prefilter (lossless); 1.13-1.17: the LCG
-                # prefilter lost about half the results (E21) → exact path
-                fast_mode=(int(mc_version) >= 22), use_gpu=_use_gpu, min_max_y=_mmy,
+                # 1.18+: the portal-chunk prefilter (finds ~1/3 of the seeds, E20-E24,
+                # re-measured 06/11) unless "Complete search"; 1.13-1.17: exact path
+                fast_mode=(int(mc_version) >= 22 and not _p.get("eye_full")), use_gpu=_use_gpu, min_max_y=_mmy,
                 seed_list=_sl, scan_128=_scan_val(_p),
                 exact_eyes=bool(_p.get("exact_eyes")),
                 chunk_callback=_etrk.chunk_cb("e") if _etrk is not None else None,
@@ -5751,6 +5842,12 @@ def _evaluate_session_impl0(
     # (absolute Exact Y too: the old streaming post-filter had no statistics and
     # no Pause, and kept a single thread on the candidates)
     _exy_view = None
+    _vil_f = (not _joint_children and any(_village_filter_on(c) for c in enabled))
+    if _vil_f:
+        # (05/11) village houses / smiths: the C engine finds the seeds with the
+        # villages (and the rest); each of them is checked with the whole tree by
+        # worker processes (the Python evaluator applies village_filter)
+        _sh_pf = []
     if (not _joint_children and not _sh_pf
             and any(c.get("type") == "precise_y" for c in enabled)):
         _exy_view = _exy_c_view(enabled)
@@ -5760,10 +5857,12 @@ def _evaluate_session_impl0(
                     _exy_view = None
             except Exception:
                 _exy_view = None
+    if _vil_f and _exy_view is None:
+        _exy_view = list(enabled)
     if _exy_view is not None:
         _x_full = list(enabled)
         _x_abs = all(int(c.get("relative", 0) or 0) == 0 for c in _x_full
-                     if c.get("type") == "precise_y")
+                     if c.get("type") == "precise_y") and not _vil_f
         _x_kind, _x_pay = "full", _x_full
         if _x_abs:
             # only absolute Exact Y: the candidates need just those (batched C)
@@ -5778,12 +5877,28 @@ def _evaluate_session_impl0(
                 pass
         _x_base = on_match
         max_found = 0       # the engine's matches are candidates, not results
-        _ppf_x = _ParallelPostFilter(_x_kind, _x_pay, mc_version, num_workers, _x_base)
+        _pf_n = num_workers
+        if _vil_f:
+            # (05/11) the village houses (~30 ms a seed) are the slow part: the C
+            # engine keeps a quarter of the threads, the checks the rest (12 threads
+            # gave 12 engine threads + 12 checking processes: 100 % of the CPU)
+            _eng_n = max(1, int(num_workers or 1) // 4)
+            _pf_n = max(1, int(num_workers or 1) - _eng_n)
+            # (05/11) every thread of the machine chosen: the checks get them all (the
+            # engine threads wait while the checks are behind) — 24 / 24 gave 84 %
+            if int(num_workers or 1) >= (os.cpu_count() or 1):
+                _pf_n = int(num_workers)
+            num_workers = _eng_n
+        _ppf_x = _ParallelPostFilter(_x_kind, _x_pay, mc_version, _pf_n, _x_base)
         _PPF_TLS.obj = _ppf_x
         _x_rows = _exy_view_rows(_x_full)          # view row -> session row
         enabled = _exy_view
         if on_mode is not None:
-            try: on_mode(("note", "Exact Y checked on the C engine's candidates"))
+            try: on_mode(("note", ("Ruined portals checked on the C engine's candidates"
+                                   if any(c.get("type") == "ruined_portal" and _village_filter_on(c)
+                                          for c in _x_full) else
+                                   "Village houses checked on the C engine's candidates")
+                          if _vil_f else "Exact Y checked on the C engine's candidates"))
             except Exception: pass
         if on_profile is not None:
             _x_prof = on_profile
@@ -5801,7 +5916,8 @@ def _evaluate_session_impl0(
                     nc, npass, secs = _ppf_x.n_checked, _ppf_x.n_passed, _ppf_x.secs
                 # the engine times 1 seed in 32: the same scale for the post-filter
                 tk = int(secs * _x_hz / 32) if _x_hz else 0
-                ex = [i for i, c in enumerate(_x_full) if c.get("type") == "precise_y"]
+                ex = [i for i, c in enumerate(_x_full) if c.get("type") == "precise_y"
+                      or _village_filter_on(c)]
                 for j, i in enumerate(ex):
                     full[i] = (nc, npass, tk if j == 0 else 0, nc, npass)
                 for i in range(_n):
@@ -6142,7 +6258,6 @@ def _evaluate_session_impl0(
     _gpu_struct = any(c.get("params", {}).get("use_gpu")
                       for c in enabled
                       if c.get("type") in _structure_type_keys())
-    import sys as _sys
     _nl_dbg(f"[GPU-DBG] search_mode={search_mode!r}  _gpu_struct={_gpu_struct}")
     # Dès qu'une condition de structure a use_gpu=True, on emprunte le pipeline
     # GPU — INDÉPENDAMMENT du mode affiché dans l'UI. Cocher « GPU CUDA » EST la
@@ -6175,7 +6290,7 @@ def _evaluate_session_impl0(
                         return  # pipeline GPU terminé
                     else:
                         _gpu_msg = (_LAST_GPU_FAIL["msg"]
-                                    or "GPU : échec du pré-filtre — recherche relancée sur le CPU.")
+                                    or "GPU: the pre-filter failed — search restarted on the CPU.")
                 else:
                     _gpu_msg = ("GPU: no eligible structure (build_jobs empty). "
                                 "This structure may not be supported by the kernel.")

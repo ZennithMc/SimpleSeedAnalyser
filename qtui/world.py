@@ -14,6 +14,69 @@ from PySide6.QtCore import QObject, Signal
 import cubiomes_wrap as cw
 
 VERSION_NAMES = list(cw.DROPDOWN_VERSIONS)
+# (29/10) the game versions each entry stands for (tooltips of the version list)
+VERSION_TIPS = {
+    "Java 1.16.1": "1.16 → 1.16.1", "Java 1.16": "1.16.2 → 1.16.5", "Java 1.17": "1.17 → 1.17.1",
+    "Java 1.18": "1.18 → 1.18.2", "Java 1.19.2": "1.19 → 1.19.2", "Java 1.19": "1.19.3 → 1.19.4",
+    "Java 1.20": "1.20 → 1.20.6", "Java 1.21.1": "1.21 → 1.21.1", "Java 1.21.3": "1.21.2 → 1.21.3",
+    "Java 1.21": "1.21.4 → 1.21.8", "Java 1.21.9": "1.21.9 → 1.21.11 (strongholds also in "
+    "cherry groves)", "Java 26.1": "26.1.x", "Java 26.2": "26.2", "Java 26.3": "26.3",
+}
+# (31/10) what the version list shows: the game versions of each entry, in order
+# (« Java 1.21 » — 1.21.4 → 1.21.8 — came after 1.21.3 and looked misplaced)
+VERSION_LABELS = {
+    "Java 1.16.1": "Java 1.16 – 1.16.1", "Java 1.16": "Java 1.16.2 – 1.16.5",
+    "Java 1.17": "Java 1.17 – 1.17.1", "Java 1.18": "Java 1.18 – 1.18.2",
+    "Java 1.19.2": "Java 1.19 – 1.19.2", "Java 1.19": "Java 1.19.3 – 1.19.4",
+    "Java 1.20": "Java 1.20 – 1.20.6", "Java 1.21.1": "Java 1.21 – 1.21.1",
+    "Java 1.21.3": "Java 1.21.2 – 1.21.3", "Java 1.21": "Java 1.21.4 – 1.21.8",
+    "Java 1.21.9": "Java 1.21.9 – 1.21.11", "Java 26.1": "Java 26.1",
+    "Java 26.2": "Java 26.2", "Java 26.3": "Java 26.3",
+}
+
+
+def version_label(name: str) -> str:
+    return VERSION_LABELS.get(name, name)
+
+
+# (31/10) every game version, by entry (the version menu: major → exact versions)
+GAME_VERSIONS = {
+    "Java 1.16.1": ["1.16", "1.16.1"], "Java 1.16": ["1.16.2", "1.16.3", "1.16.4", "1.16.5"],
+    "Java 1.17": ["1.17", "1.17.1"], "Java 1.18": ["1.18", "1.18.1", "1.18.2"],
+    "Java 1.19.2": ["1.19", "1.19.1", "1.19.2"], "Java 1.19": ["1.19.3", "1.19.4"],
+    "Java 1.20": ["1.20", "1.20.1", "1.20.2", "1.20.3", "1.20.4", "1.20.5", "1.20.6"],
+    "Java 1.21.1": ["1.21", "1.21.1"], "Java 1.21.3": ["1.21.2", "1.21.3"],
+    "Java 1.21": ["1.21.4", "1.21.5", "1.21.6", "1.21.7", "1.21.8"],
+    "Java 1.21.9": ["1.21.9", "1.21.10", "1.21.11"],
+    "Java 26.1": ["26.1"], "Java 26.2": ["26.2"], "Java 26.3": ["26.3"],
+}
+EXACT_TO_NAME = {v: k for k, vs in GAME_VERSIONS.items() for v in vs}
+
+
+def major_of(exact: str) -> str:
+    """'1.21.4' -> '1.21', '26.2' -> '26'."""
+    a = exact.split(".")
+    return a[0] if a[0] != "1" else ".".join(a[:2])
+
+
+_EXACT = [None]
+
+
+def current_exact(name: str | None = None) -> str:
+    """The exact game version chosen in the top bar (the last one of the entry
+    when it does not match `name`)."""
+    e = _EXACT[0]
+    if e is None or (name is not None and EXACT_TO_NAME.get(e) != name):
+        if name is None:
+            return e or ""
+        return GAME_VERSIONS.get(name, [""])[-1]
+    return e
+
+
+def set_current_exact(exact: str) -> None:
+    _EXACT[0] = exact
+
+
 DEFAULT_VERSION = "Java 1.21" if "Java 1.21" in VERSION_NAMES else VERSION_NAMES[-1]
 
 
@@ -72,7 +135,9 @@ class WorldState(QObject):
         self.changed.emit()
 
     def structure_available(self, key: str) -> bool:
-        if key in ("dungeon", "lava_lake"):          # (10/10) 1.16 features only
+        if key == "dungeon":                         # (30/10) every version (1.17+ too)
+            return 19 <= int(self.mc) <= 35
+        if key == "lava_lake":                       # (10/10) 1.16 features only
             return int(self.mc) in (19, 20)
         need = cw.STRUCTURE_MIN_VERSION.get(key)
         return need is None or self.mc >= need

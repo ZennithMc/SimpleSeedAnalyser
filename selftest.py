@@ -4,8 +4,8 @@ selftest.py — quick check that an installed SSA works on this PC.
     SimpleSeedAnalyser.exe --selftest        (or: py ssa_qt.py --selftest)
 
 Checks the native libraries with known answers (biomes, the session engine,
-eyes of ender, exact Y), that worker processes start (frozen multiprocessing)
-and reports the GPU state. The report goes to the console, to
+eyes of ender, exact Y, chest loot, world spawn), that worker processes start
+(frozen multiprocessing) and reports the GPU state. The report goes to the console, to
 %LOCALAPPDATA%\\SimpleSeedAnalyser\\selftest.txt (~/.local/state/SimpleSeedAnalyser on Linux)
 and, when possible, to a message box. Exit code 0 = everything passed.
 """
@@ -89,12 +89,31 @@ def run() -> tuple[bool, str]:
         got = (e.exact_y(0, 0), e.exact_y(1234, -567))
         return got == (41, 63), f"surface Y {got}"
 
+    def loot():
+        # a 26.2 stronghold chest checked in game (tests/loot_ingame_check.py)
+        import structure_loot as sl
+        res = {tuple(c["pos"]): c for c in sl.chests("stronghold", -2605588847664851059, 34, 1860, 1124, None)}
+        c = res.get((1866, 41, 1132))
+        got = {} if c is None else {i: s.item.replace("minecraft:", "") for i, s in enumerate(c["slots"])
+                                    if s is not None}
+        want = {5: "eye_armor_trim_smithing_template", 11: "bread", 16: "bread", 18: "ender_pearl",
+                21: "bread", 22: "iron_helmet"}
+        return got == want, "stronghold chest as in game" if got == want else f"got {got}"
+
+    def spawn():
+        # a 1.21.11 world spawn read from a real server's level.dat
+        import spawn_exact
+        got = spawn_exact.spawn(8112289023114088219, 32)            # MC_1_21_11
+        return got == (2272, 63, 1386), f"world spawn {got} (server: (2272, 63, 1386))"
+
     check("Biome generation", biomes)
     check("Session engine (C)", session)
     check("Worker processes", workers)
     check("Eyes of ender", eyes)
     check("Stronghold layouts", layouts)
     check("Exact Y (terrain)", exact_y)
+    check("Chest loot", loot)
+    check("World spawn (1.18+)", spawn)
     try:
         import native_libs as nl
         for unit in ("structure_cuda", "noise_gpu", "gaider_cuda"):
@@ -103,6 +122,14 @@ def run() -> tuple[bool, str]:
             print(lines[-1], flush=True)
     except Exception as e:                          # noqa: BLE001
         lines.append(f"cpu   GPU check                    {e}")
+    try:                                            # optional C engines (else: Python, slower)
+        import loot_native
+        ok = bool(loot_native.available())
+        lines.append(f"{'C   ' if ok else 'py  '}  {'lootvm (loot finder)':<28} "
+                     + ("loaded" if ok else "not found — the loot finder runs in Python (slower)"))
+        print(lines[-1], flush=True)
+    except Exception as e:                          # noqa: BLE001
+        lines.append(f"py    lootvm (loot finder)         {e}")
     head = "SimpleSeedAnalyser self-test: " + ("ALL OK" if ok_all else "PROBLEMS FOUND")
     return ok_all, head + "\n\n" + "\n".join(lines)
 

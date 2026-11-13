@@ -19,11 +19,10 @@ has_corrupted() renvoie False et la recherche est indisponible).
 """
 import os
 import ctypes
-import math
 import multiprocessing as mp
 
 import cubiomes_wrap
-from stronghold_eyes import get_stronghold_portal_full, get_end_portal_frames
+from stronghold_eyes import get_end_portal_frames
 
 _U64 = (1 << 64) - 1
 _REG = 40 * 16  # taille de région des portails en ruine (40 chunks) en blocs
@@ -700,8 +699,8 @@ def search_corrupted_portals(seed_start, seed_count, callback,
     are done (ignores seed_start/seed_count).
     """
     if not has_corrupted():
-        raise RuntimeError("libcubiomes ne contient pas le pont corrupted — "
-                           "supprime libcubiomes.dll pour recompiler.")
+        raise RuntimeError("libcubiomes lacks the corrupted-portal bridge — "
+                           "rebuild it: py tools/build_native.py --cubiomes")
     if seed_list is not None:
         # Stream the list — do NOT materialise 43M ints. SeedListSource / list
         # expose len() for the progress denominator; a bare generator gives 0

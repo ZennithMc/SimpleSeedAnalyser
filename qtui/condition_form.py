@@ -17,9 +17,8 @@ import copy
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFrame,
-                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QPushButton, QScrollArea, QSpinBox,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFrame,
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QSpinBox,
                                QToolButton, QVBoxLayout, QWidget)
 
 from condition_types import (CATEGORY_COLORS, CONDITION_TYPES, _build_octave_options)
@@ -133,14 +132,14 @@ class TypePicker(QWidget):
     GROUPS = [("Structures", "structures", "village"),
               ("Nether", ["fortress", "bastion", "ruined_portal_nether", "nether_biomes"],
                "fortress"),
-              ("End", ["end_city", "end_gateway", "end_biomes"], "end_city"),
+              ("End", ["end_city", "end_gateway", "end_biomes", "elytra_spawn"], "end_city"),
               ("Biomes", ["biome_filter", "biome_sample", "biome_center"], "biome_filter"),
               ("Climate", ["climate_minmax", "climate_center", "noise_sample", "crunchiness",
                            "height", "precise_y"], "climate_center"),
               ("Algorithm helpers", ["spiral", "logic_or", "logic_not", "scale_to_nether",
                                      "scale_to_overworld"], "spiral"),
               ("Presets", ["spawn116_preset", "mansion_spawn116_preset", "dungeon_spawn116_preset",
-                          "lavalake_spawn116_preset"], "spawn"),
+                          "lavalake_spawn116_preset", "elytra_spawn_preset"], "spawn"),
               ("Others", None, "slime")]
 
     @classmethod
@@ -574,6 +573,18 @@ class ConditionForm(QWidget):
             lay.addSpacing(4)
             self._build_stronghold(lay, c)
             specs = {}
+        self.vg = None
+        if t == "village":                     # (05/11) its own panel
+            self.pw = {}
+            lay.addSpacing(4)
+            self._build_village(lay, c)
+            specs = {}
+        self.rp = None
+        if t == "ruined_portal":               # (07/11) its own panel
+            self.pw = {}
+            lay.addSpacing(4)
+            self._build_ruined_portal(lay, c)
+            specs = {}
         if specs:
             lay.addSpacing(4); lay.addWidget(section_title("Details"))
             self._build_params(lay, c, specs)
@@ -617,6 +628,7 @@ class ConditionForm(QWidget):
                                                     (c.get("x2", 0) - c.get("x1", 0))), 16, " blocks")
         box = QWidget(); g = QGridLayout(box); g.setContentsMargins(0, 0, 0, 0)
         g.setHorizontalSpacing(6); g.setVerticalSpacing(4)
+        box.setToolTip("Two opposite corners of the box, in any order.")
         for i, k in enumerate(("x1", "z1", "x2", "z2")):
             self.w[k] = _spin(val=int(c.get(k, 0)))
             g.addWidget(body(k.upper(), muted=True, wrap=False), i // 2, (i % 2) * 2)
@@ -824,7 +836,14 @@ class ConditionForm(QWidget):
                              "(eyes alone, first stronghold).")
         sh["gpu"].setChecked(bool(p.get("eye_gpu", True)))
         sh["gpu"].toggled.connect(self._changed)
+        # (06/11) 1.18+: the fast prefilter (portal room alone in its chunk) misses seeds
+        sh["full"] = QCheckBox("Complete search (slower)")
+        sh["full"].setToolTip("1.18+, 6 to 11 eyes: checks every seed exactly (CPU).\n"
+                              "Unticked: ~30× faster, but finds about 1 matching seed in 3.")
+        sh["full"].setChecked(bool(p.get("eye_full")))
+        sh["full"].toggled.connect(self._changed)
         bl.addWidget(sh["portal"]); bl.addWidget(sh["cmp"]); bl.addWidget(sh["gpu"])
+        bl.addWidget(sh["full"])
         sh["eyes_box"] = box
         lay.addWidget(box)
         # top Y: the same gauge as the Stronghold page
@@ -911,6 +930,7 @@ class ConditionForm(QWidget):
         mc = int(self.mc)
         sh["eyes_box"].setVisible(sh["eyes_on"].isChecked())
         sh["maxy_box"].setVisible(sh["maxy_on"].isChecked())
+        sh["full"].setVisible(mc >= 22)
         sh["gauge"].set_mc(mc)
         import topy_family as _tf
         room = sh["target"].value() == "Portal room"
@@ -945,10 +965,311 @@ class ConditionForm(QWidget):
         sh["frames"].set_causes([c[3] for c in CAUSES
                                  if c[0] in on])
 
+    # ── village (05/11) ─────────────────────────────────────────────────────
+    def _build_village(self, lay, c):
+        """The village's type (cards), abandoned or not, and its houses and forges
+        (histograms of 100 000 villages with two handles, and their rarity)."""
+        from .village_visuals import CountRange, VillageTypePicker, histogram, rarity_text, share
+        import village_filter as vf
+        p = c.get("params", {}) or {}
+        vg = self.vg = {}
+        from .village_visuals import stats_info
+        hdr = QHBoxLayout(); hdr.setSpacing(6)
+        hdr.addWidget(section_title("Village")); hdr.addStretch(1)
+        st = QLabel("ⓘ  Stats"); st.setObjectName("Muted")
+        st.setToolTip(stats_info())
+        st.setCursor(Qt.CursorShape.WhatsThisCursor)
+        hdr.addWidget(st)
+        lay.addLayout(hdr)
+        vg["types"] = VillageTypePicker(p.get("types") or [])
+        lay.addWidget(vg["types"])
+        vg["variant"] = Segmented(["Any", "Not abandoned", "Abandoned"],
+                                  {"abandoned": "Abandoned", "not_abandoned": "Not abandoned"}.get(
+                                      p.get("variant", "any"), "Any"))
+        vg["variant"].buttons["Abandoned"].setToolTip("A zombie village (2 % of the villages): "
+                                                      "zombie villagers, broken houses.")
+        lay.addLayout(_field("Abandoned", vg["variant"]))
+
+        def _range_block(key, title, n, unit, tip):
+            lo, hi = vf.bounds(p, key)
+            head = QHBoxLayout(); head.setSpacing(8)
+            cb = QCheckBox(title); cb.setChecked(lo is not None or hi is not None)
+            cb.setToolTip(tip)
+            head.addWidget(cb); head.addStretch(1)
+            rar = QLabel(""); rar.setObjectName("Muted")
+            head.addWidget(rar)
+            lay.addSpacing(6); lay.addLayout(head)
+            box = QWidget(); bl = QVBoxLayout(box); bl.setContentsMargins(0, 2, 0, 0); bl.setSpacing(6)
+            cr = CountRange(n, lo or 0, hi, unit)
+            cr.setToolTip(tip)
+            bl.addWidget(cr)
+            row = QHBoxLayout(); row.setSpacing(8)
+            # (05/11) plain fields: a spin box with « Min » inside appended the typed
+            # digits instead of replacing them
+            from PySide6.QtGui import QIntValidator
+            mn = QLineEdit("" if not lo else str(lo)); mn.setPlaceholderText("0")
+            mx = QLineEdit("" if hi is None else str(hi)); mx.setPlaceholderText("∞")
+            for w_ in (mn, mx):
+                w_.setValidator(QIntValidator(0, 999, w_))
+                w_.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            row.addWidget(body("Min", muted=True, wrap=False))
+            row.addWidget(mn, 1)
+            row.addSpacing(6); row.addWidget(body("Max", muted=True, wrap=False))
+            row.addWidget(mx, 1)
+            bl.addLayout(row)
+            lay.addWidget(box)
+            vg[key] = dict(cb=cb, cr=cr, mn=mn, mx=mx, box=box, rar=rar, n=n)
+
+            def _from_bar(a, b, mn=mn, mx=mx):
+                for w_, v in ((mn, "" if not a else str(a)), (mx, "" if b is None else str(b))):
+                    w_.blockSignals(True); w_.setText(v); w_.blockSignals(False)
+                self._sync_village(); self._changed()
+
+            def _from_fields(_v=None, cr=cr, mn=mn, mx=mx):
+                a = int(mn.text()) if mn.text().strip() else 0
+                b = int(mx.text()) if mx.text().strip() else None
+                cr.set_values(a, None if b is None else max(a, b))
+                self._sync_village(); self._changed()
+            cr.changed.connect(_from_bar)
+            mn.textChanged.connect(_from_fields); mx.textChanged.connect(_from_fields)
+            cb.toggled.connect(lambda _v: (self._sync_village(), self._changed()))
+        _range_block("houses", "Houses", 40, "houses",
+                     "Farms, animal pens and meeting points are not houses.")
+        _range_block("smiths", "Forges with a chest", 6, "forges",
+                     "The smiths' houses with a loot chest (weaponsmith, toolsmith or armorer, "
+                     "depending on the village type).")
+        # the summary card
+        card = QFrame(); card.setObjectName("Card")
+        cl = QVBoxLayout(card); cl.setContentsMargins(12, 10, 12, 10); cl.setSpacing(3)
+        vg["sum_title"] = QLabel(""); vg["sum_title"].setObjectName("PanelTitle")
+        vg["sum_text"] = body("", muted=True, small=True)
+        cl.addWidget(vg["sum_title"]); cl.addWidget(vg["sum_text"])
+        lay.addSpacing(6); lay.addWidget(card)
+        vg["card"] = card
+        vg["gpu"] = QCheckBox("GPU CUDA (48-bit only)")
+        vg["gpu"].setChecked(bool(p.get("use_gpu")))
+        vg["gpu"].setToolTip("Village positions on the GPU; houses and forges on the CPU.")
+        vg["gpu"].toggled.connect(self._changed)
+        lay.addWidget(vg["gpu"])
+        vg["types"].changed.connect(lambda _v: (self._sync_village(), self._changed()))
+        vg["variant"].changed.connect(lambda _v: self._changed())
+        self._vv = (histogram, rarity_text, share)
+        self._sync_village()
+
+    def _village_bounds(self, key):
+        d = self.vg[key]
+        if not d["cb"].isChecked():
+            return None, None
+        lo = int(d["mn"].text()) if d["mn"].text().strip() else 0
+        hi = int(d["mx"].text()) if d["mx"].text().strip() else None
+        if hi is not None and hi < lo:
+            hi = lo
+        return (lo or None), hi
+
+    def _sync_village(self):
+        vg = getattr(self, "vg", None)
+        if not vg:
+            return
+        histogram, rarity_text, share = self._vv
+        types = vg["types"].value()
+        for key, which in (("houses", "houses"), ("smiths", "forges")):
+            d = vg[key]
+            on = d["cb"].isChecked()
+            d["box"].setVisible(on)
+            d["cr"].set_hist(histogram(types, which, d["n"] + 1))
+            lo, hi = self._village_bounds(key)
+            pr = share(types, *(lo, hi) if key == "houses" else (None, None),
+                       *(lo, hi) if key == "smiths" else (None, None))
+            if on and pr is not None:
+                pct, one, col = rarity_text(pr, types)
+                d["rar"].setText(one if pr else pct)
+                d["rar"].setStyleSheet(f"color: {col.name()};")
+            else:
+                d["rar"].setText("")
+        hl, hh = self._village_bounds("houses")
+        fl, fh = self._village_bounds("smiths")
+        filt = any(v is not None for v in (hl, hh, fl, fh))
+        if filt:
+            pr = share(types, hl, hh, fl, fh)
+            pct, one, col = rarity_text(pr, types)
+            vg["sum_title"].setText(one if pr else pct)
+            vg["sum_title"].setStyleSheet(f"color: {col.name()};")
+            vg["sum_text"].setText((pct if pr else "") + (" · " if pr else "") +
+                                   "checked on the real terrain")
+        else:
+            vg["sum_title"].setText("Any village" if not types else
+                                    " / ".join(t.capitalize() for t in types) + " villages")
+            vg["sum_title"].setStyleSheet("")
+            vg["sum_text"].setText("")
+        vg["sum_text"].setVisible(bool(vg["sum_text"].text()))
+
+    def _village_params(self):
+        vg = self.vg
+        def rng(key):
+            lo, hi = self._village_bounds(key)
+            return None if lo is None and hi is None else (
+                None if lo is None else str(lo), None if hi is None else str(hi))
+        return dict(variant={"Abandoned": "abandoned", "Not abandoned": "not_abandoned"}.get(
+                        vg["variant"].value(), "any"),
+                    types=vg["types"].value(), houses=rng("houses"), smiths=rng("smiths"),
+                    use_gpu=vg["gpu"].isChecked())
+
+    # ── ruined portal (07/11) ──────────────────────────────────────────────
+    def _build_ruined_portal(self, lay, c):
+        """Where it stands, its type, the crying obsidian of its frame, and whether it
+        can be completed and lit with its own chest."""
+        from .ruined_portal_visuals import PlacementPicker, PortalFrame
+        from .village_visuals import CountRange
+        import ruined_portal_filter as rpf
+        p = c.get("params", {}) or {}
+        rp = self.rp = {}
+        hdr = QHBoxLayout(); hdr.setSpacing(6)
+        hdr.addWidget(section_title("Ruined portal")); hdr.addStretch(1)
+        st = QLabel("ⓘ  Stats"); st.setObjectName("Muted")
+        st.setCursor(Qt.CursorShape.WhatsThisCursor)
+        hdr.addWidget(st)
+        rp["stats"] = st
+        lay.addLayout(hdr)
+        rp["place"] = PlacementPicker(rpf.placements_of(p))
+        lay.addWidget(rp["place"])
+        # the frame
+        lay.addSpacing(6)
+        rp["frame"] = PortalFrame()
+        rp["frame"].setToolTip(
+            "The portal's frame: the cheapest nether portal (4 × 5 or bigger, corners not\n"
+            "needed) made with the ruin's obsidian where it stands. Crying obsidian does not\n"
+            "make a portal: it must be broken and replaced.")
+        lay.addWidget(rp["frame"])
+        rp["comp"] = QCheckBox("Completable")
+        rp["comp"].setChecked(bool(p.get("completable")))
+        rp["comp"].setToolTip(
+            "Its chest holds enough obsidian to fill the frame's holes and replace its crying\n"
+            "obsidian, and something to light it: a flint and steel, a fire charge, or flint +\n"
+            "iron nuggets (9 nuggets → an ingot → a flint and steel). The chest must still be\n"
+            "there (not in lava, not under the netherrack).")
+        lay.addWidget(rp["comp"])
+        # crying obsidian: a histogram with two handles, as the village's houses
+        lo, hi = rpf.bounds(p, "crying")
+        head = QHBoxLayout(); head.setSpacing(8)
+        rp["cry_on"] = QCheckBox("Crying obsidian in the frame")
+        rp["cry_on"].setChecked(lo is not None or hi is not None)
+        rp["cry_on"].setToolTip("How many crying obsidian blocks of the frame you would have to\n"
+                                "break (a diamond pickaxe) and replace.")
+        head.addWidget(rp["cry_on"]); head.addStretch(1)
+        rp["cry_rar"] = QLabel(""); rp["cry_rar"].setObjectName("Muted")
+        head.addWidget(rp["cry_rar"])
+        lay.addSpacing(2); lay.addLayout(head)
+        box = QWidget(); bl = QVBoxLayout(box); bl.setContentsMargins(0, 2, 0, 0); bl.setSpacing(6)
+        rp["cry"] = CountRange(6, lo or 0, hi, "crying")
+        bl.addWidget(rp["cry"])
+        row = QHBoxLayout(); row.setSpacing(8)
+        from PySide6.QtGui import QIntValidator
+        mn = QLineEdit("" if not lo else str(lo)); mn.setPlaceholderText("0")
+        mx = QLineEdit("" if hi is None else str(hi)); mx.setPlaceholderText("∞")
+        for w_ in (mn, mx):
+            w_.setValidator(QIntValidator(0, 99, w_))
+            w_.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row.addWidget(body("Min", muted=True, wrap=False)); row.addWidget(mn, 1)
+        row.addSpacing(6); row.addWidget(body("Max", muted=True, wrap=False)); row.addWidget(mx, 1)
+        bl.addLayout(row)
+        rp["cry_box"], rp["cry_mn"], rp["cry_mx"] = box, mn, mx
+        lay.addWidget(box)
+
+        def _from_bar(a, b):
+            for w_, v in ((mn, "" if not a else str(a)), (mx, "" if b is None else str(b))):
+                w_.blockSignals(True); w_.setText(v); w_.blockSignals(False)
+            self._sync_ruined(); self._changed()
+
+        def _from_fields(_v=None):
+            a = int(mn.text()) if mn.text().strip() else 0
+            b = int(mx.text()) if mx.text().strip() else None
+            rp["cry"].set_values(a, None if b is None else max(a, b))
+            self._sync_ruined(); self._changed()
+        rp["cry"].changed.connect(_from_bar)
+        mn.textChanged.connect(_from_fields); mx.textChanged.connect(_from_fields)
+        # the summary
+        card = QFrame(); card.setObjectName("Card")
+        cl = QVBoxLayout(card); cl.setContentsMargins(12, 10, 12, 10); cl.setSpacing(3)
+        rp["sum_title"] = QLabel(""); rp["sum_title"].setObjectName("PanelTitle")
+        rp["sum_text"] = body("", muted=True, small=True)
+        cl.addWidget(rp["sum_title"]); cl.addWidget(rp["sum_text"])
+        lay.addSpacing(6); lay.addWidget(card)
+        rp["gpu"] = QCheckBox("GPU CUDA (48-bit only)")
+        rp["gpu"].setChecked(bool(p.get("use_gpu")))
+        rp["gpu"].setToolTip("Portal positions on the GPU (without the filters above: they need\n"
+                             "the terrain, so the whole seed).")
+        rp["gpu"].toggled.connect(self._changed)
+        lay.addWidget(rp["gpu"])
+        rp["place"].changed.connect(lambda _v: (self._sync_ruined(), self._changed()))
+        for k in ("comp", "cry_on"):
+            rp[k].toggled.connect(lambda _v: (self._sync_ruined(), self._changed()))
+        self._sync_ruined()
+
+    def _ruined_bounds(self):
+        rp = self.rp
+        if not rp["cry_on"].isChecked():
+            return None, None
+        lo = int(rp["cry_mn"].text()) if rp["cry_mn"].text().strip() else 0
+        hi = int(rp["cry_mx"].text()) if rp["cry_mx"].text().strip() else None
+        if hi is not None and hi < lo:
+            hi = lo
+        return (lo or None), hi
+
+    def _sync_ruined(self):
+        rp = getattr(self, "rp", None)
+        if not rp:
+            return
+        from .ruined_portal_visuals import (crying_hist, placement_shares, rarity_text, share,
+                                            stats_info)
+        mc = int(self.mc)
+        pl, ks = rp["place"].value(), []
+        comp = rp["comp"].isChecked()
+        lo, hi = self._ruined_bounds()
+        on = rp["cry_on"].isChecked()
+        rp["cry_box"].setVisible(on)
+        rp["place"].set_shares(placement_shares(mc))
+        rp["stats"].setToolTip(stats_info(mc))
+        rp["cry"].set_hist(crying_hist(mc, pl, ks, comp))
+        rp["frame"].set_state(lo or 0, hi, comp)
+        if on:
+            pr = share(mc, pl, ks, lo, hi, False)
+            pct, one, col = rarity_text(pr, mc)
+            rp["cry_rar"].setText(one if pr else pct)
+            rp["cry_rar"].setStyleSheet(f"color: {col.name()};")
+        else:
+            rp["cry_rar"].setText("")
+        filt = bool(pl or ks or comp or lo is not None or hi is not None)
+        if mc < 19:
+            rp["sum_title"].setText("No ruined portals before 1.16")
+            rp["sum_title"].setStyleSheet("")
+            rp["sum_text"].setText("")
+        elif filt:
+            pr = share(mc, pl, ks, lo, hi, comp)
+            pct, one, col = rarity_text(pr, mc)
+            rp["sum_title"].setText(one if pr else pct)
+            rp["sum_title"].setStyleSheet(f"color: {col.name()};")
+            rp["sum_text"].setText((pct + " · " if pr else "") + "checked on the real terrain")
+        else:
+            rp["sum_title"].setText("Any ruined portal")
+            rp["sum_title"].setStyleSheet("")
+            rp["sum_text"].setText("")
+        rp["sum_text"].setVisible(bool(rp["sum_text"].text()))
+        rp["gpu"].setVisible(not filt)
+
+    def _ruined_params(self):
+        rp = self.rp
+        lo, hi = self._ruined_bounds()
+        cry = None if lo is None and hi is None else (
+            None if lo is None else str(lo), None if hi is None else str(hi))
+        return dict(placements=rp["place"].value(), kinds=[],
+                    completable=rp["comp"].isChecked(), crying=cry,
+                    use_gpu=rp["gpu"].isChecked())
+
     def set_mc(self, mc):
         """The version of the top bar changed: grey / ungrey what depends on it."""
         self.mc = int(mc)
         self._sync_stronghold()
+        self._sync_ruined()
 
     def _stronghold_params(self):
         sh = self.sh
@@ -956,6 +1277,7 @@ class ConditionForm(QWidget):
         out = dict(min_eyes=int(sh["portal"].value()) if eyes else 0,
                    exact_eyes=eyes and sh["cmp"].value() == "Exactly",
                    eye_gpu=sh["gpu"].isChecked(),
+                   eye_full=sh["full"].isChecked(),
                    topy_gpu=sh["topy_gpu"].isChecked(),
                    maxy_enabled=sh["maxy_on"].isChecked(),
                    min_max_y=int(sh["miny"].value()),
@@ -1050,8 +1372,13 @@ class ConditionForm(QWidget):
                     e.textChanged.connect(self._changed)
                 bl.addWidget(a); bl.addWidget(body("to", muted=True, wrap=False)); bl.addWidget(b)
                 wd = (a, b)
-                lay.addLayout(_field(label, box, "Empty = no bound. Values are ×10000 like "
-                                                 "cubiomes-viewer (e.g. -4500)."))
+                if spec.get("int"):                       # (05/11) counts (village houses)
+                    from PySide6.QtGui import QIntValidator
+                    for e in (a, b):
+                        e.setValidator(QIntValidator(0, 1000, e))
+                lay.addLayout(_field(label, box, spec.get("tip") or
+                                     "Empty = no bound. Values are ×10000 like "
+                                     "cubiomes-viewer (e.g. -4500)."))
             elif typ == "octave_choice":
                 wd = QComboBox()
                 wd.currentIndexChanged.connect(self._changed)
@@ -1282,7 +1609,7 @@ class ConditionForm(QWidget):
         # stronghold sub-options follow their switch
         if "min_eyes" in pw:
             eyes_on = pw["min_eyes"][1].value() > 0
-            for k in ("exact_eyes", "eye_gpu"):
+            for k in ("exact_eyes", "eye_gpu", "eye_full"):
                 if k in pw:
                     pw[k][1].setEnabled(eyes_on)
             if "maxy_enabled" in pw and "min_max_y" in pw:
@@ -1309,8 +1636,9 @@ class ConditionForm(QWidget):
                 c.update(area_mode=1, radial=0, square_side=s, rmax=0, x1=-h, z1=-h, x2=h, z2=h)
             else:
                 x1, z1, x2, z2 = (self.w[k].value() for k in ("x1", "z1", "x2", "z2"))
-                if x2 < x1 or z2 < z1:
-                    raise ValueError("Box: X2 / Z2 must be ≥ X1 / Z1.")
+                # (05/11) any two opposite corners: put in order (no error any more)
+                x1, x2 = min(x1, x2), max(x1, x2)
+                z1, z2 = min(z1, z2), max(z1, z2)
                 c.update(area_mode=2, radial=0, square_side=0, rmax=0, x1=x1, z1=z1, x2=x2, z2=z2)
             if info.get("requires_at"):
                 ax, az = self.w["at_x"].value(), self.w["at_z"].value()
@@ -1373,6 +1701,11 @@ class ConditionForm(QWidget):
             elif typ == "weight_matrix":
                 params[key] = {slot: sp.value() for slot, sp in wd.items() if not slot.startswith("__")
                                and sp.isVisibleTo(wd["__box"])}
+        if t == "village" and getattr(self, "vg", None):
+            params.update(self._village_params())
+            params.pop("smith_kind", None)
+        if t == "ruined_portal" and getattr(self, "rp", None):
+            params.update(self._ruined_params())
         if t == "first_stronghold" and self.sh is not None:
             params.update(self._stronghold_params())
             for old in ("eye_enabled", "scan_128"):      # pre-rework keys (now explicit)

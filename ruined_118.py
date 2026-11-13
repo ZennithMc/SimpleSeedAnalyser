@@ -18,7 +18,6 @@ Differences vs 1.13-1.17 (handled here):
 The footprint X,Z + variant are EXACT. The Y is approximate (terrain) and gets
 calibrated against the 1.18.1 checker (scan_ruined_118.py).
 """
-import ctypes
 from stronghold_eyes import JavaRandom, get_end_portal_frames
 from ruined_portal import _PSX, _PSY, _PSZ, _FOOTPRINT, _xf
 

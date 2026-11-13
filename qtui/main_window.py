@@ -12,14 +12,12 @@ The seed / version live in the top bar, always visible, shared by every page.
 from __future__ import annotations
 
 import os
-import subprocess
-import sys
 import threading
 
 from PySide6.QtCore import QObject, QSize, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel,
-                               QLineEdit, QMainWindow, QPushButton, QStackedWidget,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFrame, QHBoxLayout, QLabel,
+                               QLineEdit, QMainWindow, QStackedWidget,
                                QToolButton, QVBoxLayout, QWidget)
 
 from . import icons, theme
@@ -29,7 +27,7 @@ from .map_drawer import MapDrawer
 from .map_link import MapLink
 from .sessions_page import SessionsPage
 from .stronghold_page import StrongholdPage
-from .world import VERSION_NAMES, WorldState, parse_seed, random_seed
+from .world import VERSION_NAMES, VERSION_TIPS, WorldState, parse_seed, random_seed
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -76,10 +74,13 @@ class TopBar(QFrame):
         # version
         col = QVBoxLayout(); col.setSpacing(2)
         col.addWidget(field_label("Version"))
-        self.version = QComboBox(); self.version.addItems(VERSION_NAMES)
-        self.version.setCurrentText(world.version_name)
-        self.version.setMinimumWidth(120)
-        self.version.currentTextChanged.connect(lambda v: self.world.set(version_name=v))
+        # (31/10) a button: the major versions, each opening its exact versions
+        self.version = QToolButton(); self.version.setObjectName("VersionButton")
+        self.version.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.version.setMinimumWidth(130)
+        self.version.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._build_version_menu()
+        self._show_version()
         col.addWidget(self.version)
         lay.addLayout(col)
 
@@ -112,14 +113,78 @@ class TopBar(QFrame):
     def random(self):
         self.world.set(seed=random_seed())
 
+    def _build_version_menu(self):
+        from PySide6.QtWidgets import QMenu
+        from .world import GAME_VERSIONS, major_of
+        m = QMenu(self.version)
+        majors = {}
+        for name in VERSION_NAMES:
+            for ex in GAME_VERSIONS.get(name, []):
+                majors.setdefault(major_of(ex), []).append((ex, name))
+        for mj, items in majors.items():
+            sub = m.addMenu(f"Java {mj}" if mj != "26" else "Java 26")
+            for ex, name in items:
+                a = sub.addAction(f"Java {ex}")
+                a.setCheckable(True)
+                tip = VERSION_TIPS.get(name)
+                if tip:
+                    a.setToolTip(f"Same world as {tip}")
+                a.triggered.connect(lambda _c=False, e=ex, n=name: self._pick_version(e, n))
+        m.setToolTipsVisible(True)
+        m.aboutToShow.connect(self._check_version_menu)
+        self._vmenu = m
+        self.version.setMenu(m)
+
+    def _check_version_menu(self):
+        from .world import current_exact
+        cur = current_exact(self.world.version_name)
+        for sub in self._vmenu.actions():
+            sm = sub.menu()
+            hit = False
+            for a in (sm.actions() if sm else ()):
+                on = a.text() == f"Java {cur}"
+                a.setChecked(on)
+                hit = hit or on
+            if sm is not None:
+                f = sm.menuAction().font(); f.setBold(hit); sm.menuAction().setFont(f)
+
+    def _pick_version(self, exact, name):
+        from .world import set_current_exact
+        set_current_exact(exact)
+        try:
+            from PySide6.QtCore import QSettings
+            QSettings("SSA", "SimpleSeedAnalyser").setValue("ui/exact_version", exact)
+        except Exception:
+            pass
+        if self.world.version_name != name:
+            self.world.set(version_name=name)
+        self._show_version()
+        ws = getattr(self.window(), "_world_status", None)      # (13/11) the status bar too
+        if ws is not None:
+            ws()
+
+    def _show_version(self):
+        from .world import current_exact, set_current_exact, _EXACT
+        if _EXACT[0] is None:
+            try:
+                from PySide6.QtCore import QSettings
+                v = QSettings("SSA", "SimpleSeedAnalyser").value("ui/exact_version", "")
+                if v:
+                    set_current_exact(str(v))
+            except Exception:
+                pass
+        ex = current_exact(self.world.version_name)
+        self.version.setText(f"Java {ex}")
+        tip = VERSION_TIPS.get(self.world.version_name)
+        self.version.setToolTip(f"Same world generation: {tip}" if tip else "")
+
     def _copy(self):
         QGuiApplication.clipboard().setText(str(self.world.seed))
 
     def _sync(self):
         if parse_seed(self.seed.text()) != self.world.seed:
             self.seed.setText(str(self.world.seed))
-        if self.version.currentText() != self.world.version_name:
-            self.version.setCurrentText(self.world.version_name)
+        self._show_version()
         if self.large.isChecked() != self.world.large_biomes:
             self.large.setChecked(self.world.large_biomes)
 
@@ -202,6 +267,14 @@ class MainWindow(QMainWindow):
         self.strongholds = StrongholdPage(self.world, link=self.link)
         from .draw_page import DrawPage
         self.drawing = DrawPage(self.world, link=self.link)
+        from .loot_page import LootPage                    # (06/11) replaces "Stronghold"
+        self.loot = LootPage(self.world)
+        self.loot.status.connect(lambda t: self._flash(t))
+        self.loot.openOnMap.connect(self._crack_open_map)
+        from .seedcrack_page import SeedcrackPage          # (05/11) replaces "Analyze"
+        self.seedcrack = SeedcrackPage(self.world)
+        self.seedcrack.openOnMap.connect(self._crack_open_map)
+        self.seedcrack.sendSisters.connect(self._crack_sisters)
 
         # Map page
         self.map = MapView(self.world, link=self.link)
@@ -220,10 +293,13 @@ class MainWindow(QMainWindow):
         pages = [
             ("map", "Map", "map", "Explore the seed: biomes, structures, landmarks", mp),
             ("sessions", "Sessions", "sessions", "Custom search sessions", self.sessions),
-            ("strongholds", "Stronghold", "eye", "Eye count · max Y · broken portals",
-             self.strongholds),
-            ("analyze", "Analyze", "analyze", "One-click analyses and presets",
-             Placeholder("Analyze", "Being rebuilt — coming soon.")),
+            # (06/11) the Stronghold page is gone from the rail (all of it is in the
+            # Sessions' Stronghold condition); its object stays for the shared state
+            ("loot", "Loot", "chest", "Find seeds by the loot of their chests · every loot table",
+             self.loot),
+            ("seedcrack", "Crack", "forest", "Seedcracking: rebuild the trees you saw in 3D "
+                                             "and crack the structure seed (Java 1.16 – 1.17)",
+             self.seedcrack),
             ("drawing", "Draw", "brush", "Draw a terrain over the map and find the seeds "
                                          "that look like it", self.drawing),
         ]
@@ -239,9 +315,6 @@ class MainWindow(QMainWindow):
                   ("Theme", "palette", "Appearance: themes and colours", self.open_theme),
                   ("Settings", "gear", "Settings: what SSA does by itself instead of asking",
                    self.open_settings)]
-        if not getattr(sys, "frozen", False) and os.path.exists(os.path.join(APP_DIR, "main.py")):
-            # (an .exe has no classic UI: sys.executable would just start SSA again)
-            _tools.append(("Classic", "legacy", "Open the classic (Tk) interface", self.open_classic))
         for text, ic, tip, fn in _tools:
             cl = QToolButton(); cl.setObjectName("NavButton"); cl.setText(text)
             icons.bind(cl, ic, 22, "text3", "text"); cl.setIconSize(QSize(22, 22))
@@ -504,6 +577,7 @@ class MainWindow(QMainWindow):
         a_conv = m.addAction(icons.icon("save", 16), "Convert a seed list to .seeds…")
         a_clim = m.addAction("Biome climate requirements…")      # (19/10)
         a_clim.setEnabled(self.world.mc >= 22)
+        a_loot = m.addAction(icons.icon("legend", 16), "Loot tables…")      # (06/11)
         m.addSeparator()
         a_leg = m.addAction(icons.icon("legend", 16), "Structure legend on the map")
         a_leg.setCheckable(True); a_leg.setChecked(self.map.legend_on())
@@ -524,6 +598,18 @@ class MainWindow(QMainWindow):
         elif act is a_clim:
             mp2 = mp if mp is not None else self.map
             mp2.show_biome_climate()
+        elif act is a_loot:
+            import loot_engine as le
+            from .loot_table_dialog import LootTableDialog
+            sub = None
+            try:
+                from .world import current_exact
+                ex = current_exact()
+                if ex in (le.MC_SUBVERSIONS.get(int(self.world.mc)) or []):
+                    sub = ex
+            except Exception:                                # noqa: BLE001
+                pass
+            LootTableDialog(le.loot_version(int(self.world.mc), sub), None, self).show()
         elif act is a_leg:
             self.layers.legend.setChecked(a_leg.isChecked())
         elif act is a_full:
@@ -662,13 +748,40 @@ class MainWindow(QMainWindow):
                 page.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
             page.setFocus(Qt.FocusReason.OtherFocusReason)
 
+    def _crack_open_map(self, seed, version_name, x, z):
+        """Seedcracking → a world seed on the map, centred on the trees."""
+        self.world.set(seed=int(seed), version_name=version_name or None, large_biomes=False)
+        self.show_page("map")
+        try:
+            self.map.center_on(int(x), int(z))
+        except Exception:
+            pass
+
+    def _crack_sisters(self, ss, version_name):
+        """Seedcracking → Sessions in « Sister seeds » mode on the structure seed."""
+        if version_name:
+            self.world.set(version_name=version_name)
+        sp = self.sessions
+        try:
+            sp.mode.set_value("Sister seeds", emit=True)
+            if isinstance(ss, (list, tuple)):        # (06/11) every result: a seed list
+                sp.set_seed_list(ss, "Seedcracking")
+            else:
+                if sp.seed_list is not None:
+                    sp._seed_list()                  # back to a start seed
+                sp.start_seed.setText(str(int(ss)))
+            sp._sync_start_ui()
+            sp._sync_fam_opts()
+        except Exception:
+            pass
+        self.show_page("sessions")
+
     def _world_status(self):
         w = self.world
-        self.status_left.setText(f"Seed {w.seed}   ·   {w.version_name}"
+        from .world import current_exact
+        ex = current_exact(w.version_name)
+        self.status_left.setText(f"Seed {w.seed}   ·   {('Java ' + ex) if ex else w.version_name}"
                                  + ("   ·   Large biomes" if w.large_biomes else ""))
-
-    def open_classic(self):
-        subprocess.Popen([sys.executable, os.path.join(APP_DIR, "main.py")], cwd=APP_DIR)
 
     def _probe_gpu(self):
         self._probe = _GpuProbe()

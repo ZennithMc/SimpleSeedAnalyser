@@ -1,4 +1,4 @@
-import sys, random, ctypes; sys.path.insert(0,'/home/claude/ssa')
+import sys, random, ctypes; import os; sys.path.insert(0,os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','..'))
 import ruined_portal as rp, cubiomes_wrap, stronghold_eyes as se
 lib=ctypes.CDLL(cubiomes_wrap._find_lib()); rp._bind(lib); ctx=lib.cb_create(); cubiomes_wrap.apply_large_ctx(lib,ctx)
 MC=20

@@ -89,6 +89,8 @@ BIOME_NAME_TO_ID: Dict[str, int] = {
     "frozen_peaks": 181, "stony_peaks": 182,
     "deep_dark": 183, "mangrove_swamp": 184,
     "cherry_grove": 185, "pale_garden": 186,
+    "sulfur_caves": 187, "dappled_forest": 188,
+    "seasonal_forest": 51, "rainforest": 52, "shrubland": 53,
 }
 
 
@@ -100,12 +102,149 @@ PALETTES: List[Tuple[str, Optional[str]]] = [
     ("Cooler & Brighter (Zennith)",      "CoolerAndBrighter__Zennith_.colormap"),
     ("True Colors (ShowMe7)",            "truecolors.colormap"),
     ("AltMeadow (ShowMe7)",             "altmeadow.colormap"),
+    ("Atlas (SSA)",                      "atlas.colormap"),       # (22/10)
 ]
 
 DEFAULT_PALETTE = "True Colors (ShowMe7)"
 
 _COLORMAPS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "colormaps")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# (22/10) Your own biome palettes — like cubiomes-viewer's « Biome colors »:
+# one .colormap file each in <data>/biome_palettes, the first line « ;Name ».
+# Read: one biome per line, an id or a resource name, then #RRGGBB / 0xRRGGBB
+# or « R G B » (other characters ignored, as cubiomes-viewer).
+# ═════════════════════════════════════════════════════════════════════════════
+import re as _re
+
+_HEX = _re.compile(r"(?:#|0x)([0-9a-fA-F]{6})")
+
+
+TEMP: Dict[str, Dict[int, Tuple[int, int, int]]] = {}   # name -> colours (editor preview)
+
+
+def user_dir() -> str:
+    import ssa_paths
+    d = os.path.join(ssa_paths.data_dir(), "biome_palettes")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _name_to_id(name: str):
+    name = name.lower()
+    if name.startswith("minecraft:"):
+        name = name[10:]
+    bid = BIOME_NAME_TO_ID.get(name)
+    if bid is None:
+        try:
+            import biome_catalog as bc
+            L = bc._lib_funcs()
+            for i in range(256):
+                for mc in (35, 21, 19):
+                    raw = L.biome2str(mc, i)
+                    if raw and raw.decode().lower() == name:
+                        return i
+        except Exception:
+            return None
+    return bid
+
+
+def parse_colormap_text(text: str) -> Dict[int, Tuple[int, int, int]]:
+    out: Dict[int, Tuple[int, int, int]] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(";") or line.startswith("#") and not _HEX.match(line):
+            continue
+        m = _re.match(r"\s*([A-Za-z_:][A-Za-z0-9_:]*|\d+)", line)
+        if not m:
+            continue
+        key, rest = m.group(1).rstrip(":"), line[m.end():]
+        bid = int(key) if key.isdigit() else _name_to_id(key)
+        if bid is None or not 0 <= bid < 256:
+            continue
+        h = _HEX.search(rest)
+        if h:
+            v = int(h.group(1), 16)
+            out[bid] = ((v >> 16) & 255, (v >> 8) & 255, v & 255)
+            continue
+        nums = [int(x) for x in _re.findall(r"\d+", rest)][:3]
+        if len(nums) == 3:
+            out[bid] = tuple(x & 255 for x in nums)
+    return out
+
+
+def _resource_name(bid: int) -> str:
+    try:
+        import biome_catalog as bc
+        raw = bc._lib_funcs().biome2str(35, bid)
+        if raw:
+            return raw.decode()
+    except Exception:
+        pass
+    for k, v in BIOME_NAME_TO_ID.items():
+        if v == bid:
+            return k
+    return str(bid)
+
+
+def user_palettes() -> Dict[str, str]:
+    """name -> file of the user's palettes."""
+    out: Dict[str, str] = {}
+    try:
+        for f in sorted(os.listdir(user_dir())):
+            if not f.endswith(".colormap"):
+                continue
+            path = os.path.join(user_dir(), f)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    first = fh.readline().strip()
+            except OSError:
+                continue
+            name = first[1:].strip() if first.startswith(";") and len(first) > 1 else os.path.splitext(f)[0]
+            out[name] = path
+    except OSError:
+        pass
+    return out
+
+
+def is_builtin(label: str) -> bool:
+    return any(lbl == label for lbl, _f in PALETTES)
+
+
+def save_user_palette(name: str, colors: Dict[int, Tuple[int, int, int]], path: str = None) -> str:
+    """Writes (or rewrites) a palette; returns its file."""
+    if path is None:
+        path = user_palettes().get(name)
+    if path is None:
+        import uuid
+        path = os.path.join(user_dir(), f"palette-{uuid.uuid4().hex[:8]}.colormap")
+    lines = [f";{name}"]
+    for bid in sorted(colors):
+        r, g, b = colors[bid]
+        lines.append(f"{_resource_name(bid)} {int(r)} {int(g)} {int(b)}")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+    return path
+
+
+def delete_user_palette(name: str) -> None:
+    path = user_palettes().get(name)
+    if path:
+        trash = os.path.join(user_dir(), "_trash")
+        os.makedirs(trash, exist_ok=True)
+        os.replace(path, os.path.join(trash, os.path.basename(path)))
+
+
+def export_text(colors: Dict[int, Tuple[int, int, int]], name: str = "") -> str:
+    lines = [f";{name}"] if name else []
+    for bid in sorted(colors):
+        r, g, b = colors[bid]
+        lines.append(f"{_resource_name(bid)} {int(r)} {int(g)} {int(b)}")
+    return "\n".join(lines) + "\n"
 
 
 def _parse_colormap_file(path: str) -> Dict[int, Tuple[int, int, int]]:
@@ -146,10 +285,25 @@ def get_available_colormaps() -> List[str]:
                 out.append(label)
             else:
                 print(f"[colormaps] missing: {path}")
+    for name in user_palettes():                   # (22/10) the user's own
+        if name not in out:
+            out.append(name)
     return out
 
 
 def load_colormap(label: str) -> Dict[int, Tuple[int, int, int]]:
+    if label in TEMP:                              # (22/10) the editor's live preview
+        out = dict(CLASSIC_COLORS); out.update(TEMP[label])
+        return out
+    up = user_palettes().get(label) if not is_builtin(label) else None
+    if up:                                         # (22/10) a palette of the user
+        out = dict(CLASSIC_COLORS)
+        try:
+            with open(up, "r", encoding="utf-8", errors="replace") as f:
+                out.update(parse_colormap_text(f.read()))
+        except OSError:
+            pass
+        return out
     fname = None
     found = False
     for lbl, fn in PALETTES:

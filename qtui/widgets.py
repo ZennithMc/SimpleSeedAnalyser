@@ -626,3 +626,118 @@ class RangeSlider(QWidget):
         else:
             hi = max(v, lo)
         self.set_values(lo, hi, emit=True)
+
+
+# ── (06/11) a block coordinate field ─────────────────────────────────────────
+from PySide6.QtWidgets import QLineEdit as _QLineEdit  # noqa: E402
+
+
+class CoordEdit(_QLineEdit):
+    """A block coordinate (X or Z): a plain text field — no arrows, the wheel scrolls
+    the page instead of changing the value. Pasting several numbers (F3's
+    “XYZ: 1234.5 / 64 / -560.3”, “/tp @s 1234 64 -560”, “1234 -560”) emits
+    `pasted([x, z])` so both fields fill at once; a decimal is floored to its block.
+    Up / Down: ± 1, with Shift ± 16 (a chunk). valueChanged(int) at each edit
+    (live=True) or on Enter / leaving the field."""
+    valueChanged = Signal(int)
+    pasted = Signal(list)
+    LIMIT = 30_000_000
+
+    def __init__(self, value: int = 0, live: bool = False, placeholder: str = "", parent=None):
+        super().__init__(parent)
+        import re as _re
+        self._re = _re
+        self._v = int(value)
+        self._live = live
+        self.setText(str(self._v))
+        self._last = self.text()
+        self.setPlaceholderText(placeholder)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setToolTip("Block coordinate. Paste F3's XYZ line (or “x y z”) to fill X and Z at once. "
+                        "↑ / ↓: ± 1 · Shift: ± 16 (one chunk).")
+        self.textEdited.connect(self._edited)
+        self.editingFinished.connect(self._finish)
+
+    def value(self) -> int:
+        return self._v
+
+    def setValue(self, v: int):
+        self._v = max(-self.LIMIT, min(self.LIMIT, int(v)))
+        if self.text() != str(self._v):
+            self.setText(str(self._v))
+        self._last = self.text()
+
+    def _nums(self, t):
+        return [n for n in self._re.findall(r"-?\d+(?:\.\d+)?", t)]
+
+    @staticmethod
+    def _floor(n: str) -> int:
+        import math
+        return int(math.floor(float(n)))
+
+    def _parse(self, t):
+        t = t.strip()
+        if self._re.fullmatch(r"-?\d+(?:\.\d*)?", t):
+            return max(-self.LIMIT, min(self.LIMIT, self._floor(t.rstrip(".") or "0")))
+        return None
+
+    def _edited(self, t):
+        nums = self._nums(t)
+        if len(nums) >= 2:                       # pasted coordinates
+            vals = [self._floor(n) for n in nums]
+            xz = [vals[0], vals[2]] if len(vals) >= 3 else vals[:2]
+            self.setText(str(self._v))
+            self._last = self.text()
+            self.pasted.emit(xz)
+            return
+        if len(nums) == 1 and "." in t and self._parse(t) is not None and not t.rstrip().endswith("."):
+            v = self._parse(t)                   # 1234.7 → 1234 (the block)
+            self.setText(str(v))
+        else:
+            digits = self._re.sub(r"\D", "", t)
+            if self._last in ("0", "-0") and len(digits) >= 2 and "0" in digits:
+                i = t.find("0") if not t.startswith(self._last) else len(self._last) - 1
+                digits = self._re.sub(r"\D", "", t[:i] + t[i + 1:])  # (06/11) the 0 was a placeholder
+            digits = digits.lstrip("0") or ("0" if digits else "")
+            clean = ("-" if "-" in t else "") + digits
+            if clean != t:
+                pos = self.cursorPosition()
+                self.setText(clean)
+                self.setCursorPosition(min(pos, len(clean)))
+        self._last = self.text()
+        if self._live:
+            v = self._parse(self.text())
+            if v is not None and v != self._v:
+                self._v = v
+                self.valueChanged.emit(v)
+
+    def _finish(self):
+        v = self._parse(self.text())
+        if v is None:
+            self.setText(str(self._v))
+            self._last = self.text()
+            return
+        self.setText(str(v))
+        self._last = self.text()
+        if v != self._v:
+            self._v = v
+            self.valueChanged.emit(v)
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            step = 16 if e.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+            v = self._parse(self.text())
+            v = self._v if v is None else v
+            self.setValue(v + (step if k == Qt.Key.Key_Up else -step))
+            self.valueChanged.emit(self._v)
+            return
+        super().keyPressEvent(e)
+
+    def wheelEvent(self, e):
+        e.ignore()                               # scroll the page, never the value
+
+    def focusInEvent(self, e):
+        super().focusInEvent(e)
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self.selectAll)     # typing replaces the value

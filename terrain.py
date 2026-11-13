@@ -26,7 +26,8 @@ _SG_DEBUG = True
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC_DIR = os.path.join(_HERE, "cubiomes_terrain")
 _SRC = ["terrain_bridge.c", "terrainnoise.c", "biomenoise.c", "noise.c",
-        "biomes.c", "layers.c", "generator.c", "util.c"]
+        "biomes.c", "layers.c", "generator.c", "util.c",
+        "cave118.c"]       # (23/10) underground after the carvers (structure loot)
 
 _LIB = None
 _AVAIL = None
@@ -41,6 +42,16 @@ def _lib_name():
     if s == "Darwin":
         return "libterrain.dylib"
     return "libterrain.so"          # not "terrain.so": Python would import it as the terrain module
+
+
+def _place(tmp, final):
+    """Move a freshly built library into place; if the old one is in use (Windows),
+    keep using the new copy under its own name."""
+    try:
+        os.replace(tmp, final)
+        return final
+    except OSError:
+        return tmp
 
 
 def _compile():
@@ -63,6 +74,12 @@ def _compile():
 
     is_win = (platform.system() == "Windows")
     print("[terrain] Compiling terrain lib (one time)…")
+    # (31/10) built under a name of its own, then moved into place: several SSA
+    # processes (map / search helpers) may rebuild at once, and on Windows a DLL
+    # loaded by one of them cannot be overwritten — that process then lost the
+    # library (Exact Y failing in it). If the move fails, this one uses its copy.
+    final = out
+    out = f"{final}.{os.getpid()}.tmp{os.path.splitext(final)[1]}"
     # GCC / Clang
     for cc in ("gcc", "clang", "cc"):
         cmd = [cc, "-O3", "-fwrapv", "-fPIC", "-shared", "-I", _SRC_DIR,
@@ -74,8 +91,8 @@ def _compile():
         except subprocess.TimeoutExpired:
             _ERR = f"{cc} timed out"; return None
         if r.returncode == 0 and os.path.exists(out):
-            print(f"[terrain] OK: {out}")
-            return out
+            print(f"[terrain] OK: {final}")
+            return _place(out, final)
         _ERR = (r.stderr or b"").decode(errors="replace")[:2000]
     # nvcc — guaranteed present on this machine (used to build noise_gpu) and it
     # drives the MSVC host compiler itself, so no Visual Studio dev-prompt needed.
@@ -86,8 +103,8 @@ def _compile():
     try:
         r = subprocess.run(nvcc_cmd, capture_output=True, timeout=180)
         if r.returncode == 0 and os.path.exists(out):
-            print(f"[terrain] OK (nvcc): {out}")
-            return out
+            print(f"[terrain] OK (nvcc): {final}")
+            return _place(out, final)
         _ERR = ((r.stderr or b"") + (r.stdout or b"")).decode(errors="replace")[:2000]
     except FileNotFoundError:
         pass
@@ -100,8 +117,8 @@ def _compile():
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=180)
             if r.returncode == 0 and os.path.exists(out):
-                print(f"[terrain] OK (cl): {out}")
-                return out
+                print(f"[terrain] OK (cl): {final}")
+                return _place(out, final)
             _ERR = (r.stdout or b"").decode(errors="replace")[:2000]
         except FileNotFoundError:
             pass
@@ -161,6 +178,27 @@ def _load():
                 lib.tb_precise_y_filter_ctx.restype = ctypes.c_int
             except AttributeError:
                 pass
+            try:   # (23/10) cave118.c — chunk underground after the carvers
+                lib.cv_alloc.restype = ctypes.c_void_p
+                lib.cv_free.argtypes = [ctypes.c_void_p]
+                lib.cv_init.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64]
+                lib.cv_init.restype = ctypes.c_int
+                lib.cv_chunk.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                         ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                                         ctypes.POINTER(ctypes.c_uint8), ctypes.c_int]
+                lib.cv_chunk.restype = ctypes.c_int
+                if hasattr(lib, "cv_chunk_ex"):
+                    lib.cv_chunk_ex.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                                ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                                                ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                                                ctypes.POINTER(ctypes.c_uint8), ctypes.c_int]
+                    lib.cv_chunk_ex.restype = ctypes.c_int
+                lib.cv_surface.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+                lib.cv_surface.restype = ctypes.c_int
+                lib.cv_solid_top.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+                lib.cv_solid_top.restype = ctypes.c_int
+            except AttributeError:
+                pass
             _LIB, _AVAIL = lib, True
         except Exception as e:
             _ERR = f"load failed: {e}"
@@ -180,7 +218,7 @@ def last_error():
 # bit-exact vs CPU on the RTX 5080). Falls back to the CPU bridge if nvcc/GPU absent.
 _GPU = None                          # None=untried, False=unavailable, lib=loaded
 _GPU_LOCK = threading.Lock()
-_GPU_SRC = ["terrain_gpu.cu"] + _SRC[1:]   # the .cu + the cubiomes .c (no terrain_bridge.c)
+_GPU_SRC = ["terrain_gpu.cu"] + [s for s in _SRC[1:] if s != "cave118.c"]   # the .cu + the cubiomes .c
 
 
 def _gpu_name():
@@ -426,3 +464,103 @@ class TerrainEngine:
                 self._ctx = None
         except Exception:
             pass
+
+
+# ── (23/10) the underground of a chunk right after the CARVERS status ───────────
+# cave118.c: noise caves + aquifers + beardifier (BURY boxes) + cave/canyon carvers,
+# 1.18 → 26.2. Bytes [(y+64)*256 + z*16 + x]: 0 solid, 1 air, 2 water, 3 lava.
+CV_SOLID, CV_AIR, CV_WATER, CV_LAVA = 0, 1, 2, 3
+_CV_TLS = threading.local()
+
+
+def _cv_ctx(seed, mc):
+    _load()
+    if not _AVAIL or not hasattr(_LIB, "cv_chunk"):
+        return None
+    st = getattr(_CV_TLS, "st", None)
+    key = (int(mc), int(seed) & ((1 << 64) - 1))
+    if st is None or st[0] != key:
+        ctx = st[1] if st is not None else _LIB.cv_alloc()
+        if not _LIB.cv_init(ctx, key[0], key[1]):
+            return None
+        st = (key, ctx)
+        _CV_TLS.st = st
+    return st[1]
+
+
+def first_occupied(seed, mc, x, z):
+    """(24/10) getFirstOccupiedHeight(WORLD_SURFACE_WG): the highest solid OR fluid
+    block straight after the noise (1.18 → 26.2), per-block exact. None if n/a."""
+    ctx = _cv_ctx(seed, mc)
+    if ctx is None or not hasattr(_LIB, "cv_surface"):
+        return None
+    return int(_LIB.cv_surface(ctx, int(x), int(z)))
+
+
+def chunk_underground_ex(seed, mc, cx, cz, rigids=(), junctions=(), flags=0):
+    """(25/10) chunk_underground with the game's full Beardifier: rigids = (minX,
+    minY, minZ, maxX, maxY, maxZ, type 0 bury / 1 beard_thin / 2 beard_box /
+    3 encapsulate, groundLevelDelta), junctions = (x, groundY, z). None if n/a."""
+    ctx = _cv_ctx(seed, mc)
+    if ctx is None or not hasattr(_LIB, "cv_chunk_ex"):
+        return None
+    fr = [int(v) for b in rigids for v in b]
+    fj = [int(v) for b in junctions for v in b]
+    ar = (ctypes.c_int * max(1, len(fr)))(*fr)
+    aj = (ctypes.c_int * max(1, len(fj)))(*fj)
+    out = (ctypes.c_uint8 * (384 * 256))()
+    if _LIB.cv_chunk_ex(ctx, int(cx), int(cz), ar, len(fr) // 8, aj, len(fj) // 3, out,
+                        int(flags)) < 0:
+        return None
+    return bytes(out)
+
+
+def chunk_underground(seed, mc, cx, cz, bury_boxes=()):
+    """None when unavailable (lib missing / too old). bury_boxes: iterable of
+    (minX, minY, minZ, maxX, maxY, maxZ) of the BURY structure pieces near it."""
+    _load()
+    if not _AVAIL or not hasattr(_LIB, "cv_chunk"):
+        return None
+    st = getattr(_CV_TLS, "st", None)
+    key = (int(mc), int(seed) & ((1 << 64) - 1))
+    if st is None or st[0] != key:
+        ctx = st[1] if st is not None else _LIB.cv_alloc()
+        if not _LIB.cv_init(ctx, key[0], key[1]):
+            return None
+        st = (key, ctx)
+        _CV_TLS.st = st
+    flat = [int(v) for b in bury_boxes for v in b]
+    arr = (ctypes.c_int * max(1, len(flat)))(*flat)
+    out = (ctypes.c_uint8 * (384 * 256))()
+    if _LIB.cv_chunk(st[1], int(cx), int(cz), arr, len(flat) // 6, out, 0) < 0:
+        return None
+    return bytes(out)
+
+
+_BANDS_LOCK = threading.Lock()
+
+
+def chunk_bands(seed, mc, cx, cz, buf, bands, bury_boxes=()):
+    """(31/10) chunk_underground for the 8-block layers `bands` (bit k: y -64 + 8k ..
+    +7) only, written into `buf` (a bytearray of 384 * 256; the other layers are left
+    as they are). False when unavailable."""
+    _load()
+    if not _AVAIL or not hasattr(_LIB, "cv_chunk_bands"):
+        return False
+    ctx = _cv_ctx(seed, mc)
+    if ctx is None:
+        return False
+    f = _LIB.cv_chunk_bands
+    if not getattr(f, "_ssa_set", False):
+        with _BANDS_LOCK:                 # set once (not while another thread calls it)
+            if not getattr(f, "_ssa_set", False):
+                f.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
+                              ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64]
+                f.restype = ctypes.c_int
+                f._ssa_set = True
+    flat = [int(v) for b in bury_boxes for v in b]
+    arr = (ctypes.c_int * max(1, len(flat)))(*flat)
+    out = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
+    r = f(ctx, int(cx), int(cz), arr, len(flat) // 6, out, 0, ctypes.c_uint64(int(bands)))
+    del out
+    return r >= 0

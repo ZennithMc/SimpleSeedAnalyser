@@ -1,6 +1,7 @@
 #include "terrainnoise.h"
 
 #include <limits.h>
+#include <string.h>
 #include <stdio.h>
 
 #ifndef BITMASK
@@ -340,7 +341,13 @@ double sampleSpaghetti2d(TerrainNoise *params, int x, int y, int z) {
     double spaghetti2dModulator = sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_2D_MODULATOR], x * 2, y, z * 2);
     double rarity = getSpaghettiRarity2d(spaghetti2dModulator);
     double spaghetti2dThickness = map(sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_2D_THICKNESS], x * 2, y, z * 2), -1.0, 1.0, 0.6, 1.3);
-    double spaghetti2d = sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_2D], x / rarity, y / rarity, z / rarity);
+    double spaghetti2d;
+    if (params->g.mc >= MC_26_2) {      /* (24/10) 26.2: interval_select, noise(x * k) */
+        double k = rarity == 0.5 ? 2.0 : rarity == 0.75 ? 1.3333333333333333 : rarity == 1.0 ? 1.0
+                 : rarity == 2.0 ? 0.5 : 0.3333333333333333;
+        spaghetti2d = sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_2D], x * k, y * k, z * k);
+    } else
+        spaghetti2d = sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_2D], x / rarity, y / rarity, z / rarity);
     double a = fabs(rarity * spaghetti2d) - 0.083 * spaghetti2dThickness;
     double spaghetti2dElevation = map(sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_2D_ELEVATION], x, 0.0, z), -1.0, 1.0, floordiv(-64, 8), 8.0);
     double b = fabs(spaghetti2dElevation - y / 8.0) - spaghetti2dThickness;
@@ -351,8 +358,16 @@ double sampleSpaghetti3d(TerrainNoise *params, int x, int y, int z) {
     double spaghetti3dRarity = sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_3D_RARITY], x * 2, y, z * 2);
     double spaghetti3dThickness = mapFromUnitTo(sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_3D_THICKNESS], x, y, z), -0.065, -0.088);
     double rarity = getSpaghettiRarity3d(spaghetti3dRarity);
-    double spaghetti3d1 = rarity * fabs(sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_3D_1], x / rarity, y / rarity, z / rarity));
-    double spaghetti3d2 = rarity * fabs(sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_3D_2], x / rarity, y / rarity, z / rarity));
+    double spaghetti3d1, spaghetti3d2;
+    if (params->g.mc >= MC_26_2) {      /* (24/10) 26.2: interval_select, noise(x * k) */
+        double k = rarity == 0.75 ? 1.3333333333333333 : rarity == 1.0 ? 1.0
+                 : rarity == 1.5 ? 0.6666666666666666 : 0.5;
+        spaghetti3d1 = fabs(rarity * sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_3D_1], x * k, y * k, z * k));
+        spaghetti3d2 = fabs(rarity * sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_3D_2], x * k, y * k, z * k));
+    } else {
+        spaghetti3d1 = rarity * fabs(sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_3D_1], x / rarity, y / rarity, z / rarity));
+        spaghetti3d2 = rarity * fabs(sampleDoublePerlin(&params->noises[OTP_SPAGHETTI_3D_2], x / rarity, y / rarity, z / rarity));
+    }
     return clamp(fmax(spaghetti3d1, spaghetti3d2) + spaghetti3dThickness, -1.0, 1.0);
 }
 
@@ -447,10 +462,32 @@ int samplePreliminarySurfaceLevel(TerrainNoise *params, int x, int z) {
     return lowerBound;
 }
 
-/* caves=1 -> full exact density (caves carved). caves=0 -> NO CAVES: the terrain
- * shape only (slopedCheese) with the SAME overworld slide + post-process, but
- * without entrances/underground/noodle carving. Everything else stays exact. */
-void sampleNoiseColumnEx(TerrainNoise *params, int cellX, int cellZ, double buffer[48 + 1], int caves) {
+void sampleCornerInputs(TerrainNoise *p, int x, int y, int z, double depth, double factor,
+                        double jagged, double out[5]);
+
+/* (24/10) EXACT per-block density, as NoiseChunk: the column buffer holds, per cell
+ * corner level i (49), the FIVE inputs the game interpolates (TN_CH doubles):
+ *   [0] M = 0.64*slide(...)  (squeezed per block AFTER interpolation)
+ *   [1] noodle toggle, [2] noodle thickness, [3]/[4] noodle ridges A/B
+ * and a block is solid iff squeeze(M) > 0 and noodle > 0, i.e. M > 0 && noodle > 0
+ * (squeeze keeps the sign). Before, the already-squeezed min(..) was interpolated:
+ * the Exact Y was 1-4 blocks off in ~7 % of the columns (checked on a 26.2 server).
+ * Interpolation order = NoiseChunk: y, then x, then z.
+ * caves=0 -> terrain shape only: [0] = 0.64*slide(sloped), the noodle switched off. */
+#define TN_CH 5
+static void cornerChannels(TerrainNoise *params, int x, int y, int z, double depth, double factor,
+                           double jagged, int caves, double *out)
+{
+    if (caves) {
+        sampleCornerInputs(params, x, y, z, depth, factor, jagged, out);
+        return;
+    }
+    double sloped = sampleSlopedCheese(params, x, y, z, depth, factor, jagged);
+    out[0] = 0.64 * slideOverworld(sloped, y);
+    out[1] = -1.0; out[2] = 0.0; out[3] = 0.0; out[4] = 0.0;
+}
+
+void sampleNoiseColumnEx(TerrainNoise *params, int cellX, int cellZ, double buffer[(48 + 1) * 5], int caves) {
     const int minY = -64;
     const int cellWidth = 1 << 2;
     const int cellHeight = 2 << 2;
@@ -465,56 +502,51 @@ void sampleNoiseColumnEx(TerrainNoise *params, int cellX, int cellZ, double buff
     jagged = jagged >= 0.0 ? jagged : jagged / 2.0;
     jagged *= getSpline(params->jaggednessSpline, np_param);
 
-    for (int i = 0; i < 48 + 1; ++i) {
-        int y = minY + i * cellHeight;
-        double slopedCheese = sampleSlopedCheese(params, x, y, z, depth, factor, jagged);
-        if (caves) {
-            double spaghettiRoughness = sampleSpaghettiRoughness(params, x, y, z);
-            double entrances = sampleEntrances(params, x, y, z, spaghettiRoughness);
-            buffer[i] = sampleFinalDensity(params, x, y, z, spaghettiRoughness, entrances, slopedCheese);
-        } else {
-            buffer[i] = postProcess(slideOverworld(slopedCheese, y));
-        }
-    }
+    for (int i = 0; i < 48 + 1; ++i)
+        cornerChannels(params, x, minY + i * cellHeight, z, depth, factor, jagged, caves, buffer + i * TN_CH);
 }
-void sampleNoiseColumn(TerrainNoise *params, int cellX, int cellZ, double buffer[48 + 1]) {
+void sampleNoiseColumn(TerrainNoise *params, int cellX, int cellZ, double buffer[(48 + 1) * 5]) {
     sampleNoiseColumnEx(params, cellX, cellZ, buffer, 1);
 }
 
-int generateColumn(int x, int z, int blocks[384], const double ds00[48 + 1], const double ds01[48 + 1], const double ds10[48 + 1], const double ds11[48 + 1], int flag) {
-    const int cellHeight = 2 << 2;
+static inline double tn_lerp(double t, double a, double b) { return a + t * (b - a); }
+
+/* solid test of one block from the 8 corners (c[k] -> TN_CH doubles), y, x, z order:
+ * corner k = (dx, dz, top) packed as b00 b10 b01 b11 (bottom) and t.. (top) */
+static inline int tn_solid(const double *b00, const double *b10, const double *b01, const double *b11,
+                           const double *t00, const double *t10, const double *t01, const double *t11,
+                           double tx, double ty, double tz)
+{
+    double v[TN_CH];
+    for (int n = 0; n < TN_CH; n++) {
+        if (n == 1 && v[0] <= 0.0) return 0;          /* M <= 0: air whatever the noodle */
+        double a00 = tn_lerp(ty, b00[n], t00[n]);
+        double a10 = tn_lerp(ty, b10[n], t10[n]);
+        double a01 = tn_lerp(ty, b01[n], t01[n]);
+        double a11 = tn_lerp(ty, b11[n], t11[n]);
+        v[n] = tn_lerp(tz, tn_lerp(tx, a00, a10), tn_lerp(tx, a01, a11));
+    }
+    if (v[0] <= 0.0) return 0;
+    if (v[1] >= -1000000.0 && v[1] < 0.0) return 1;  /* noodle off (64) */
+    return v[2] + 1.5 * fmax(fabs(v[3]), fabs(v[4])) > 0.0;
+}
+
+int generateColumn(int x, int z, int blocks[384], const double ds00[(48 + 1) * 5], const double ds01[(48 + 1) * 5], const double ds10[(48 + 1) * 5], const double ds11[(48 + 1) * 5], int flag) {
+    const int cellHeight = 8;
     const int minY = -64;
-    const int heightScaled = floordiv(384, cellHeight);
-    const int cellWidth = 1 << 2;
-    /* MSVC rejects const-int divisors in static initializers; hardcode (bit-identical:
-     * 1/4 and 1/8 are exact doubles). cellWidth=4, cellHeight=8. */
     static const double percentagesXZ[4] = {0.0, 0.25, 0.5, 0.75};
     static const double percentagesY[8]  = {0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875};
-    (void)cellWidth;
+    const double tx = percentagesXZ[x & 3];
+    const double tz = percentagesXZ[z & 3];
 
-    const int relX = x & 3; // floormod(x, cellWidth)
-    const int relZ = z & 3; // floormod(z, cellWidth)
-    const double percentX = percentagesXZ[relX];
-    const double percentZ = percentagesXZ[relZ];
-
-    for (int cellY = heightScaled - 1; cellY >= 0; --cellY) {
-        const double noise000 = ds00[cellY];
-        const double noise001 = ds01[cellY];
-        const double noise100 = ds10[cellY];
-        const double noise101 = ds11[cellY];
-        const double noise010 = ds00[cellY + 1];
-        const double noise011 = ds01[cellY + 1];
-        const double noise110 = ds10[cellY + 1];
-        const double noise111 = ds11[cellY + 1];
-
+    for (int cellY = 48 - 1; cellY >= 0; --cellY) {
+        const double *b00 = ds00 + cellY * TN_CH, *b01 = ds01 + cellY * TN_CH;
+        const double *b10 = ds10 + cellY * TN_CH, *b11 = ds11 + cellY * TN_CH;
+        const double *t00 = b00 + TN_CH, *t01 = b01 + TN_CH, *t10 = b10 + TN_CH, *t11 = b11 + TN_CH;
         for (int relY = cellHeight - 1; relY >= 0; --relY) {
-            double percentY = percentagesY[relY];
-            double noise = lerp3(percentX, percentY, percentZ, noise000, noise100, noise010, noise110, noise001, noise101, noise011, noise111);
             int y = cellY * cellHeight + relY;
-
-            int block = noise > 0.0;
+            int block = tn_solid(b00, b10, b01, b11, t00, t10, t01, t11, tx, percentagesY[relY], tz);
             blocks[y] = block;
-
             if (flag && block) {
                 return y + 1;
             }
@@ -523,67 +555,41 @@ int generateColumn(int x, int z, int blocks[384], const double ds00[48 + 1], con
     return minY;
 }
 
-/* Like generateColumn(flag=1) but skips the air cells above the surface, so it does
- * ~8 lerp3 (one surface cell) instead of ~250 (the whole sky). PROVABLY bit-identical:
- * the surface is found with the SAME lerp3 call, same arg order, same `> 0` test as
- * generateColumn; the only change is skipping a cell when the MAX of its 8 noise
- * corners is below -EPS. A trilinear interpolation is a convex combination of those
- * corners, so its value is <= max corner (up to a few ULP, covered by EPS); a cell
- * whose max corner is < 0 therefore cannot contain a solid block and is safe to skip.
- * No solid is ever missed → the first solid found from the top is identical. */
-int generateColumnFast(int x, int z, const double ds00[48 + 1], const double ds01[48 + 1],
-                       const double ds10[48 + 1], const double ds11[48 + 1]) {
-    const int cellHeight = 8, minY = -64, heightScaled = 48;
+/* Like generateColumn(flag=1) but skips the cells whose 8 M corners are all < 0:
+ * M is interpolated linearly, so no block of such a cell can have M > 0. Same answer. */
+int generateColumnFast(int x, int z, const double ds00[(48 + 1) * 5], const double ds01[(48 + 1) * 5],
+                       const double ds10[(48 + 1) * 5], const double ds11[(48 + 1) * 5]) {
+    const int cellHeight = 8, minY = -64;
     static const double percentagesXZ[4] = {0.0, 0.25, 0.5, 0.75};
     static const double percentagesY[8]  = {0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875};
-    const double percentX = percentagesXZ[x & 3];
-    const double percentZ = percentagesXZ[z & 3];
-    const double EPS = 1e-6;            /* >> the few-ULP trilinear overshoot */
+    const double tx = percentagesXZ[x & 3];
+    const double tz = percentagesXZ[z & 3];
+    const double EPS = 1e-9;
 
-    for (int cellY = heightScaled - 1; cellY >= 0; --cellY) {
-        const double noise000 = ds00[cellY];
-        const double noise100 = ds10[cellY];
-        const double noise001 = ds01[cellY];
-        const double noise101 = ds11[cellY];
-        const double noise010 = ds00[cellY + 1];
-        const double noise110 = ds10[cellY + 1];
-        const double noise011 = ds01[cellY + 1];
-        const double noise111 = ds11[cellY + 1];
-
-        double mx = noise000;
-        if (noise100 > mx) mx = noise100;
-        if (noise001 > mx) mx = noise001;
-        if (noise101 > mx) mx = noise101;
-        if (noise010 > mx) mx = noise010;
-        if (noise110 > mx) mx = noise110;
-        if (noise011 > mx) mx = noise011;
-        if (noise111 > mx) mx = noise111;
-        if (mx <= -EPS) continue;       /* all air → no solid block possible here */
-
+    for (int cellY = 48 - 1; cellY >= 0; --cellY) {
+        const double *b00 = ds00 + cellY * TN_CH, *b01 = ds01 + cellY * TN_CH;
+        const double *b10 = ds10 + cellY * TN_CH, *b11 = ds11 + cellY * TN_CH;
+        const double *t00 = b00 + TN_CH, *t01 = b01 + TN_CH, *t10 = b10 + TN_CH, *t11 = b11 + TN_CH;
+        double mx = b00[0];
+        if (b10[0] > mx) mx = b10[0];
+        if (b01[0] > mx) mx = b01[0];
+        if (b11[0] > mx) mx = b11[0];
+        if (t00[0] > mx) mx = t00[0];
+        if (t10[0] > mx) mx = t10[0];
+        if (t01[0] > mx) mx = t01[0];
+        if (t11[0] > mx) mx = t11[0];
+        if (mx <= -EPS) continue;
         for (int relY = cellHeight - 1; relY >= 0; --relY) {
-            double noise = lerp3(percentX, percentagesY[relY], percentZ,
-                noise000, noise100, noise010, noise110, noise001, noise101, noise011, noise111);
-            if (noise > 0.0)
+            if (tn_solid(b00, b10, b01, b11, t00, t10, t01, t11, tx, percentagesY[relY], tz))
                 return (cellY * cellHeight + relY) + 1;   /* == generateColumn's y+1 */
         }
     }
     return minY;
 }
 
-/* one density value at a corner block (cell-boundary y), caves on/off */
-static double densityAtCorner(TerrainNoise *p, int wx, int y, int wz,
-                              double depth, double factor, double jagged, int caves) {
-    double sloped = sampleSlopedCheese(p, wx, y, wz, depth, factor, jagged);
-    if (!caves) return postProcess(slideOverworld(sloped, y));
-    double rough = sampleSpaghettiRoughness(p, wx, y, wz);
-    double entr  = sampleEntrances(p, wx, y, wz, rough);
-    return sampleFinalDensity(p, wx, y, wz, rough, entr, sloped);
-}
-
-/* Highest-solid world Y at block (x,z), computed TOP-DOWN with early-exit (keeps
- * only 2 corner layers, never builds the full 49-cell column) → ~2× faster than
- * sampleNoiseColumn+generateColumn, and bit-identical (same densities, same lerp3,
- * same corner mapping). Returns the air-above-solid world Y (== generateColumn-64). */
+/* Highest-solid world Y at block (x,z), TOP-DOWN with early exit (2 corner layers).
+ * Same densities / interpolation / test as generateColumn. Returns the air-above-solid
+ * world Y (== generateColumn - 64). */
 int sampleSurfaceYDescend(TerrainNoise *params, int x, int z, int caves) {
     const int cellHeight = 8, minY = -64;
     int cx = x >> 2, cz = z >> 2;
@@ -602,23 +608,21 @@ int sampleSurfaceYDescend(TerrainNoise *params, int x, int z, int caves) {
     }
     static const double pXZ[4] = {0.0, 0.25, 0.5, 0.75};
     static const double pY[8]  = {0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875};
-    double pcX = pXZ[x & 3], pcZ = pXZ[z & 3];
-    double top[4], bot[4];
+    double tx = pXZ[x & 3], tz = pXZ[z & 3];
+    double top[4][TN_CH], bot[4][TN_CH];
     int yTop = 48 * cellHeight + minY;      /* 320 */
     for (int k = 0; k < 4; k++)
-        top[k] = densityAtCorner(params, wx[k], yTop, wz[k], dep[k], fac[k], jag[k], caves);
+        cornerChannels(params, wx[k], yTop, wz[k], dep[k], fac[k], jag[k], caves, top[k]);
     for (int cellY = 47; cellY >= 0; cellY--) {
         int yBot = cellY * cellHeight + minY;
         for (int k = 0; k < 4; k++)
-            bot[k] = densityAtCorner(params, wx[k], yBot, wz[k], dep[k], fac[k], jag[k], caves);
+            cornerChannels(params, wx[k], yBot, wz[k], dep[k], fac[k], jag[k], caves, bot[k]);
+        /* corners: 0 (x0,z0) 1 (x0,z1) 2 (x1,z0) 3 (x1,z1) */
         for (int relY = cellHeight - 1; relY >= 0; relY--) {
-            /* same arg order as generateColumn: (n000,n100,n010,n110,n001,n101,n011,n111) */
-            double noise = lerp3(pcX, pY[relY], pcZ,
-                bot[0], bot[2], top[0], top[2], bot[1], bot[3], top[1], top[3]);
-            if (noise > 0.0)
+            if (tn_solid(bot[0], bot[2], bot[1], bot[3], top[0], top[2], top[1], top[3], tx, pY[relY], tz))
                 return (cellY * cellHeight + relY + 1) + minY;
         }
-        top[0]=bot[0]; top[1]=bot[1]; top[2]=bot[2]; top[3]=bot[3];
+        memcpy(top, bot, sizeof top);
     }
     return minY;
 }
@@ -634,7 +638,7 @@ void generateRegion(TerrainNoise *params, int chunkX, int chunkZ, int chunkW, in
     const int minCellZ = chunkZ << 2;
 
     const int cells = chunkCellsW * chunkCellsH;
-    double (*ds)[48 + 1] = malloc(cells * sizeof(*ds));
+    double (*ds)[(48 + 1) * 5] = malloc(cells * sizeof(*ds));
     char* bitSet = calloc(BITNSLOTS(cells), sizeof(char));
 
     for (int relCellX = 0; relCellX < chunkCellsW - 1; ++relCellX) {
@@ -683,4 +687,53 @@ void generateRegion(TerrainNoise *params, int chunkX, int chunkZ, int chunkW, in
     }
     free(ds);
     free(bitSet);
+}
+
+/* (SSA 23/10) the five inputs of final_density that the game interpolates over a
+ * 4x8x4 cell, at one cell corner: [0] = 0.64*slide(...) (squeezed per block after
+ * interpolation), [1] noodle toggle, [2] noodle thickness, [3]/[4] ridges A/B
+ * (combined per block). Same expression tree as the 1.18-26.2 overworld router. */
+/* (31/10) an upper bound of sampleCornerInputs' out[0] from the sloped cheese alone:
+ * while sloped is in [-1e6, 1.5625) the input is min(sloped, 5 * entrances) <= sloped
+ * and slide() is non-decreasing in it; else +inf (the underground noises decide). */
+double cornerUpperBound(TerrainNoise *p, int x, int y, int z, double depth, double factor,
+                        double jagged, double *sloped_out)
+{
+    double sloped = sampleSlopedCheese(p, x, y, z, depth, factor, jagged);
+    if (sloped_out) *sloped_out = sloped;
+    if (sloped >= -1000000.0 && sloped < 1.5625) return 0.64 * slideOverworld(sloped, y);
+    return INFINITY;
+}
+
+/* sampleCornerInputs with its sloped cheese already known */
+void sampleCornerInputsS(TerrainNoise *p, int x, int y, int z, double sloped, double out[5])
+{
+    double rough = sampleSpaghettiRoughness(p, x, y, z);
+    double entr = sampleEntrances(p, x, y, z, rough);
+    double a = fmin(sloped, 5.0 * entr);
+    double b = rangeChoice(sloped, -1000000.0, 1.5625, a,
+                           sampleUnderground(p, x, y, z, rough, entr, sloped));
+    out[0] = 0.64 * slideOverworld(b, y);
+    int inr = (y >= -60 && y < 321);
+    out[1] = inr ? sampleDoublePerlin(&p->noises[OTP_NOODLE], x, y, z) : -1.0;
+    out[2] = inr ? (-0.07500000000000001 + -0.025 * sampleDoublePerlin(&p->noises[OTP_NOODLE_THICKNESS], x, y, z)) : 0.0;
+    out[3] = inr ? sampleDoublePerlin(&p->noises[OTP_NOODLE_RIDGE_A], x * 2.6666666666666665, y * 2.6666666666666665, z * 2.6666666666666665) : 0.0;
+    out[4] = inr ? sampleDoublePerlin(&p->noises[OTP_NOODLE_RIDGE_B], x * 2.6666666666666665, y * 2.6666666666666665, z * 2.6666666666666665) : 0.0;
+}
+
+void sampleCornerInputs(TerrainNoise *p, int x, int y, int z, double depth, double factor,
+                        double jagged, double out[5])
+{
+    double sloped = sampleSlopedCheese(p, x, y, z, depth, factor, jagged);
+    double rough = sampleSpaghettiRoughness(p, x, y, z);
+    double entr = sampleEntrances(p, x, y, z, rough);
+    double a = fmin(sloped, 5.0 * entr);
+    double b = rangeChoice(sloped, -1000000.0, 1.5625, a,
+                           sampleUnderground(p, x, y, z, rough, entr, sloped));
+    out[0] = 0.64 * slideOverworld(b, y);
+    int inr = (y >= -60 && y < 321);
+    out[1] = inr ? sampleDoublePerlin(&p->noises[OTP_NOODLE], x, y, z) : -1.0;
+    out[2] = inr ? (-0.07500000000000001 + -0.025 * sampleDoublePerlin(&p->noises[OTP_NOODLE_THICKNESS], x, y, z)) : 0.0;
+    out[3] = inr ? sampleDoublePerlin(&p->noises[OTP_NOODLE_RIDGE_A], x * 2.6666666666666665, y * 2.6666666666666665, z * 2.6666666666666665) : 0.0;
+    out[4] = inr ? sampleDoublePerlin(&p->noises[OTP_NOODLE_RIDGE_B], x * 2.6666666666666665, y * 2.6666666666666665, z * 2.6666666666666665) : 0.0;
 }

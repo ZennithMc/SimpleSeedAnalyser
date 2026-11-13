@@ -325,21 +325,24 @@ class StrongholdGenerator:
         # qui n'en consomme aucune (cf. source !).
         # Vérification de la source : OUI, PORTAL_ROOM consomme aussi nextInt(5).
         if pt == STRAIGHT:
-            rng.nextInt_bound(5)
+            self._door = rng.nextInt_bound(5)   # (05/11) entryDoor, kept for the map
             ad = 0
             ad |= (1 if rng.nextInt_bound(2) == 0 else 0) << 0
             ad |= (1 if rng.nextInt_bound(2) == 0 else 0) << 1
             return Piece(pt, depth, bb, direction, ad)
         if pt in (PRISON_HALL, LEFT_TURN, RIGHT_TURN,
                   STRAIGHT_STAIRS_DOWN, STAIRS_DOWN, CHEST_CORRIDOR, LIBRARY):
-            rng.nextInt_bound(5)
+            self._door = rng.nextInt_bound(5)   # (05/11) entryDoor, kept for the map
             return Piece(pt, depth, bb, direction, 0)
         if pt == ROOM_CROSSING:
-            rng.nextInt_bound(5)
-            rng.nextInt_bound(5)
-            return Piece(pt, depth, bb, direction, 0)
+            self._door = rng.nextInt_bound(5)   # (05/11) entryDoor, kept for the map                 # entryDoor = randomSmallDoor()
+            # (24/10) this.type = random.nextInt(5): KEPT (it was thrown away, so
+            # every crossing was type 0 — a storeroom (type 2) has a chest whose
+            # createChest draws a nextLong in its chunk: eyes / loot were shifted)
+            ad = rng.nextInt_bound(5)
+            return Piece(pt, depth, bb, direction, ad)
         if pt == FIVE_CROSSING:
-            rng.nextInt_bound(5)
+            self._door = rng.nextInt_bound(5)   # (05/11) entryDoor, kept for the map
             ad = 0
             ad |= (1 if rng.nextBoolean() else 0) << 0
             ad |= (1 if rng.nextBoolean() else 0) << 1
@@ -361,6 +364,8 @@ class StrongholdGenerator:
         return Piece(pt, depth, bb, direction, 0)
 
     def add_piece(self, p: Piece):
+        p.door = getattr(self, "_door", 0)       # (05/11) 0, 1 opening, 2 wood, 3 grates, 4 iron
+        self._door = 0
         idx = len(self.pieces)
         self.pieces.append(p)
         self.pending.append(idx)
@@ -990,6 +995,13 @@ def _box_edges(n_x: int, n_y: int, n_z: int) -> int:
     return total - interior
 
 
+# (26/10) optional: (wx, wy, wz) -> True when the block there is air BEFORE the
+# stronghold (caves, lakes, mineshafts…). generateBox(…, true, …) skips those
+# cells: one random draw less each. None = assume solid ground (the eyes).
+AIR_TEST = None
+EYES_CAVES = True          # (24/10) the eye count sees the caves (1.18 → 26.2)
+
+
 def _gen_box_selector_rng(rng: 'Xrsr128', piece: 'Piece', chunkBB: 'BoundingBox',
                            x0: int, y0: int, z0: int,
                            x1: int, y1: int, z1: int,
@@ -1039,6 +1051,9 @@ def _gen_box_selector_rng(rng: 'Xrsr128', piece: 'Piece', chunkBB: 'BoundingBox'
                 if not (chunkBB.minX <= wx <= chunkBB.maxX and
                         chunkBB.minY <= wy <= chunkBB.maxY and
                         chunkBB.minZ <= wz <= chunkBB.maxZ):
+                    continue
+                # (26/10) air there before the stronghold (a cave…) → skipped too
+                if AIR_TEST is not None and AIR_TEST(wx, wy, wz):
                     continue
                 # Dans chunkBB : test isEdge pour le selector
                 is_edge = (i == y0 or i == y1 or
@@ -1331,8 +1346,42 @@ def _eyes_per_frame(world_seed: int, gen: StrongholdGenerator, mc_version: int =
         return [False] * 12
 
     chunk_cache: dict = {}
+    full = {}
+
+    def _air(cx, cz, chunkBB):
+        """(24/10) 1.18 → 26.2: the walls of the pieces placed before the portal
+        room in this chunk skip the blocks already air (caves): one draw less
+        each. Checked on the 26.2 server: 6 of 7 cave cases right (0 of 7
+        before), no change on the others (44 / 45)."""
+        global AIR_TEST
+        if not (EYES_CAVES and (22 <= int(mc_version) <= 35 or int(mc_version) in (19, 20, 21))):
+            return None
+        before = False
+        for q in gen.pieces:
+            if q is p:
+                break
+            if q.bbox.intersects(chunkBB):
+                before = True
+                break
+        if not before:
+            return None
+        try:
+            if "dy" not in full:
+                sx, sz = (gen.startX - 2) >> 4, (gen.startZ - 2) >> 4
+                g2, r2 = _generate_full_bfs(int(world_seed), sx, sz,
+                                            pre118=_use_old_filler(mc_version))
+                sea, miny = _sea_min_for_mc(mc_version)
+                full["dy"] = _move_below_sea_level(g2, r2, sea, miny, 10,
+                                                   _inflate_for_mc(mc_version))
+                full["pieces"] = g2.pieces
+            import structure_loot as _sl
+            return _sl._air_test(int(world_seed), int(mc_version), cx, cz, full["dy"],
+                                 full["pieces"])
+        except Exception:
+            return None
 
     def get_chunk_frames(cx: int, cz: int) -> list[bool]:
+        global AIR_TEST
         if (cx, cz) in chunk_cache:
             return chunk_cache[(cx, cz)]
         # 1) decoration_seed pour ce chunk
@@ -1340,6 +1389,8 @@ def _eyes_per_frame(world_seed: int, gen: StrongholdGenerator, mc_version: int =
         # 3) chunkBB du chunk en cours
         chunkBB = BoundingBox(cx << 4, -32768, cz << 4,
                                 (cx << 4) + 15, 32767, (cz << 4) + 15)
+        _prev = AIR_TEST
+        AIR_TEST = _air(cx, cz, chunkBB) if _prev is None else _prev
         # 4) Simuler chaque pièce qui intersecte ce chunk, en ordre BFS,
         #    jusqu'à arriver à PortalRoom
         for piece in gen.pieces:
@@ -1351,6 +1402,7 @@ def _eyes_per_frame(world_seed: int, gen: StrongholdGenerator, mc_version: int =
                 break
             # Autre pièce avant PortalRoom : simuler sa consommation RNG
             _simulate_piece_postprocess(rng, piece, chunkBB)
+        AIR_TEST = _prev
         # 5) Lire 12 nextFloat → eyes[]
         frames = [rng.next_float() > 0.9 for _ in range(12)]
         chunk_cache[(cx, cz)] = frames
@@ -2151,7 +2203,6 @@ def _validate_candidates_cpu(candidate_seeds, min_eyes, callback,
     (cubiomes biome filter + count_stronghold_eyes + double-check Gaider).
     Utilise un ProcessPoolExecutor pour répartir sur plusieurs cores."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
-    from search_worker import search_chunk
 
     # On crée un job par groupe de ~50 candidats (validation prend ~15 ms
     # par candidat avec biome filter, donc 50 candidats = 750 ms).
@@ -2856,7 +2907,7 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
     Si `min_eyes == 12`, le worker active automatiquement le mode rapide
     Gaider. Précision quasi parfaite pour cette valeur.
     """
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import ProcessPoolExecutor
 
     # Worker function importée depuis le module isolé
     from search_worker import search_chunk

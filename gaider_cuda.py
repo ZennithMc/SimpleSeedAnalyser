@@ -11,9 +11,6 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
-import subprocess
-import shutil
-import time
 
 _CUDA_LIB = None  # ctypes.CDLL or None
 _CUDA_AVAILABLE = None  # tri-state: None=unchecked, True/False=result
@@ -124,7 +121,7 @@ def _load_cuda() -> None:
         except AttributeError:
             _HAS_LCG = False
     except Exception as e:
-        _CUDA_LOAD_ERROR = f"gaider_cuda.dll : liaison des fonctions impossible ({e})"
+        _CUDA_LOAD_ERROR = f"gaider_cuda: cannot bind its functions ({e})"
         print(f"[CUDA] {_CUDA_LOAD_ERROR}")
         _CUDA_AVAILABLE = False
 
@@ -138,15 +135,15 @@ def _grow(total) -> int:
     allocation démesurée."""
     if total > _GROW_LIMIT:
         import native_libs as _nl
-        raise _nl.GpuError(f"{total:,} candidats dans un seul lot GPU : condition trop "
-                           f"large (augmente le seuil / le nombre d'yeux minimum)")
+        raise _nl.GpuError(f"{total:,} candidates in one GPU batch: condition too "
+                           f"broad (raise the threshold / the minimum number of eyes)")
     return int(total)
 
 
 def _unavailable():
     """Appel GPU sans GPU utilisable : erreur explicite (avant : « 0 résultat »)."""
     import native_libs as _nl
-    raise _nl.GpuError(f"GPU indisponible : {get_load_error()}")
+    raise _nl.GpuError(f"GPU unavailable: {get_load_error()}")
 
 
 def _check(rc) -> None:
@@ -154,7 +151,7 @@ def _check(rc) -> None:
     if rc is None or rc < 0:
         import native_libs as _nl
         global _CUDA_AVAILABLE, _CUDA_LOAD_ERROR
-        err = _nl.last_error(_CUDA_LIB) or "erreur CUDA"
+        err = _nl.last_error(_CUDA_LIB) or "CUDA error"
         if _nl.is_sticky(err):             # dead CUDA context: CPU from now on
             _CUDA_AVAILABLE = False
             _CUDA_LOAD_ERROR = "GPU switched off until SSA restarts (the CUDA context is lost): " + err
@@ -405,7 +402,6 @@ def _symbol_exists(lib: ctypes.CDLL, name: str) -> bool:
     """
     try:
         if platform.system() == "Windows":
-            import ctypes.util as _cu
             kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
             # lib._handle is the HMODULE (an int on Windows ctypes)
             addr = kernel32.GetProcAddress(lib._handle, name.encode())

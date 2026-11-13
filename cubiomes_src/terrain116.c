@@ -941,6 +941,10 @@ static void carve_point(Carv *cv, int x, int z, int rx, int y, int rz, int *gras
             return;
         }
         if (y < 10) { T116_AT(c, rx, y, rz) = T116_LAVA; return; }
+        if (cv->t->mc == MC_1_17_1) {   /* 1.17: the water on the block itself (no moved pos) */
+            T116_AT(c, rx, y, rz) = T116_WATER;
+            return;
+        }
         /* the Java loop moves `pos` to a neighbour only when that neighbour is
            in the chunk (short-circuit): the water lands on the first in-chunk
            air neighbour (N E S W), or — at a neighbour outside the chunk — on
@@ -1007,7 +1011,8 @@ static void carve_region(Carv *cv, uint64_t seed, double x, double y, double z, 
             for (int s = l; s > k; --s) {
                 double h = ((double)s - 0.5 - y) / pitch;
                 if (cv->kind == CV_CAVE || cv->kind == CV_UW_CAVE) {
-                    if (h <= -0.7 || f * f + h * h + g * g >= 1.0) continue;
+                    /* 1.17: the floor level is a FloatProvider: (double)-0.7f */
+                    if (h <= (cv->t->mc == MC_1_17_1 ? (double)-0.7f : -0.7) || f * f + h * h + g * g >= 1.0) continue;
                 } else {
                     if ((f * f + g * g) * (double)cv->stretch[s - 1] + h * h / 6.0 >= 1.0) continue;
                 }
@@ -1107,11 +1112,24 @@ static void carve_ravine_src(Carv *cv, uint64_t *r, int sx, int sz)
     double e = nextInt(r, nextInt(r, 40) + 8) + 20;
     double f = sz * 16 + nextInt(r, 16);
     float g = nextFloat(r) * ((float)3.141592653589793 * 2.0f);
-    float h = (nextFloat(r) - 0.5f) * 2.0f / 8.0f;
-    float p = nextFloat(r) * 2.0f;
-    p += nextFloat(r);
-    p *= 2.0f;
-    int q = n - nextInt(r, n / 4);
+    /* (24/10) 1.17: the canyon's shape comes from its configuration (float
+       providers): the same draws, other roundings, and its length is
+       (int)(112 * uniform(0.75, 1)) — a nextFloat instead of the nextInt */
+    const int v117 = cv->t->mc == MC_1_17_1;
+    float h, p;
+    int q;
+    if (v117) {
+        h = nextFloat(r) * 0.25f + -0.125f;
+        p = 0.0f + nextFloat(r) * 4.0f;
+        p = p + nextFloat(r) * 2.0f;
+        q = (int)((float)n * (nextFloat(r) * 0.25f + 0.75f));
+    } else {
+        h = (nextFloat(r) - 0.5f) * 2.0f / 8.0f;
+        p = nextFloat(r) * 2.0f;
+        p += nextFloat(r);
+        p *= 2.0f;
+        q = n - nextInt(r, n / 4);
+    }
     uint64_t seed = nextLong(r);
     /* carveRavine */
     uint64_t R;
@@ -1138,8 +1156,13 @@ static void carve_ravine_src(Carv *cv, uint64_t *r, int sx, int sz)
     for (int j = 0; j < q; ++j) {
         double dd = 1.5 + (double)(msin((float)j * (float)3.141592653589793 / (float)q) * p);
         double ee = dd * 3.0;
-        dd *= (double)nextFloat(&R) * 0.25 + 0.75;
-        ee *= (double)nextFloat(&R) * 0.25 + 0.75;
+        if (v117) {
+            dd *= (double)(nextFloat(&R) * 0.25f + 0.75f);
+            ee = 1.0 * ee * (double)(nextFloat(&R) * 0.25f + 0.75f);
+        } else {
+            dd *= (double)nextFloat(&R) * 0.25 + 0.75;
+            ee *= (double)nextFloat(&R) * 0.25 + 0.75;
+        }
         float k = mcos(pitch), l = msin(pitch);
         x += (double)(mcos(yaw) * k);
         y += (double)l;
@@ -1161,9 +1184,12 @@ static void carve_ravine_src(Carv *cv, uint64_t *r, int sx, int sz)
 
 static __thread CarvRec *CARV_C = NULL;     /* [64] */
 
+static void t116_carve_117(const T116 *t, T116Chunk *c, int liquid);
+
 static void t116_carve(const T116 *t, T116Chunk *c, int liquid)
 {
     sint_init();
+    if (t->mc == MC_1_17_1) { t116_carve_117(t, c, liquid); return; }
     const T116Biome *bi = tb(c->bio4[2 * 9 + 2]);
     int ocean = (bi->flags & 2) != 0;
     if (liquid && !ocean) return;
@@ -1229,6 +1255,38 @@ static void t116_carve(const T116 *t, T116Chunk *c, int liquid)
                 if (kind == CV_CAVE || kind == CV_UW_CAVE) carve_cave_src(&cv, &r, l, m);
                 else carve_ravine_src(&cv, &r, l, m);
             }
+}
+
+/* (24/10) 1.17: each carver start uses the carvers of ITS chunk's biome (the
+   1:4 cell at its corner), not of the carved chunk's (1.16) — checked in the
+   1.17.1 jar (ChunkGenerator.applyCarvers) and on the server */
+static void t116_carve_117(const T116 *t, T116Chunk *c, int liquid)
+{
+    Carv cv;
+    cv.t = t;
+    cv.c = c;
+    cv.sup = NULL;
+    cv.rec = NULL;
+    cv.mask = liquid ? c->mask_liq : c->mask_air;
+    for (int l = c->cx - 8; l <= c->cx + 8; ++l)
+        for (int m = c->cz - 8; m <= c->cz + 8; ++m) {
+            int ocean = (tb(t116_biome4(&t->g, l * 4, m * 4))->flags & 2) != 0;
+            if (liquid && !ocean) continue;
+            float pcave = ocean ? 0.06666667f : 0.14285715f;
+            for (int n = 0; n < 2; ++n) {
+                uint64_t r;
+                uint64_t ws = t->seed + (uint64_t)n;
+                setSeed(&r, ws);
+                uint64_t a = nextLong(&r), b = nextLong(&r);
+                setSeed(&r, (uint64_t)((int64_t)l * (int64_t)a) ^ (uint64_t)((int64_t)m * (int64_t)b) ^ ws);
+                int kind = liquid ? (n == 0 ? CV_UW_RAVINE : CV_UW_CAVE) : (n == 0 ? CV_CAVE : CV_RAVINE);
+                float pr = (kind == CV_CAVE || kind == CV_UW_CAVE) ? pcave : 0.02f;
+                if (!(nextFloat(&r) <= pr)) continue;
+                cv.kind = kind;
+                if (kind == CV_CAVE || kind == CV_UW_CAVE) carve_cave_src(&cv, &r, l, m);
+                else carve_ravine_src(&cv, &r, l, m);
+            }
+        }
 }
 
 int t116_chunk_build(const T116 *t, int cx, int cz, int status, T116Chunk *c)
@@ -1330,10 +1388,25 @@ typedef struct {
     T116Chunk *scratch;
     const T116 *t;
     T116Cache *cache;
+    /* (24/10) optional shared 5×5 world around (pcx, pcz): the features of a
+       neighbour chunk then stay in the world the next chunk is decorated in */
+    T116Chunk *pool; unsigned char *pool_ok; int pcx, pcz;
 } W116;
 
 static T116Chunk *w_chunk(W116 *w, int k)
 {
+    if (!w->ch[k] && w->pool) {
+        int qx = w->cx - 1 + k % 3 - w->pcx + 2, qz = w->cz - 1 + k / 3 - w->pcz + 2;
+        if (qx < 0 || qx > 4 || qz < 0 || qz > 4) return NULL;
+        int q = qz * 5 + qx;
+        if (!w->pool_ok[q]) {
+            const T116Chunk *c = cache_get(w->t, w->cache, w->cx - 1 + k % 3, w->cz - 1 + k / 3);
+            if (!c) return NULL;
+            memcpy(&w->pool[q], c, sizeof(T116Chunk));
+            w->pool_ok[q] = 1;
+        }
+        w->ch[k] = &w->pool[q];
+    }
     if (!w->ch[k]) {
         const T116Chunk *c = cache_get(w->t, w->cache, w->cx - 1 + k % 3, w->cz - 1 + k / 3);
         if (!c) return NULL;
@@ -1432,6 +1505,23 @@ static int lake_generate(W116 *w, uint64_t *r, int x, int y, int z, int liquid, 
     return 1;
 }
 
+/* (30/10) capture of the dungeons chunk (dcap_cx, dcap_cz) places: 16 int64 each
+   (X Y Z, half sizes j o, mob, chest count, 2 × (chest x y z, loot table seed), attempt) */
+static __thread int64_t *dcap_out = NULL;
+static __thread int dcap_max, dcap_n, dcap_cx, dcap_cz;
+
+void t116_dungeon_capture(int cx, int cz, int64_t *out, int max)
+{
+    dcap_out = out; dcap_max = max; dcap_n = 0; dcap_cx = cx; dcap_cz = cz;
+}
+
+int t116_dungeon_capture_end(void)
+{
+    int n = dcap_n;
+    dcap_out = NULL; dcap_n = 0;
+    return n;
+}
+
 /* DungeonFeature.generate at (x, y, z), the random after the decorator draws */
 static int dungeon_generate(W116 *w, uint64_t *r, int X, int Y, int Z, int *pj, int *po)
 {
@@ -1469,6 +1559,12 @@ static int dungeon_generate(W116 *w, uint64_t *r, int X, int Y, int Z, int *pj, 
                 wset(w, px, py, pz, T116_CAVE_AIR);
             }
     static const int DX[4] = {0, 1, 0, -1}, DZ[4] = {-1, 0, 1, 0};
+    int64_t *rec = NULL;
+    if (dcap_out && w->cx == dcap_cx && w->cz == dcap_cz && dcap_n < dcap_max) {
+        rec = dcap_out + 16 * dcap_n++;
+        memset(rec, 0, 16 * sizeof(int64_t));
+        rec[0] = X; rec[1] = Y; rec[2] = Z; rec[3] = j; rec[4] = o;
+    }
     for (int yy = 0; yy < 2; ++yy)
         for (int zz = 0; zz < 3; ++zz) {
             int aa = X + nextInt(r, j * 2 + 1) - j;
@@ -1478,11 +1574,16 @@ static int dungeon_generate(W116 *w, uint64_t *r, int X, int Y, int Z, int *pj, 
             for (int d = 0; d < 4; ++d) if (T116_IS_SOLID(wget(w, aa + DX[d], Y, ac + DZ[d]))) ++ad;
             if (ad != 1) continue;
             wset(w, aa, Y, ac, T116_CHEST);
-            nextLong(r);                    /* the loot table seed */
+            int64_t ls = (int64_t)nextLong(r);     /* the loot table seed */
+            if (rec) {
+                int64_t *c = rec + 7 + 4 * rec[6]++;
+                c[0] = aa; c[1] = Y; c[2] = ac; c[3] = ls;
+            }
             break;
         }
     wset(w, X, Y, Z, T116_SPAWNER);
-    nextInt(r, 4);                          /* the spawner's mob */
+    int mob = nextInt(r, 4);                /* the spawner's mob */
+    if (rec) rec[5] = mob;
     return 1;
 }
 
@@ -1496,6 +1597,8 @@ int t116_populate(const T116 *t, T116Cache *cache, int cx, int cz, T116Feat *out
     return t116_populate_ex(t, cache, cx, cz, out, cap, result, 3);
 }
 
+static int pop_run(W116 *wp, T116Feat *out, int cap, T116Chunk *result, int want);
+
 /* want: 1 the lakes, 2 the dungeons (the lakes are run anyway: they come first) */
 int t116_populate_ex(const T116 *t, T116Cache *cache, int cx, int cz, T116Feat *out, int cap,
                      T116Chunk *result, int want)
@@ -1505,6 +1608,16 @@ int t116_populate_ex(const T116 *t, T116Cache *cache, int cx, int cz, T116Feat *
     W116 w;
     memset(&w, 0, sizeof w);
     w.cx = cx; w.cz = cz; w.scratch = scratch; w.t = t; w.cache = cache;
+    ms116_spider_reset(0);
+    return pop_run(&w, out, cap, result, want);
+}
+
+static int pop_run(W116 *wp, T116Feat *out, int cap, T116Chunk *result, int want)
+{
+    W116 w = *wp;
+    const T116 *t = w.t;
+    T116Cache *cache = w.cache;
+    int cx = w.cx, cz = w.cz;
     if (!w_chunk(&w, 4)) return -1;
     int n = 0;
     int bio = w.ch[4]->bio4[(2 + 2) * 9 + (2 + 2)];   /* the 1:4 cell (cx*4+2, cz*4+2) */
@@ -1565,6 +1678,46 @@ int t116_populate_ex(const T116 *t, T116Cache *cache, int cx, int cz, T116Feat *
     return n;
 }
 
+
+/* (24/10) the chunk's blocks once the neighbours given by `mask` (bit k:
+   neighbour k of the 3×3, k = (dz+1)*3 + (dx+1), centre excluded) have been
+   decorated BEFORE it, in that bit order, then the chunk itself: their lakes
+   and dungeons reach into it (a lake spans x-8 .. x+7) — the game decorates
+   the chunks in its loading order. */
+int t116_populate_nb(const T116 *t, T116Cache *cache, int cx, int cz, int mask, T116Chunk *result)
+{
+    static __thread T116Chunk *pool = NULL;
+    static __thread T116Chunk *scratch = NULL;
+    if (!pool) { pool = malloc(25 * sizeof(T116Chunk)); if (!pool) return -1; }
+    if (!scratch) { scratch = malloc(9 * sizeof(T116Chunk)); if (!scratch) return -1; }
+    unsigned char ok[25];
+    memset(ok, 0, sizeof ok);
+    T116Feat fe[16];
+    ms116_spider_reset(0);       /* (29/10) the spawners the neighbours place are kept */
+    for (int k = 0; k < 9; ++k) {
+        if (k == 4 || !(mask >> k & 1)) continue;
+        W116 w;
+        memset(&w, 0, sizeof w);
+        w.cx = cx - 1 + k % 3; w.cz = cz - 1 + k / 3;
+        w.scratch = scratch; w.t = t; w.cache = cache;
+        w.pool = pool; w.pool_ok = ok; w.pcx = cx; w.pcz = cz;
+        if (pop_run(&w, fe, 16, NULL, 3) < 0) return -1;
+    }
+    W116 w;
+    memset(&w, 0, sizeof w);
+    w.cx = cx; w.cz = cz; w.scratch = scratch; w.t = t; w.cache = cache;
+    w.pool = pool; w.pool_ok = ok; w.pcx = cx; w.pcz = cz;
+    return pop_run(&w, fe, 16, result, 3);
+}
+
+/* (24/10) debug: the chunk after the carvers only (status LIQUID_CARVERS) */
+int t116_carved(const T116 *t, T116Cache *cache, int cx, int cz, T116Chunk *result)
+{
+    const T116Chunk *c = cache_get(t, cache, cx, cz);
+    if (!c) return -1;
+    memcpy(result, c, sizeof(T116Chunk));
+    return 0;
+}
 
 /* ══ dungeon pre-filter: can chunk (cx, cz) have a dungeon at all? ══════════
  * Cheap and EXACT as a superset (0 = certainly none, 1 = maybe: run the full

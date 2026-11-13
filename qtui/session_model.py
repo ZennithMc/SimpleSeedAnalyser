@@ -30,7 +30,7 @@ IMPORTED_TYPES = {
 # types that take dependent conditions (children) meaningfully
 CONTAINERS = {"spiral", "logic_or", "logic_not", "scale_to_nether", "scale_to_overworld"}
 NO_AREA = {"scale_to_nether", "scale_to_overworld", "logic_or", "logic_not", "crunchiness"}
-NO_INSTANCES = {"spawn_feature116", "spiral", "scale_to_nether", "scale_to_overworld", "crunchiness", "logic_or",
+NO_INSTANCES = {"spawn_feature116", "elytra_spawn", "spiral", "scale_to_nether", "scale_to_overworld", "crunchiness", "logic_or",
                 "logic_not", "first_stronghold", "spawn", "climate_minmax", "climate_center",
                 "climate_noise", "climate_extreme", "noise_sample", "biome_filter",
                 "nether_biomes", "end_biomes",
@@ -106,6 +106,12 @@ def area_text(c: dict) -> str:
         if t == "logic_or" and int(p.get("min_pass", 1) or 1) > 1:     # (19/10)
             return f"at least {int(p['min_pass'])} pass"
         return ""
+    if t == "elytra_spawn":                       # (24/10) its own radius, no area
+        try:
+            r = int(p.get("radius", 10000) or 10000)
+        except (TypeError, ValueError):
+            r = 10000
+        return f"≤ {r:,} blocks".replace(",", " ") + ("" if p.get("ortho", True) else " · in portal only")
     if t == "climate_center":                     # flood fill: size and scale
         sc = int(p.get("scale", 16) or 16)
         mx = int(p.get("max_size", 0) or 0)
@@ -434,6 +440,22 @@ class SessionModel(QObject):
         c.update(keep)
         self._touch("Edit a condition")
 
+    def update_many(self, conds_by_uid, what="Edit conditions"):
+        """(22/10) Several conditions edited at once: one undo step."""
+        n = 0
+        for uid, cond in conds_by_uid.items():
+            c = self.get(uid)
+            if c is None:
+                continue
+            keep = {k: c[k] for k in ("_uid", "_parent")}
+            c.clear()
+            c.update(copy.deepcopy({k: v for k, v in cond.items() if not k.startswith("_")}))
+            c.update(keep)
+            n += 1
+        if n:
+            self._touch(what)
+        return n
+
     def remove(self, uids):
         """Removes exactly these conditions (08/10). The conditions linked to a
         removed one stay, relative to the origin (0, 0) — before, the whole
@@ -468,6 +490,27 @@ class SessionModel(QObject):
             self.conds.append(c)
         self._touch("Move a condition")
         return True
+
+    def reparent_many(self, uids, new_parent):
+        """(22/10) Several conditions under one parent in one step (one undo).
+        A selected condition whose parent is selected too keeps that parent
+        (the subtree moves with it). Returns how many moved."""
+        sel = [u for u in uids if self.get(u) is not None]
+        sset = set(sel)
+        roots = [u for u in sel if self.get(u).get("_parent", 0) not in sset]
+        if new_parent and (self.get(new_parent) is None or
+                           any(new_parent == u or new_parent in self.subtree(u) for u in roots)):
+            return 0
+        n = 0
+        for u in roots:
+            c = self.get(u)
+            if c.get("_parent", 0) != new_parent:
+                c["_parent"] = new_parent
+                self.conds.remove(c); self.conds.append(c)
+                n += 1
+        if n:
+            self._touch("Change the parent" if n == 1 else f"Change the parent of {n} conditions")
+        return n
 
     def move(self, uid, delta):
         """Move among its siblings (delta = -1 up, +1 down)."""

@@ -155,6 +155,10 @@ def _draw(name: str, p: QPainter, c: QColor):
         path = QPainterPath(); path.moveTo(15.5, 4.5); path.lineTo(19.5, 8.5); path.lineTo(9, 19)
         path.lineTo(4.5, 19.5); path.lineTo(5, 15); path.closeSubpath(); p.drawPath(path)
         p.drawLine(13.5, 6.5, 17.5, 10.5)
+    elif name == "chest":            # (06/11) Loot: a chest, lid seam and latch
+        p.drawRoundedRect(QRectF(3.5, 5.5, 17, 14), 2, 2)
+        p.drawLine(QPointF(3.5, 10.5), QPointF(20.5, 10.5))
+        p.drawRoundedRect(QRectF(10.3, 8.8, 3.4, 4.4), 0.8, 0.8)
     elif name == "folder":
         path = QPainterPath(); path.moveTo(3.5, 7); path.lineTo(3.5, 18.5); path.lineTo(20.5, 18.5)
         path.lineTo(20.5, 8.5); path.lineTo(11.5, 8.5); path.lineTo(9.5, 6); path.lineTo(4, 6)
@@ -167,6 +171,12 @@ def _draw(name: str, p: QPainter, c: QColor):
         p.drawLine(9, 12, 15, 12); p.drawLine(9, 15.5, 13, 15.5)
     elif name == "check":
         p.drawPolyline([QPointF(5, 12.5), QPointF(10, 17.5), QPointF(19, 7)])
+    elif name == "forest":           # (05/11) Seedcracking: a block tree
+        path = QPainterPath()
+        path.moveTo(8, 4); path.lineTo(16, 4); path.lineTo(16, 7); path.lineTo(20, 7)
+        path.lineTo(20, 14); path.lineTo(4, 14); path.lineTo(4, 7); path.lineTo(8, 7); path.closeSubpath()
+        p.drawPath(path)
+        p.drawLine(QPointF(12, 14), QPointF(12, 20.5)); p.drawLine(QPointF(8, 20.5), QPointF(16, 20.5))
     elif name == "tree":
         p.drawEllipse(QPointF(6, 6), 2, 2); p.drawEllipse(QPointF(14, 12), 2, 2); p.drawEllipse(QPointF(14, 19), 2, 2)
         p.drawPolyline([QPointF(6, 8), QPointF(6, 19), QPointF(12, 19)]); p.drawLine(6, 12, 12, 12)

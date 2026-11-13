@@ -8,7 +8,7 @@ Equivalent to cubiomes' 48-bit pass. Prebuilt DLL (tools/build_native.py, RTX 20
 self-tested at load; falls back to CPU if the GPU is unusable.
 """
 from __future__ import annotations
-import ctypes, os, platform, subprocess
+import ctypes, os, platform
 
 _CUDA_LIB = None
 _CUDA_AVAILABLE = None
@@ -34,6 +34,37 @@ class GpuStructJob(ctypes.Structure):
 
 
 ALGO_DUNGEON116, ALGO_LAKE116 = 4, 5
+ALGO_WELL116 = 6                      # (30/10) 1.16 / 1.17 desert well attempts
+
+
+def _well_job(c, mc):
+    """(30/10) GpuStructJob of a top-level desert well condition, 1.16 / 1.17 only (the
+    population random of the 48 low bits; 1.18+ uses the whole seed: CPU), or None.
+    The attempts only (no biome / terrain): a superset, the CPU checks them."""
+    if not 19 <= int(mc) <= 21:
+        return None
+    try:
+        need = int(c.get("instances", (c.get("params") or {}).get("count", 1)))
+    except (TypeError, ValueError):
+        need = 1
+    if need <= 0:
+        return None
+    rmax = int(c.get("rmax", 0) or 0)
+    if not rmax and c.get("area_mode") == 0 and int(c.get("radial", 0) or 0) > 0:
+        rmax = int(c["radial"]) + 1
+    if rmax > 0:
+        rb = rmax - 1
+        bx1, bz1, bx2, bz2, rsq = -rb, -rb, rb, rb, rb * rb + 1
+    else:
+        bx1, bz1, bx2, bz2 = int(c.get("x1", 0)), int(c.get("z1", 0)), int(c.get("x2", 0)), int(c.get("z2", 0))
+        if bx1 > bx2: bx1, bx2 = bx2, bx1
+        if bz1 > bz2: bz1, bz2 = bz2, bz1
+        rsq = 0
+    return GpuStructJob(algo_kind=ALGO_WELL116, salt=40013, region_size=1, chunk_range=0,
+                        rx1=bx1 >> 4, rz1=bz1 >> 4, rx2=bx2 >> 4, rz2=bz2 >> 4,
+                        x1=bx1, z1=bz1, x2=bx2, z2=bz2, rmax_sq=rsq, cx=0, cz=0,
+                        min_count=need, exclude=0, _pad=0,
+                        ylo=-1000000, yhi=1000000, variant=0, skip_ref=0)
 
 
 def _feature116_job(c, mc):
@@ -100,7 +131,7 @@ def _load():
         lib.structure_cuda_filter.restype=ctypes.c_int64
         _CUDA_LIB=lib; _CUDA_AVAILABLE=True
     except Exception as e:
-        _CUDA_LOAD_ERROR=f"structure_cuda : liaison impossible ({e})"; _CUDA_AVAILABLE=False
+        _CUDA_LOAD_ERROR=f"structure_cuda: cannot bind its functions ({e})"; _CUDA_AVAILABLE=False
 
 
 def is_available():
@@ -122,7 +153,6 @@ def build_jobs(conditions, lib, mc):
     raw.ssa_get_struct_config.restype=ctypes.c_int
     raw.ssa_struct_gpu_algo.argtypes=[ctypes.c_int]; raw.ssa_struct_gpu_algo.restype=ctypes.c_int
     from custom_search import STRUCT_TYPES
-    import sys as _dbg
     jobs=[]; all_sup=True; n_struct=0
     global LAST_JOB_CONDS
     LAST_JOB_CONDS=[]                  # the condition of each job (statistics)
@@ -136,6 +166,12 @@ def build_jobs(conditions, lib, mc):
             fj=_feature116_job(c,mc)
             if fj is None: all_sup=False
             else: jobs.append(fj); LAST_JOB_CONDS.append(c)
+            continue
+        if t=="desert_well":                      # (30/10) 1.16 / 1.17 only
+            n_struct+=1
+            wj=_well_job(c,mc)
+            if wj is None: all_sup=False
+            else: jobs.append(wj); LAST_JOB_CONDS.append(c)
             continue
         if t not in STRUCT_TYPES: continue
         n_struct+=1
@@ -239,11 +275,11 @@ def filter_seeds(jobs, seed_start, n, fam48=False, out_cap=1<<20):
     if total < 0:
         import native_libs as _nl
         global _CUDA_AVAILABLE, _CUDA_LOAD_ERROR
-        err = _nl.last_error(_CUDA_LIB) or "erreur CUDA"
+        err = _nl.last_error(_CUDA_LIB) or "CUDA error"
         if _nl.is_sticky(err):             # dead CUDA context: CPU from now on
             _CUDA_AVAILABLE = False
             _CUDA_LOAD_ERROR = "GPU switched off until SSA restarts (the CUDA context is lost): " + err
             print(f"[structure_cuda] {_CUDA_LOAD_ERROR}", flush=True)
-        raise _nl.GpuError("filtre GPU des structures : " + err)
+        raise _nl.GpuError("GPU structure filter: " + err)
     ncopy = min(int(total), out_cap)
     return [int(out[i]) for i in range(ncopy)], int(total)

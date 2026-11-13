@@ -144,7 +144,10 @@ double samplePerlin(const PerlinNoise *noise, double d1, double d2, double d3,
     if (yamp)
     {
         double yclamp = ymax >= 0.0 && ymax < d2 ? ymax : d2;
-        d2 -= floor(yclamp / yamp) * yamp;
+        /* (24/10) ImprovedNoise.noise: Mth.floor(d7 / yScale + (double)1.0E-7F) — the
+         * epsilon was missing: a corner of the base 3D noise now and then fell on the
+         * other side of a floor -> density off by ~0.002, Exact Y off by 1 block */
+        d2 -= floor(yclamp / yamp + 1.0000000116860974e-07) * yamp;
     }
 
     const uint8_t *idx = noise->d;
