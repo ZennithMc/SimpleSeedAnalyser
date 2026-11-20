@@ -423,6 +423,7 @@ class MapEngine(QObject):
         self.pieces_pending: set = set()
         self.bus.skipped.connect(self._on_skipped)
         self.bus.failed.connect(self._on_failed)
+        self.tileReady.connect(self._tile_bump)
         self.failed: set = set()                 # keys whose job raised (not retried this epoch)
         self.palette = "True Colors (ShowMe7)"
         self.tiles: "OrderedDict[tuple, QPixmap]" = OrderedDict()
@@ -432,6 +433,7 @@ class MapEngine(QObject):
         self.noise_pix: "OrderedDict[tuple, QPixmap]" = OrderedDict()
         self.structs: dict = {}
         self.struct_pending: set = set()
+        self.block_ver: dict = {}           # (15/11) (bx, bz) → its version (each result received)
         self.zombies: dict = {}             # village block key → frozenset of abandoned (x, z)
         self.ships: dict = {}               # (18/10) end city block key → frozenset with a ship
         self.landmarks: dict = {}
@@ -460,6 +462,7 @@ class MapEngine(QObject):
         self.tiles.clear(); self.pending.clear(); self.previews.clear()
         self.noise_raw.clear(); self.noise_pix.clear()
         self.structs.clear(); self.struct_pending.clear(); self.zombies = {}; self.ships = {}
+        self.block_ver = {}
         self.basements = {}
         self.sh_pieces = {}; self.pieces_pending = set()
         self.landmarks = {}
@@ -472,6 +475,12 @@ class MapEngine(QObject):
             self.palette = name
             self.tiles.clear()
             self.previews.clear()
+            self.tile_ver += 1
+
+    tile_ver = 0          # (15/11) +1 at every tile received / recoloured (the map's picture cache)
+
+    def _tile_bump(self):
+        self.tile_ver += 1
 
     def min_scale(self, dim=0) -> int:
         if dim in (-1, 1):                  # Nether / End noise: 1:1 in every version
@@ -910,6 +919,8 @@ class MapEngine(QObject):
         if key[0] != self.epoch:
             return
         self.structs[key] = pts
+        bk = (key[2], key[3])
+        self.block_ver[bk] = self.block_ver.get(bk, 0) + 1
         self.structuresReady.emit()
 
     # ── stronghold pieces (zoomed-in map, 03/10) ────────────────────────────

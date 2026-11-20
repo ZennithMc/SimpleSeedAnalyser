@@ -26,6 +26,18 @@ class MapLink(QObject):
         self.visible = None          # the first view's dicts become the shared ones
         self.ov = None
         self.style = {"icon_px": 22}
+        try:                         # (15/11) the icons' sizes of the last session
+            import json
+            from PySide6.QtCore import QSettings
+            qs = QSettings("SSA", "SimpleSeedAnalyser")
+            px = int(qs.value("map/icon_px", 22) or 22)
+            self.style["icon_px"] = max(12, min(40, px))
+            sc = json.loads(qs.value("map/icon_scale", "{}") or "{}")
+            if isinstance(sc, dict):
+                self.style["icon_scale"] = {str(k): float(v) for k, v in sc.items()
+                                            if 0.3 <= float(v) <= 3.0}
+        except Exception:                                   # noqa: BLE001
+            pass
         self._syncing = False
 
     def add(self, view):

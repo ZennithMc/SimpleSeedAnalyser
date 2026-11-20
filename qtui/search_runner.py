@@ -70,6 +70,7 @@ class SearchRunner(QObject):
         self.state = "idle"
         self._thread = None
         self._stop = threading.Event()
+        self._gen = 0                      # (15/11) the run whose thread may still talk to us
         self._lock = threading.Lock()
         self._buf = []
         self._seen = set()
@@ -142,7 +143,11 @@ class SearchRunner(QObject):
         self._mode_err = None
         self.plan = None
         self._planning = None
-        self._stop.clear()
+        # (15/11) a run of its own: a stopped run's thread may still be ending (Stop no
+        # longer waits for it) — it keeps its own stop event, and its callbacks are
+        # ignored once the generation moved on
+        self._gen += 1
+        self._stop = threading.Event()
         self._err = None
         self._done_flag = False
         self._limit_hit = False
@@ -160,7 +165,8 @@ class SearchRunner(QObject):
         self._t0 = time.perf_counter()
         self._set_state("running")
         self._engine_label_initial(threads)
-        self._thread = threading.Thread(target=self._work, name="ssa-search", daemon=True)
+        gen = self._gen
+        self._thread = threading.Thread(target=lambda: self._work(gen), name="ssa-search", daemon=True)
         self._thread.start()
         self._timer.start()
 
@@ -294,21 +300,56 @@ class SearchRunner(QObject):
         self.message.emit(f"Paused (restored)  ·  {self.summary()}  ·  resume from {self.resume_point}")
         return True
 
-    def stop(self):
+    def stop(self, wait=False):
+        """Stop = the end. (15/11) It answers at once: the engine is told to stop and
+        the page is free again (a new search can start); the engine thread ends by
+        itself a moment later, what it finds after the click is dropped.
+        wait=True: as before, the end once the engine has stopped (a page that
+        stops to pause and needs the exact point reached)."""
         if self.state in ("running", "pausing"):
-            self._set_state("stopping")
             self._stop.set()
+            if wait:
+                self._set_state("stopping")
+            else:
+                self._detach()
+        elif self.state == "stopping" and not wait:
+            self._detach()
         elif self.state == "paused":
             self._set_state("done")
             self.message.emit(f"Stopped  ·  {self.summary()}")
 
+    def _detach(self):
+        """(15/11) the end of a run without waiting for its thread"""
+        self._gen += 1                             # its callbacks are ignored from now on
+        self._timer.stop()
+        with self._lock:
+            batch, self._buf = self._buf, []
+        if batch:
+            self.resultsReady.emit(batch)
+        done = self._last[0] * self._unit_mult()
+        self._elapsed_before += time.perf_counter() - self._t0
+        self.profile_base = self.profile()
+        self._prof_live = None
+        self._done_before += done
+        self.resume_point = None
+        self._planning = None
+        self._set_state("done")
+        self.message.emit(f"Stopped  ·  {self.summary()}")
+
     # ── worker ──────────────────────────────────────────────────────────────
-    def _work(self):
+    def _work(self, gen=None):
         import custom_search as cs
         p = self.params
+        stop = self._stop                         # this run's own (a later run has another)
         self._dedupe = p.get("seed_list") is not None or len(self._seen) > 0
 
+        def live():
+            return gen is None or gen == self._gen
+
         def on_match(seed, details=""):
+            if not live():
+                stop.set()
+                return
             s = int(seed)
             # one row per seed; stronghold jobs can report several strongholds of
             # the same seed (all-128 scans) → keyed by position as well
@@ -340,25 +381,30 @@ class SearchRunner(QObject):
                 self.found += 1
                 if self.rule[0] == "results" and self.rule[1] > 0 and self.found >= self.rule[1]:
                     self._limit_hit = True
-                    self._stop.set()
+                    stop.set()
                 elif self.found >= self._safety():
                     self._limit_hit = True
                     self._safety_hit = True
-                    self._stop.set()
+                    stop.set()
 
         def on_progress(done, total):
-            self._last = (int(done), int(total))
+            if live():
+                self._last = (int(done), int(total))
 
         def on_mode(m):
-            self._engine_modes.append(m)
+            if live():
+                self._engine_modes.append(m)
 
         def on_resume(pt):
-            self.resume_point = int(pt)
+            if live():
+                self.resume_point = int(pt)
 
         def on_profile(rows, total):
-            self._prof_live = (rows, total)
+            if live():
+                self._prof_live = (rows, total)
 
         run_conds = p["conditions"]
+        run_start, run_count = self._run_start, self._run_count      # this run's
         if p.get("job") is None and p["seed_list"] is None and p.get("gpu") in ("auto", "cpu", "plan"):
             import gpu_planner as gp
             if p["gpu"] == "cpu":
@@ -370,24 +416,35 @@ class SearchRunner(QObject):
                 # GPU: Auto — measure CPU vs the GPU pre-filters, keep the fastest
                 self.can_pause = False                  # nothing to resume while calibrating
                 self._planning = "GPU auto: preparing…"
+
+                def planning(text):
+                    if live():
+                        self._set_planning(text)
                 try:
-                    plan = gp.plan_gpu(run_conds, p["mc"], self._run_start, p["threads"],
-                                       p["engine_mode"], status=self._set_planning, stop=self._stop)
-                    self.plan = plan
+                    plan = gp.plan_gpu(run_conds, p["mc"], run_start, p["threads"],
+                                       p["engine_mode"], status=planning, stop=stop)
                     run_conds = plan.conditions
-                    self.message.emit("Engine: " + plan.detail)   # never silent
+                    if live():
+                        self.plan = plan
+                        self.message.emit("Engine: " + plan.detail)   # never silent
                 except Exception as e:                  # never block the search
                     import traceback
                     traceback.print_exc()
-                    self.plan = None
-                    self._gpu_note = f"GPU auto failed ({type(e).__name__}: {e}) — CPU used."
+                    if live():
+                        self.plan = None
+                        self._gpu_note = f"GPU auto failed ({type(e).__name__}: {e}) — CPU used."
                     run_conds = gp.strip_gpu(run_conds)
+                if not live():
+                    return                              # stopped while it was measuring
                 self._planning = None
                 self.can_pause = True
                 self._rate = []
+        err = None
         try:
-            if p.get("job") is not None:
-                p["job"](self._run_start, self._run_count, p["threads"], self._stop,
+            if not live():
+                pass                                    # stopped before it began
+            elif p.get("job") is not None:
+                p["job"](run_start, run_count, p["threads"], stop,
                          on_match, on_progress, on_mode)
             else:
                 # result limit / safety cap applied inside the C engine (p96):
@@ -396,8 +453,8 @@ class SearchRunner(QObject):
                 target = self.rule[1] if (self.rule[0] == "results" and self.rule[1] > 0) \
                     else self._safety()
                 cap = max(1, target - self.found) + self._refind_count()
-                cs.evaluate_session(run_conds, self._run_start, self._run_count, p["mc"],
-                                    p["threads"], self._stop, on_match, on_progress,
+                cs.evaluate_session(run_conds, run_start, run_count, p["mc"],
+                                    p["threads"], stop, on_match, on_progress,
                                     search_mode=p["engine_mode"], on_mode=on_mode,
                                     seed_list=p["seed_list"], on_resume=on_resume,
                                     on_profile=on_profile, max_found=cap,
@@ -405,8 +462,11 @@ class SearchRunner(QObject):
         except Exception as e:                                 # reported, never swallowed
             import traceback
             traceback.print_exc()
-            self._err = f"{type(e).__name__}: {e}"
-        self._done_flag = True
+            err = f"{type(e).__name__}: {e}"
+        if live():
+            if err is not None:
+                self._err = err
+            self._done_flag = True
 
     # ── GUI thread ──────────────────────────────────────────────────────────
     def _engine_label_initial(self, threads):

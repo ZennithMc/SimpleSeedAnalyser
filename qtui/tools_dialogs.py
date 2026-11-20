@@ -206,6 +206,7 @@ class ConvertSeedsDialog(QDialog):
         row.addWidget(self.src, 1); row.addWidget(pick)
         lay.addLayout(row)
         self.bar = QProgressBar(); self.bar.setRange(0, 1000); self.bar.setValue(0); self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(6)                         # (20/11) a thin line, not a block
         lay.addWidget(self.bar)
         self.msg = QLabel(" "); self.msg.setObjectName("Body"); self.msg.setWordWrap(True)
         lay.addWidget(self.msg)

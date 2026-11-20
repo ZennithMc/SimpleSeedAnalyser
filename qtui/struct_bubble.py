@@ -173,6 +173,17 @@ class StructBubble(QFrame):
         self.hide()
         self.setMinimumSize(0, 0); self.setMaximumSize(16777215, 16777215)
         self.ic.setPixmap(struct_icons.pixmap(key, 30))
+        if theme.is_live():                      # (14/11 bis) SSA's theme: the bubble wears its structure's colour
+            if not hasattr(self, "_qss0"):
+                self._qss0 = self.styleSheet()
+            c = struct_icons.color(key) if struct_icons.known(key) else (theme.ACCENT or "#7c9cff")
+            bg = theme.BG1 or "#1b1f27"
+            self.setStyleSheet(self._qss0 + (
+                f"#StructBubble {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:1, "
+                f"stop:0 {theme._mix(bg, c, 0.34)}, stop:0.5 {theme._mix(bg, c, 0.08)}, stop:1 {bg}); "
+                f"border: 1px solid {theme._mix(theme.LINE2, c, 0.65)}; border-radius: 16px; }}"
+                f"#BubIcon {{ background: {theme._rgba(c, 0.20)}; border: 1px solid {theme._rgba(c, 0.55)}; "
+                f"border-radius: 12px; }}"))
         self.title.setText(struct_icons.label(key))
         self.sub.setText(subtitle)
         self._clear(self.body)

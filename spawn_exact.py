@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import threading
 
 MC_1_18 = 22
 _F = None
@@ -153,8 +154,14 @@ def _column(col, over):
     return None, top
 
 
+_KEY_LOCKS = {}
+_KEY_LOCKS_LOCK = threading.Lock()
+
+
 def spawn(seed, mc):
-    """(x, y, z) of the world spawn (1.18+), or None (older version / no terrain)"""
+    """(x, y, z) of the world spawn (1.18+), or None (older version / no terrain).
+    (19/11) One computation per world at a time: the map, the home banner and the Seed
+    Library ask together when the seed changes; the others wait for it, then read the cache."""
     seed, mc = int(seed), int(mc)
     seed = ((seed + (1 << 63)) % (1 << 64)) - (1 << 63)          # signed 64 bits
     if mc < MC_1_18:
@@ -162,6 +169,15 @@ def spawn(seed, mc):
     k = (seed, mc)
     if k in _CACHE:
         return _CACHE[k]
+    with _KEY_LOCKS_LOCK:
+        lk = _KEY_LOCKS.setdefault(k, threading.Lock())
+    with lk:
+        if k in _CACHE:
+            return _CACHE[k]
+        return _spawn(seed, mc, k)
+
+
+def _spawn(seed, mc, k):
     import numpy as np
     import terrain
     sx, sz = find_spawn_position(seed, mc)

@@ -20,13 +20,14 @@ import threading
 
 from PySide6.QtCore import (QAbstractTableModel, QEvent, QModelIndex, QObject, QRect, QRectF, QSize, Qt,
                             QTime, Signal)
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence, QPainter,
+                           QPainterPath, QPen, QPixmap, QShortcut)
 from .widgets import AdaptiveButton, user_path, remember_path
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QTimeEdit, QFrame, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar,
                                QPushButton, QSpinBox, QSplitter, QStackedWidget, QTableView,
                                QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
-                               QApplication, QStyle, QStyledItemDelegate, QDialog)
+                               QApplication, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QDialog)
 
 import numpy as np
 
@@ -35,8 +36,8 @@ from .seed_rows import RowIndex, SeedRows
 from .condition_form import ConditionForm, TypePicker
 from .map_view import MapView
 from .search_runner import SearchRunner
-from .session_model import (CONTAINERS, SessionModel, area_text, display_name, new_condition,
-                            type_color, type_icon, icon_type)
+from .session_model import (CONTAINERS, SessionModel, area_text, detail_text, display_name,
+                            new_condition, type_color, type_icon, icon_type)
 from .widgets import Segmented, body
 from .world import random_seed
 
@@ -212,6 +213,102 @@ class _ProfileDelegate(QStyledItemDelegate):
         p.restore()
 
 
+def _row_card(p, card, sel, hov=False, tint=None, radius=11.0):
+    """(13/11) The card of a row (conditions, results): a soft panel, the accent's
+    outline when selected, an optional tint (the checked seed's ✓ / ✗)."""
+    path = QPainterPath()
+    path.addRoundedRect(card, radius, radius)
+    c = QColor(theme.BG3 if hov else theme.BG2)
+    c.setAlphaF(0.95 if hov else 0.62)
+    p.fillPath(path, c)
+    if tint is not None and tint.alpha() > 0:
+        p.fillPath(path, tint)
+    if sel:
+        c = QColor(theme.ACCENT)
+        c.setAlphaF(0.13)
+        p.fillPath(path, c)
+        p.setPen(QPen(QColor(theme.ACCENT), 1.2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+    return path
+
+
+class _CondCardDelegate(QStyledItemDelegate):
+    """(13/11) A condition = a card: its type's colour on the edge and behind its
+    icon, its area as a pill. Column 0 paints the whole row's card (the other
+    columns and the branches are painted over it)."""
+    def __init__(self, tree):
+        super().__init__(tree)
+        self.tree = tree
+
+    def sizeHint(self, opt, idx):
+        s = super().sizeHint(opt, idx)
+        if idx.column() == 0:                          # (15/11) measured in the font it is painted in:
+            t = str(idx.data() or "")                  # « ✓ #12 » no longer runs into the colour edge
+            s.setWidth(QFontMetrics(theme.num_font(8, QFont.Weight.Bold)).horizontalAdvance(t) + 20)
+            return s
+        if idx.column() == 2:
+            t = str(idx.data() or "")
+            s.setWidth(QFontMetrics(theme.num_font(8, QFont.Weight.DemiBold)).horizontalAdvance(t) + 30
+                       if t else 8)
+        return s
+
+    def paint(self, p, opt, idx):
+        col = idx.column()
+        sel = bool(opt.state & QStyle.StateFlag.State_Selected)
+        hov = bool(opt.state & QStyle.StateFlag.State_MouseOver)
+        tcol = idx.siblingAtColumn(0).data(Qt.ItemDataRole.UserRole + 1)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if col == 0:
+            card = QRectF(3, opt.rect.top() + 2, self.tree.viewport().width() - 6, opt.rect.height() - 4)
+            bg = idx.siblingAtColumn(1).data(Qt.ItemDataRole.BackgroundRole)
+            path = _row_card(p, card, sel, hov, bg.color() if bg is not None else None)
+            if tcol:                                   # the type's colour, on the card's edge
+                p.setClipPath(path)
+                p.fillRect(QRectF(card.left(), card.top(), 3.5, card.height()), QColor(tcol))
+                p.setClipping(False)
+            t = str(idx.data() or "")
+            if t:
+                fg = idx.data(Qt.ItemDataRole.ForegroundRole)
+                p.setFont(theme.num_font(8, QFont.Weight.Bold))
+                p.setPen(fg.color() if fg is not None else QColor(tcol or theme.TEXT3))
+                p.drawText(opt.rect.adjusted(8, 0, -3, 0),
+                           int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), t)
+            p.restore()
+            return
+        if col == 2:                                   # the area: a pill
+            t = str(idx.data() or "")
+            if t:
+                f = theme.num_font(8, QFont.Weight.DemiBold)
+                w = min(QFontMetrics(f).horizontalAdvance(t) + 18, opt.rect.width() - 6)
+                r = QRectF(opt.rect.right() - w - 9, opt.rect.center().y() - 10, w, 21)
+                c = QColor(theme.TEXT)
+                c.setAlphaF(0.07)
+                p.setBrush(c)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawRoundedRect(r, 10.5, 10.5)
+                p.setFont(f)
+                p.setPen(QColor(theme.TEXT2 if tcol else theme.TEXT3))
+                p.drawText(r, int(Qt.AlignmentFlag.AlignCenter),
+                           QFontMetrics(f).elidedText(t, Qt.TextElideMode.ElideRight, int(w - 10)))
+            p.restore()
+            return
+        o = QStyleOptionViewItem(opt)                  # the tree column: check box, icon, name
+        self.initStyleOption(o, idx)
+        o.backgroundBrush = QBrush()                   # (its tint is on the card)
+        st = o.widget.style() if o.widget else QApplication.style()
+        if tcol and not o.icon.isNull():               # a tile of the type's colour behind the icon
+            dr = st.subElementRect(QStyle.SubElement.SE_ItemViewItemDecoration, o, o.widget)
+            c = QColor(tcol)
+            c.setAlphaF(0.17)
+            p.setBrush(c)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(QRectF(dr).adjusted(-4.5, -4.5, 4.5, 4.5), 7, 7)
+        p.restore()
+        st.drawControl(QStyle.ControlElement.CE_ItemViewItem, o, p, o.widget)
+
+
 class ConditionTree(QTreeWidget):
     structureEdited = Signal(list)          # [(uid, parent_uid), …] in display order
     toggled = Signal(int, bool)
@@ -248,6 +345,10 @@ class ConditionTree(QTreeWidget):
         self.header().setMinimumSectionSize(8)
         self.setItemDelegateForColumn(3, _ProfileDelegate(self))
         self.setColumnHidden(3, True)
+        _cards = _CondCardDelegate(self)               # (13/11) the conditions are cards
+        for _c in (0, 1, 2):
+            self.setItemDelegateForColumn(_c, _cards)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self._by_num = {}
         self._profile = None
         self._filling = False
@@ -285,9 +386,9 @@ class ConditionTree(QTreeWidget):
                 it.setToolTip(0, f"Active condition #{num} — the number shown on the map")
             it.setFont(0, mono)
             it.setTextAlignment(0, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter))
-            it.setText(1, display_name(c))
+            it.setText(1, display_name(c, zone=False))       # (15/11) the area: column 2
             it.setIcon(1, type_icon(icon_type(c), 16) or _dot(type_color(icon_type(c))))
-            it.setText(2, area_text(c))
+            it.setText(2, detail_text(c))
             it.setToolTip(2, area_text(c))
             it.setForeground(2, QColor(theme.TEXT3))
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled
@@ -581,26 +682,47 @@ class ResultsModel(QAbstractTableModel):
         return gone
 
 
-class _SeedCellDelegate(QStyledItemDelegate):
-    """Seed on the first line, where the conditions are satisfied under it
-    (the old third column was cut off in a narrow panel)."""
+class _ResIndexDelegate(QStyledItemDelegate):
+    """(13/11) Column « # » of the results: paints the whole row's card, then the
+    result's number (the seed cell is painted over the card)."""
     def paint(self, p, opt, idx):
-        self.initStyleOption(opt, idx)
-        opt.text = ""
-        st = opt.widget.style() if opt.widget else QApplication.style()
-        st.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, p, opt.widget)
-        seed = idx.data(Qt.ItemDataRole.DisplayRole)
+        tb = self.parent()
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        card = QRectF(2, opt.rect.top() + 3, tb.viewport().width() - 4, opt.rect.height() - 6)
+        _row_card(p, card, bool(opt.state & QStyle.StateFlag.State_Selected), radius=12.0)
+        p.setFont(theme.num_font(7.5, QFont.Weight.DemiBold))
+        p.setPen(QColor(theme.TEXT3))
+        p.drawText(opt.rect.adjusted(4, 0, -2, 0),
+                   int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), str(idx.data() or ""))
+        p.restore()
+
+
+class _SeedCellDelegate(QStyledItemDelegate):
+    """The seed's sigil, the seed on the first line, where the conditions are
+    satisfied under it (a pill), the Minecraft check on the right."""
+    def paint(self, p, opt, idx):
+        from . import brand
+        seed = str(idx.data(Qt.ItemDataRole.DisplayRole) or "")
         loc = idx.data(Qt.ItemDataRole.UserRole)
-        r = QRect(opt.rect).adjusted(6, 3, -4, -3)
-        sel = bool(opt.state & QStyle.StateFlag.State_Selected)
+        r = QRect(opt.rect).adjusted(8, 7, -10, -7)
         # (22/10) a result that no longer passes the CURRENT conditions (they
         # changed after the search): greyed out, no red cross
         stale = isinstance(loc, str) and loc.startswith("✗")
         p.save()
-        p.setFont(theme.mono_font(9.5))
-        p.setPen(QColor(theme.TEXT3 if stale and not sel else theme.TEXT))
-        fm = p.fontMetrics()
-        top = QRect(r.left(), r.top(), r.width(), r.height() // 2 + 1)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        try:
+            sg = brand.sigil(int(seed), 28)
+            p.setOpacity(0.45 if stale else 1.0)
+            p.drawPixmap(QRectF(r.left(), r.center().y() - 13.5, 28, 28), sg, QRectF(sg.rect()))
+            p.setOpacity(1.0)
+        except ValueError:
+            pass
+        x0 = r.left() + 38
+        f = theme.num_font(9.75, QFont.Weight.DemiBold)
+        p.setFont(f)
+        p.setPen(QColor(theme.TEXT3 if stale else theme.TEXT))
+        top = QRect(x0, r.top() - 1, r.right() - x0, r.height() // 2 + 1)
         mcs = idx.data(Qt.ItemDataRole.UserRole + 1)
         if mcs:                                         # Minecraft check, right of the seed
             txt0 = mcs[0]
@@ -609,29 +731,38 @@ class _SeedCellDelegate(QStyledItemDelegate):
                 from .stronghold_page import cause_color
                 col = cause_color(mcs[2]) if len(mcs) > 2 and mcs[2] else theme.OK
             p.save()
-            p.setFont(theme.mono_font(8.5))
-            p.setPen(QColor(theme.TEXT if sel and not txt0.startswith(("✓", "✗")) else col))
+            p.setFont(theme.num_font(8.5, QFont.Weight.DemiBold))
+            p.setPen(QColor(col))
             w0 = p.fontMetrics().horizontalAdvance(txt0) + 4
             p.drawText(top, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), txt0)
             p.restore()
             top = top.adjusted(0, 0, -w0 - 4, 0)
         p.drawText(top, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-                   fm.elidedText(seed, Qt.TextElideMode.ElideMiddle, top.width()))
-        bot = QRect(r.left(), r.top() + r.height() // 2, r.width(), r.height() // 2)
-        p.setFont(theme.mono_font(8.5))
-        if isinstance(loc, tuple):
-            p.setPen(QColor(theme.TEXT if sel else theme.ACCENT))
-            txt = (f"X {loc[0]} Z {loc[1]} · {loc[2]}" if len(loc) > 2      # (24/10) + a label
-                   else f"X {loc[0]}   Z {loc[1]}")
-        elif stale:
-            p.setPen(QColor(theme.TEXT3))
-            n = loc[1:].strip()
-            txt = "no longer matches" + (f"  ·  fails {n}" if n else "")
-            txt = p.fontMetrics().elidedText(txt, Qt.TextElideMode.ElideRight, bot.width())
+                   QFontMetrics(f).elidedText(seed, Qt.TextElideMode.ElideMiddle, top.width()))
+        bot = QRect(x0, r.top() + r.height() // 2 + 1, r.right() - x0, r.height() // 2)
+        f2 = theme.num_font(8, QFont.Weight.DemiBold)
+        p.setFont(f2)
+        if isinstance(loc, tuple):                      # where: a pill of the accent
+            t = (f"X {loc[0]}   Z {loc[1]}   ·   {loc[2]}" if len(loc) > 2      # (24/10) + a label
+                 else f"X {loc[0]}   Z {loc[1]}")
+            t = QFontMetrics(f2).elidedText(t, Qt.TextElideMode.ElideRight, bot.width() - 16)
+            chip = QRectF(bot.left(), bot.center().y() - 8.5, QFontMetrics(f2).horizontalAdvance(t) + 16, 18)
+            c = QColor(theme.ACCENT)
+            c.setAlphaF(0.14)
+            p.setBrush(c)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(chip, 9, 9)
+            p.setPen(QColor(theme.ACCENT))
+            p.drawText(chip, int(Qt.AlignmentFlag.AlignCenter), t)
         else:
             p.setPen(QColor(theme.TEXT3))
-            txt = loc if isinstance(loc, str) else ""
-        p.drawText(bot, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), txt)
+            if stale:
+                n = loc[1:].strip()
+                txt = "no longer matches" + (f"  ·  fails {n}" if n else "")
+            else:
+                txt = loc if isinstance(loc, str) else ""
+            p.drawText(bot, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                       QFontMetrics(f2).elidedText(txt, Qt.TextElideMode.ElideRight, bot.width()))
         p.restore()
 
 
@@ -778,7 +909,8 @@ class SessionsPage(QWidget):
 
         # ── left: conditions / editor ──────────────────────────────────────
         left = QFrame(); left.setObjectName("SidePanel"); left.setMinimumWidth(330)
-        self.left_stack = QStackedWidget(left)
+        from .motion import FadeStack                 # (14/11) list ↔ type picker ↔ editor cross-fade
+        self.left_stack = FadeStack(left, slide=14, ms=200)
         ll = QVBoxLayout(left); ll.setContentsMargins(0, 0, 0, 0); ll.addWidget(self.left_stack)
         self.left_stack.addWidget(self._build_conditions())
         self.picker = TypePicker(); self.picker.chosen.connect(self._type_chosen)
@@ -804,7 +936,7 @@ class SessionsPage(QWidget):
         # ── right: results ─────────────────────────────────────────────────
         split.addWidget(self._build_results())
         split.setStretchFactor(0, 0); split.setStretchFactor(1, 1); split.setStretchFactor(2, 0)
-        split.setSizes([380, 800, 260])
+        split.setSizes([404, 1000, 318])
         self._split = split
         # the left panel grows to its content (condition editor, type picker):
         # nothing is cut, no horizontal scroll bar (27/09)
@@ -924,7 +1056,7 @@ class SessionsPage(QWidget):
         v.addLayout(top)
 
         bar = QHBoxLayout(); bar.setSpacing(2)
-        add = QPushButton("  Add"); icons.bind(add, "plus", 16, "#ffffff", "#ffffff")
+        add = QPushButton("  Add"); icons.bind(add, "plus", 16, "on_accent", "on_accent")
         add.setMinimumWidth(88)
         add.setProperty("kind", "primary"); add.setToolTip("Add a condition  (Ctrl+N)")
         add_menu = QMenu(add)
@@ -996,7 +1128,7 @@ class SessionsPage(QWidget):
         return w
 
     def _build_results(self):
-        right = QFrame(); right.setObjectName("SidePanel"); right.setMinimumWidth(230)
+        right = QFrame(); right.setObjectName("SidePanel"); right.setMinimumWidth(262)
         v = QVBoxLayout(right); v.setContentsMargins(14, 12, 12, 10); v.setSpacing(8)
         top = QHBoxLayout()
         t = QLabel("Results"); t.setObjectName("PanelTitle"); top.addWidget(t)
@@ -1036,16 +1168,21 @@ class SessionsPage(QWidget):
             _sig.connect(self._fit_index_col)
         self._fit_index_col()
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.setItemDelegateForColumn(0, _ResIndexDelegate(self.table))    # (13/11) cards
         self.table.setItemDelegateForColumn(1, _SeedCellDelegate(self.table))
+        self.table.horizontalHeader().hide()
         self.table.setColumnHidden(2, True)          # shown under the seed (two-line cell)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setShowGrid(False)
-        self.table.verticalHeader().setDefaultSectionSize(40)
+        self.table.verticalHeader().setDefaultSectionSize(56)
         self.table.selectionModel().currentRowChanged.connect(self._result_selected)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._results_menu)
         v.addWidget(self.table, 1)
+        from .widgets import EmptyHint                     # (20/11)
+        self._res_empty = EmptyHint(self.table, "sessions", "sessions", "No results yet",
+                                    "Start a search: the seeds that pass every condition show up here.")
         self.res_hint = body("", muted=True, small=True)
         self.res_hint.setVisible(False)
         v.addWidget(self.res_hint)
@@ -1059,8 +1196,8 @@ class SessionsPage(QWidget):
         def labeled(text, w, tip=None):
             c = QVBoxLayout(); c.setSpacing(2)
             lab = QLabel(text.upper()); lab.setObjectName("FieldLabel"); c.addWidget(lab); c.addWidget(w)
-            if tip:
-                w.setToolTip(tip); lab.setToolTip(tip)
+            if tip:                          # (19/11) on the control only
+                w.setToolTip(tip)
             row.addLayout(c)
 
         from .mode_picker import ModePicker
@@ -1068,7 +1205,7 @@ class SessionsPage(QWidget):
         # 48-bit family options (08/10), in the label row like Session / Saved
         mcol = QVBoxLayout(); mcol.setSpacing(2)
         mhead = QHBoxLayout(); mhead.setSpacing(4); mhead.setContentsMargins(0, 0, 0, 0)
-        mlab = QLabel("MODE"); mlab.setObjectName("FieldLabel"); mlab.setToolTip(MODE_TIPS)
+        mlab = QLabel("MODE"); mlab.setObjectName("FieldLabel")
         mhead.addWidget(mlab); mhead.addStretch(1)
         self.opt_hide = QPushButton("One per family"); self.opt_hide.setCheckable(True)
         self.opt_hide.setToolTip(
@@ -1119,8 +1256,7 @@ class SessionsPage(QWidget):
         shead = QHBoxLayout(); shead.setSpacing(6); shead.setContentsMargins(0, 0, 0, 0)
         slab = QLabel("START"); slab.setObjectName("FieldLabel")
         self._start_lab = slab
-        tip = "The first seed searched."
-        slab.setToolTip(tip); self.start_seed.setToolTip(tip)
+        # (19/11) no « The first seed searched. »: the field says it
         shead.addWidget(slab); shead.addStretch(1)
         self.start_src = Segmented(["Session", "Saved"], self._start_mode)
         for b in self.start_src.buttons.values():
@@ -1152,7 +1288,7 @@ class SessionsPage(QWidget):
         self.threads = QSpinBox(); self.threads.setRange(1, os.cpu_count() or 4)
         self.threads.setAlignment(Qt.AlignmentFlag.AlignCenter)   # (17/10) centred number
         self.threads.setValue(max(1, (os.cpu_count() or 4) // 2))
-        labeled("Threads", self.threads, "CPU threads. Can be changed while paused.")
+        labeled("Threads", self.threads, "Can be changed while paused.")
         # stop rule: never / N seeds searched / N results / a duration
         self.rule_kind = QComboBox()
         for text, key in (("Never", "never"), ("Seeds searched", "seeds"),
@@ -1186,8 +1322,14 @@ class SessionsPage(QWidget):
         labeled("Source", self.list_btn)
         row.addStretch(1)
         self.b_start = AdaptiveButton("  Start"); self.b_start.setProperty("kind", "primary")
-        icons.bind(self.b_start, "play", 16, "#ffffff", "#ffffff")
+        icons.bind(self.b_start, "play", 16, "on_accent", "on_accent")
         self.b_start.clicked.connect(self._start_or_resume)
+        from .widgets import accent_glow
+        self._start_glow = accent_glow(self.b_start, "sessions")           # (13/11)
+        from .motion import Shine                                          # (14/11)
+        self._start_shine = Shine(self.b_start, every=(8.0, 15.0))
+        from .motion import Spot                                           # (15/11) a light under the cursor
+        self._start_spot = Spot(self.b_start)
         self.b_pause = AdaptiveButton("  Pause"); icons.bind(self.b_pause, "pause", 16)
         self.b_pause.clicked.connect(self.runner.pause)
         self.b_stop = AdaptiveButton("  Stop"); icons.bind(self.b_stop, "stop", 16)
@@ -1198,6 +1340,9 @@ class SessionsPage(QWidget):
 
         prow = QHBoxLayout(); prow.setSpacing(12)
         self.prog = QProgressBar(); self.prog.setRange(0, 1000); self.prog.setTextVisible(False)
+        from .motion import Shine as _Shine          # (14/11) a light runs along it while a search runs
+        self._prog_shine = _Shine(self.prog, hover=False, radius=3, strength=0.55)
+        self.runner.stateChanged.connect(lambda st: self._prog_shine.loop(st == "running"))
         self.prog.setFixedHeight(6)
         prow.addWidget(self.prog, 1)
         self.stat = QLabel("Idle"); self.stat.setObjectName("Muted"); self.stat.setFont(theme.mono_font(9))
@@ -1513,6 +1658,7 @@ class SessionsPage(QWidget):
                 sub.setText(f"Editing {len(sel)} conditions · only the fields you change "
                             f"are applied to all of them")
                 sub.setStyleSheet(f"color: {theme.ACCENT};")
+                sub.setVisible(True)
         self.left_stack.setCurrentWidget(self.form)
         from PySide6.QtCore import QTimer as _QT
         _QT.singleShot(0, self._fit_left)
@@ -1955,6 +2101,13 @@ class SessionsPage(QWidget):
 
     def _pick(self, kind):
         self.form.pick_origin = (0, 0)
+        if kind == "visible":                    # (14/11) Cubiomes Viewer's « From visible »
+            m = self.map
+            x1, z1 = m.to_world(0, 0)
+            x2, z2 = m.to_world(m.width(), m.height())
+            self.form.apply_pick(dict(kind="rect", x1=int(round(x1)), z1=int(round(z1)),
+                                      x2=int(round(x2)), z2=int(round(z2))))
+            return
         origin = (0, 0) if kind == "circle" else None
         self.map.start_pick(kind, origin=origin)
         self.status.emit("Draw on the map (Esc to cancel). Areas are relative to the parent "
@@ -3489,11 +3642,11 @@ class SessionsPage(QWidget):
                "range)." if self.seed_list is not None else
                "\n\nUnavailable: a search is running — pause or stop it first." if running else "")
         code = MODES[self.mode.value()] if hasattr(self, "mode") else "inc"
-        tip = {"inc": "The first seed searched.",
+        tip = {"inc": "",
                "sisters": "The structure seed whose 65 536 sister seeds are searched (a full "
                           "seed works too: its lower 48 bits)."}.get(
             code, "The first structure seed (48-bit) searched.") + why
-        self.start_seed.setToolTip(tip)
+        self.start_seed.setToolTip(tip.strip())
         self._dice.setToolTip("Random start" + why)
         lab = getattr(self, "_start_lab", None)
         if lab is not None:

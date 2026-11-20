@@ -31,8 +31,8 @@ from PySide6.QtGui import (QColor, QFont, QIcon, QImage, QKeySequence, QPainter,
 from .widgets import user_path
 from PySide6.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
                                QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QToolButton,
-                               QVBoxLayout, QWidget)
+                               QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QStyledItemDelegate,
+                               QToolButton, QVBoxLayout, QWidget)
 
 import noise_palettes as npal
 
@@ -300,11 +300,65 @@ class GradientBar(QWidget):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+class _PaletteCard(QStyledItemDelegate):
+    """(15/11) one palette = a card: its name in its colour and its gradient, wide, under it;
+    the group titles stay small capitals"""
+
+    def sizeHint(self, opt, idx):
+        head = not (idx.flags() & Qt.ItemFlag.ItemIsSelectable)
+        return QSize(opt.rect.width(), 26 if head else 48)
+
+    def paint(self, p, opt, idx):
+        from PySide6.QtWidgets import QStyle
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        r = QRectF(opt.rect).adjusted(2, 2, -4, -2)
+        if not (idx.flags() & Qt.ItemFlag.ItemIsSelectable):            # a group title
+            f = theme.ui_font(7.2, QFont.Weight.Bold)
+            f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.1)
+            p.setFont(f)
+            p.setPen(QColor(theme.TEXT3))
+            p.drawText(r.adjusted(6, 0, 0, -3), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom,
+                       str(idx.data()))
+            p.restore()
+            return
+        sel = bool(opt.state & QStyle.StateFlag.State_Selected)
+        hov = bool(opt.state & QStyle.StateFlag.State_MouseOver)
+        a = QColor(theme.ACCENT)
+        if sel or hov:
+            bg = QColor(a); bg.setAlphaF(0.18 if sel else 0.07)
+            p.setBrush(bg)
+            line = QColor(a); line.setAlphaF(0.70 if sel else 0.0)
+            p.setPen(QPen(line, 1) if sel else Qt.PenStyle.NoPen)
+            p.drawRoundedRect(r, 10, 10)
+        fg = idx.data(Qt.ItemDataRole.ForegroundRole)
+        p.setPen(fg.color() if hasattr(fg, "color") else QColor(theme.TEXT))
+        p.setFont(theme.ui_font(9.2, QFont.Weight.DemiBold))
+        p.drawText(QRectF(r.left() + 10, r.top() + 4, r.width() - 20, 18),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, str(idx.data()))
+        ic = idx.data(Qt.ItemDataRole.DecorationRole)
+        if ic is not None:
+            pm = ic.pixmap(QSize(92, 28))
+            bar = QRectF(r.left() + 10, r.top() + 25, r.width() - 20, 12)
+            path = QPainterPath(); path.addRoundedRect(bar, 6, 6)
+            p.setClipPath(path)
+            p.drawPixmap(bar, pm, QRectF(pm.rect()))
+            p.setClipping(False)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            edge = QColor("#ffffff"); edge.setAlphaF(0.14)
+            p.setPen(QPen(edge, 1))
+            p.drawPath(path)
+        p.restore()
+
+
 class _StopRow(QWidget):
     def __init__(self, editor, i, stop):
         super().__init__()
         self.ed, self.i = editor, i
-        h = QHBoxLayout(self); h.setContentsMargins(0, 1, 0, 1); h.setSpacing(6)
+        self.setObjectName("StopRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        h = QHBoxLayout(self); h.setContentsMargins(6, 2, 4, 2); h.setSpacing(8)
         # value in the units shown everywhere: blocks for height, cubiomes-viewer
         # ×10 000 integers for the climate noises; from extreme to extreme
         self.k = 1.0 if editor.noise == "Height" else CV
@@ -316,8 +370,8 @@ class _StopRow(QWidget):
         self.val.setValue(value_of(editor.noise, stop["pos"]) * self.k); self.val.setFixedWidth(104)
         self.val.setKeyboardTracking(True)
         self.val.valueChanged.connect(self._val)
-        self.reg = QLabel(); self.reg.setObjectName("Muted"); self.reg.setMinimumWidth(92)
-        self.sw = QToolButton(); self.sw.setFixedSize(QSize(34, 22))
+        self.reg = QLabel(); self.reg.setObjectName("StopRegime"); self.reg.setMinimumWidth(92)
+        self.sw = QToolButton(); self.sw.setFixedSize(QSize(44, 24))
         self.sw.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sw.setToolTip("Choose the colour")
         self.sw.clicked.connect(lambda: editor.pick_color(self.i))
@@ -334,7 +388,8 @@ class _StopRow(QWidget):
     def refresh(self, stop):
         r, g, b = stop["rgb"]
         self.sw.setStyleSheet(f"QToolButton {{ background: rgb({r},{g},{b}); border: 1px solid "
-                              f"{theme.LINE2}; border-radius: 5px; }}")
+                              f"{theme._rgba('#ffffff', 0.22)}; border-radius: 12px; }}"
+                              f"QToolButton:hover {{ border: 2px solid {theme.TEXT}; }}")
         if not self.hex.hasFocus():
             self.hex.setText(f"#{r:02x}{g:02x}{b:02x}")
         v = value_of(self.ed.noise, stop["pos"])
@@ -424,6 +479,11 @@ class PaletteEditor(QDialog):
 
         right.addWidget(section_title("Stops"))
         self.rows_host = QWidget(); self.rows_lay = QVBoxLayout(self.rows_host)
+        self.rows_host.setStyleSheet(
+            f"QWidget#StopRow {{ border-radius: 9px; }}"
+            f"QWidget#StopRow:hover {{ background: {theme._rgba(theme.TEXT, 0.045)}; }}"
+            f"QLabel#StopRegime {{ color: {theme.TEXT2}; background: {theme._rgba(theme.TEXT, 0.06)};"
+            f" border-radius: 9px; padding: 2px 9px; font-size: 8pt; font-weight: 600; }}")
         self.rows_lay.setContentsMargins(0, 0, 6, 0); self.rows_lay.setSpacing(2)
         sc = QScrollArea(); sc.setWidgetResizable(True); sc.setWidget(self.rows_host)
         sc.setFrameShape(QFrame.Shape.NoFrame)
@@ -452,20 +512,34 @@ class PaletteEditor(QDialog):
         v = QVBoxLayout(box); v.setContentsMargins(12, 12, 12, 10); v.setSpacing(6)
         t = QLabel("Palettes"); t.setObjectName("PanelTitle"); v.addWidget(t)
         self.lst = QListWidget(); self.lst.setIconSize(QSize(46, 14))
+        self.lst.setObjectName("PalList")
+        self.lst.setItemDelegate(_PaletteCard(self.lst))          # (15/11) cards with a wide gradient
+        self.lst.setMouseTracking(True)
+        self.lst.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self.lst.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.lst.setStyleSheet("QListWidget#PalList { background: transparent; border: 0; outline: 0; }"
+                               "QListWidget#PalList::item { background: transparent; border: 0; }")
         self.lst.currentItemChanged.connect(self._list_changed)
         v.addWidget(self.lst, 1)
-        g1 = QHBoxLayout(); g2 = QHBoxLayout()
-        for lay, items in ((g1, (("New", self._new), ("Duplicate", self._duplicate),
-                                 ("Rename", self._rename))),
-                           (g2, (("Delete", self._delete), ("Import…", self._import),
-                                 ("Export…", self._export)))):
-            for text, fn in items:
-                b = QPushButton(text); b.setProperty("kind", "ghost"); b.clicked.connect(fn)
-                lay.addWidget(b)
-                setattr(self, "b_" + text.strip("…").lower(), b)
-            v.addLayout(lay)
-        v.addWidget(body("Built-in palettes are read-only: editing one creates your own copy. "
-                         "Your palettes are saved automatically.", muted=True, small=True))
+        # (15/11) one row of icons (the six words were cut); the names are in the tooltips
+        g1 = QHBoxLayout(); g1.setSpacing(4)
+        for text, ic, tip, fn in (("New", "plus", "New palette", self._new),
+                                  ("Duplicate", "copy", "Duplicate", self._duplicate),
+                                  ("Rename", "edit", "Rename", self._rename),
+                                  ("Import…", "folder", "Import…", self._import),
+                                  ("Export…", "save", "Export…", self._export),
+                                  ("Delete", "trash", "Delete", self._delete)):
+            b = QToolButton(); icons.bind(b, ic, 16); b.setToolTip(tip); b.clicked.connect(fn)
+            b.setFixedSize(34, 30)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            g1.addWidget(b)
+            setattr(self, "b_" + text.strip("…").lower(), b)
+        g1.addStretch(1)
+        v.addLayout(g1)
+        hint = body("Built-in palettes are read-only  ⓘ", muted=True, small=True)
+        hint.setToolTip("Built-in palettes are read-only: editing one creates your own copy.\n"
+                        "Your palettes are saved automatically.")
+        v.addWidget(hint)
         return box
 
     def _fill_list(self):
@@ -595,7 +669,8 @@ class PaletteEditor(QDialog):
 
     def _select_row(self, i):
         for k, r in getattr(self, "rows", {}).items():
-            r.setStyleSheet(f"background: {theme.BG3}; border-radius: 6px;" if k == i else "")
+            r.setStyleSheet(f"QWidget#StopRow {{ background: {theme._rgba(theme.ACCENT, 0.16)}; border-radius: 9px; }}"
+                            if k == i else "")
 
     def _add_in_gap(self):
         st = sorted(self.stops, key=lambda s: s["pos"])

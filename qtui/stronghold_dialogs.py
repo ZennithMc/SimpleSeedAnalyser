@@ -12,13 +12,13 @@ from __future__ import annotations
 import math
 import threading
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QDialog, QGridLayout, QHBoxLayout, QHeaderView,
-                               QLabel, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
-                               QWidget)
+                               QLabel, QPushButton, QTableWidget, QTableWidgetItem, QToolButton,
+                               QVBoxLayout, QWidget)
 
-from . import struct_icons, theme
+from . import icons, struct_icons, theme
 from .widgets import body, section_title
 
 EYE_COLORS = ("#5a5f76", "#7c4257", "#a13a4d", "#d83a3a", "#ee5e2b", "#ff8a1f", "#ffb020",
@@ -116,13 +116,138 @@ class _Num(QTableWidgetItem):
             return super().__lt__(other)
 
 
+class StrongholdMap(QWidget):
+    """(15/11) The 128 strongholds of the seed at their real places around (0, 0):
+    a dot each, coloured and sized by its eyes; the rings they belong to behind.
+    Hover: its numbers. Click: its row in the list. Double-click: centre the map on it."""
+    picked = Signal(int)                         # the stronghold's number (1 … 128)
+    opened = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rows = []                           # (number, x, z, eyes, max y)
+        self.cur = None
+        self._hot = None
+        self._span = 1.0
+        self.setMouseTracking(True)
+        self.setMinimumSize(300, 300)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_rows(self, rows):
+        self.rows = [r for r in rows if len(r) == 5]
+        self._span = max([math.hypot(r[1], r[2]) for r in self.rows] + [1.0]) * 1.06
+        self.update()
+
+    def set_current(self, number):
+        if number != self.cur:
+            self.cur = number
+            self.update()
+
+    def _pos(self, x, z):
+        w, h = self.width(), self.height()
+        k = (min(w, h) / 2.0 - 14) / self._span
+        return QPointF(w / 2.0 + x * k, h / 2.0 + z * k)
+
+    def _at(self, pos):
+        best, bd = None, 13.0 ** 2
+        for r in self.rows:
+            q = self._pos(r[1], r[2])
+            d = (q.x() - pos.x()) ** 2 + (q.y() - pos.y()) ** 2
+            if d < bd:
+                best, bd = r, d
+        return best
+
+    def mouseMoveEvent(self, e):
+        r = self._at(e.position())
+        n = r[0] if r else None
+        if n != self._hot:
+            self._hot = n
+            self.update()
+            if r:
+                from PySide6.QtWidgets import QToolTip
+                QToolTip.showText(e.globalPosition().toPoint(),
+                                  f"#{r[0]}   X {r[1]}  Z {r[2]}\n{r[3]} / 12 eyes"
+                                  + (f"   ·   top Y {r[4]}" if r[4] is not None else ""), self)
+
+    def leaveEvent(self, e):
+        super().leaveEvent(e)
+        self._hot = None
+        self.update()
+
+    def mousePressEvent(self, e):
+        r = self._at(e.position())
+        if r and e.button() == Qt.MouseButton.LeftButton:
+            self.picked.emit(r[0])
+
+    def mouseDoubleClickEvent(self, e):
+        r = self._at(e.position())
+        if r:
+            self.opened.emit(r[0])
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        frame = QRectF(0.5, 0.5, w - 1, h - 1)
+        p.setPen(QPen(QColor(theme.LINE2), 1))
+        p.setBrush(QColor(theme.field_bg()))
+        p.drawRoundedRect(frame, 14, 14)
+        c = QPointF(w / 2.0, h / 2.0)
+        k = (min(w, h) / 2.0 - 14) / self._span
+        a = QColor(theme.ACCENT)
+        # the rings of the game: 1280 … 2816 blocks, then every 3072
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for i in range(8):
+            mid = (1280 + 2816) / 2.0 + 3072 * i
+            if mid * k > min(w, h) / 2.0:
+                break
+            band = QColor(a)
+            band.setAlphaF(0.07)
+            p.setPen(QPen(band, max(1.0, 1536 * k)))
+            p.drawEllipse(c, mid * k, mid * k)
+        axis = QColor(theme.TEXT)
+        axis.setAlphaF(0.10)
+        p.setPen(QPen(axis, 1))
+        p.drawLine(QPointF(c.x() - 6, c.y()), QPointF(c.x() + 6, c.y()))
+        p.drawLine(QPointF(c.x(), c.y() - 6), QPointF(c.x(), c.y() + 6))
+        if not self.rows:
+            p.setPen(QColor(theme.TEXT3))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Computing…")
+            return
+        p.setPen(Qt.PenStyle.NoPen)
+        for r in sorted(self.rows, key=lambda q: q[3]):      # the richest on top
+            q = self._pos(r[1], r[2])
+            eyes = int(r[3])
+            col = QColor(eye_color(eyes))
+            rad = 2.2 + eyes * 0.42
+            if eyes >= 4:                                    # a halo for the good ones
+                halo = QColor(col)
+                halo.setAlphaF(0.22)
+                p.setBrush(halo)
+                p.drawEllipse(q, rad + 3.5, rad + 3.5)
+            col.setAlphaF(0.55 if eyes == 0 else 1.0)
+            p.setBrush(col)
+            p.drawEllipse(q, rad, rad)
+        for n, colr, wd in ((self._hot, QColor(theme.TEXT2), 1.3), (self.cur, QColor("#ffffff"), 1.8)):
+            r = next((q for q in self.rows if q[0] == n), None) if n else None
+            if r:
+                q = self._pos(r[1], r[2])
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(colr, wd))
+                p.drawEllipse(q, 9.5, 9.5)
+        p.setFont(theme.num_font(7.6))
+        p.setPen(QColor(theme.TEXT3))
+        p.drawText(QRectF(10, h - 22, w - 20, 16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   f"± {int(self._span):,} blocks".replace(",", " "))
+
+
 class StrongholdListDialog(QDialog):
     goto = Signal(int, int)
 
     def __init__(self, seed, mc, strongholds=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("All strongholds")
-        self.resize(700, 640)
+        self.resize(1120, 660)                # (15/11) the map of the strongholds beside the list
         self.seed, self.mc = seed, mc
         v = QVBoxLayout(self); v.setContentsMargins(18, 16, 18, 14); v.setSpacing(8)
         top = QHBoxLayout()
@@ -131,8 +256,11 @@ class StrongholdListDialog(QDialog):
         top.addStretch(1)
         self.summary = QLabel("Computing…"); self.summary.setObjectName("Muted"); top.addWidget(self.summary)
         v.addLayout(top)
-        v.addWidget(body("Click a column to sort. Double-click a row (or Go) to centre the map on it.",
-                         muted=True, small=True))
+        hint = body("Click a column to sort · double-click a stronghold (row or dot) to centre the map on it  ⓘ",
+                    muted=True, small=True)
+        hint.setToolTip("Each dot is a stronghold at its real place around (0, 0): the more eyes in its\n"
+                        "portal, the bigger and brighter. A click on a dot selects its row, and a row its dot.")
+        v.addWidget(hint)
         # « Broken »: is the end portal broken by a ruined portal? Checked by the real
         # Minecraft 1.16 generation (mc_checker) for the strongholds a ruined portal
         # can reach; the others are not broken (03/10, replaces « Distance »)
@@ -145,7 +273,7 @@ class StrongholdListDialog(QDialog):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setShowGrid(False)
-        self.table.verticalHeader().setDefaultSectionSize(26)
+        self.table.verticalHeader().setDefaultSectionSize(31)          # (15/11) the « Go » buttons fit
         hh = self.table.horizontalHeader()
         for i in range(len(cols)):
             hh.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
@@ -154,7 +282,14 @@ class StrongholdListDialog(QDialog):
             self.table.setColumnHidden(7, True)
             hh.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.table.cellDoubleClicked.connect(lambda r, _c: self._go(r))
-        v.addWidget(self.table, 1)
+        self.table.setMinimumWidth(560)
+        self.ring = StrongholdMap()
+        self.ring.picked.connect(self._pick_number)
+        self.ring.opened.connect(lambda n: (self._pick_number(n), self._go(self._row_of(n))))
+        self.table.itemSelectionChanged.connect(self._row_selected)
+        mid = QHBoxLayout(); mid.setSpacing(12)
+        mid.addWidget(self.ring, 5); mid.addWidget(self.table, 6)
+        v.addLayout(mid, 1)
         row = QHBoxLayout(); row.addStretch(1)
         ok = QPushButton("Close"); ok.clicked.connect(self.accept); row.addWidget(ok)
         v.addLayout(row)
@@ -184,6 +319,24 @@ class StrongholdListDialog(QDialog):
             rows = [("error", str(e))]
         self._loader.done.emit(rows, corr)
 
+    def _row_of(self, number):
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 0)
+            if it is not None and it.data(Qt.ItemDataRole.UserRole) == number:
+                return r
+        return -1
+
+    def _pick_number(self, number):
+        r = self._row_of(number)
+        if r >= 0:
+            self.table.selectRow(r)
+            self.table.scrollToItem(self.table.item(r, 0), QAbstractItemView.ScrollHint.PositionAtCenter)
+
+    def _row_selected(self):
+        r = self.table.currentRow()
+        it = self.table.item(r, 0) if r >= 0 else None
+        self.ring.set_current(it.data(Qt.ItemDataRole.UserRole) if it is not None else None)
+
     @staticmethod
     def _ring(i):
         # 3, 6, 10, 15, 21, 28, 36, 9 strongholds per ring (1.9+)
@@ -197,6 +350,7 @@ class StrongholdListDialog(QDialog):
     def _fill(self, rows, corr):
         if rows and rows[0][0] == "error":
             self.summary.setText("Error: " + rows[0][1]); return
+        self.ring.set_rows(rows)
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(rows))
         mono = theme.mono_font(9.5)
@@ -234,9 +388,14 @@ class StrongholdListDialog(QDialog):
                         it.setToolTip("A ruined portal can reach the portal: checking it with "
                                       "the real Minecraft generation…")
                 self.table.setItem(r, cidx, it)
-            go = QPushButton("Go"); go.setProperty("kind", "ghost")
+            go = QToolButton(); icons.bind(go, "target", 15)        # (15/11) a small icon, not a big « Go »
+            go.setToolTip("Centre the map on it")
+            go.setAutoRaise(True); go.setFixedSize(26, 24)
+            go.setCursor(Qt.CursorShape.PointingHandCursor)
             go.clicked.connect(lambda _=False, xx=x, zz=z: self.goto.emit(xx, zz))
-            self.table.setCellWidget(r, len(vals), go)
+            holder = QWidget(); hl = QHBoxLayout(holder); hl.setContentsMargins(0, 0, 6, 0)
+            hl.addStretch(1); hl.addWidget(go)
+            self.table.setCellWidget(r, len(vals), holder)
             self.table.item(r, 0).setData(Qt.ItemDataRole.UserRole + 1, (x, z))
         self.table.setSortingEnabled(True)
         # the last sort chosen (column + order) is kept between seeds (03/10)

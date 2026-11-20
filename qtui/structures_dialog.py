@@ -91,6 +91,7 @@ class StructuresDialog(QDialog):
         self.setWindowTitle("Structures")
         self.setMinimumSize(820, 560)
         v = QVBoxLayout(self); v.setSpacing(10)
+        _t = QLabel("Structures"); _t.setObjectName("PageTitle"); v.addWidget(_t)      # (20/11)
         v.addWidget(body(
             f"Structures seen in the world ({version_label}). Each one is tried once per region "
             "of chunks, in a chunk the structure seed alone picks: enter where it <b>starts</b> "

@@ -1320,7 +1320,7 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
 
     # ── Slime chunks ──────────────────────────────────────────────────
     if t == "slime":
-        min_count = params.get("count", 1)
+        min_count = _cond_min_count(cond)       # (19/11) the editor's « instances » (was params.count only)
         exclude = (min_count <= 0)
         seed = ctx.seed
         cx1 = x1 >> 4; cz1 = z1 >> 4
@@ -1353,7 +1353,7 @@ def _evaluate_condition(ctx: EvalContext, cond: dict, cond_idx: int,
 
     # ── Mineshaft ─────────────────────────────────────────────────────
     if t == "mineshaft":
-        min_count = params.get("count", 1)
+        min_count = _cond_min_count(cond)       # (19/11) the editor's « instances » (was params.count only)
         exclude = (min_count <= 0)
         try:
             positions = ctx.lib.find_mineshafts(x1, z1, x2, z2, max_count=64)

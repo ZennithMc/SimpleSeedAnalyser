@@ -486,19 +486,24 @@ class AdaptiveButton(_QPB):
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
     def setText(self, text):
+        old = getattr(self, "_full", "")
         self._full = text
         if not self._compact:
             super().setText(text)
-        self.setToolTip(text.strip() if self._compact else self.toolTip())
+        self.setToolTip(text.strip() if self._compact else
+                        ("" if self.toolTip().strip() in (text.strip(), (old or "").strip()) else self.toolTip()))
         self.updateGeometry()
 
     def text(self):
         return self._full
 
     def _full_width(self):
-        fm = self.fontMetrics()
+        f = self.font()
+        f.setBold(True)                               # (15/11) the themes' buttons are bold:
+        from PySide6.QtGui import QFontMetrics      # « Star » was cut at ~1180 px
+        fm = QFontMetrics(f)
         icon = self.iconSize().width() + 8 if not self.icon().isNull() else 0
-        return fm.horizontalAdvance(self._full) + icon + 34
+        return fm.horizontalAdvance(self._full) + icon + 40
 
     def sizeHint(self):
         s = super().sizeHint()
@@ -518,6 +523,8 @@ class AdaptiveButton(_QPB):
             _QPB.setText(self, "" if compact else self._full)
             if compact:
                 self.setToolTip(self._full.strip())
+            elif self.toolTip().strip() == self._full.strip():
+                self.setToolTip("")                  # (15/11) the text is back: no echo of it
 
 
 # ── RangeSlider (08/10): two handles, like cubiomes-viewer's height filter ───
@@ -741,3 +748,151 @@ class CoordEdit(_QLineEdit):
         super().focusInEvent(e)
         from PySide6.QtCore import QTimer
         QTimer.singleShot(0, self.selectAll)     # typing replaces the value
+
+
+class _Glow(QObject):
+    def __init__(self, button, ws_key):
+        super().__init__(button)
+        from PySide6.QtWidgets import QGraphicsDropShadowEffect
+        self.b, self.key = button, ws_key
+        self.fx = QGraphicsDropShadowEffect(button)
+        self.fx.setBlurRadius(34)
+        self.fx.setOffset(0, 3)
+        button.setGraphicsEffect(self.fx)
+        button.installEventFilter(self)
+        from . import theme
+        theme.signals.changed.connect(self.sync)
+        self.sync()
+
+    def sync(self):
+        from PySide6.QtGui import QColor
+        from . import theme
+        c = QColor(theme.ws_color(self.key) if self.key else theme.ACCENT)
+        c.setAlphaF(0.48)
+        self.fx.setColor(c)
+        self.fx.setEnabled(self.b.isEnabled())
+
+    def eventFilter(self, o, e):
+        if e.type() == e.Type.EnabledChange:
+            self.fx.setEnabled(self.b.isEnabled())
+        return False
+
+
+def accent_glow(button, ws_key=None):
+    """(13/11) A soft halo of the accent under a primary button (Start…); off
+    while the button is disabled. ws_key = its workspace (theme.ws_color)."""
+    return _Glow(button, ws_key)
+
+
+def set_available(w, ok, why="", tip=None):
+    """(19/11) an option that does nothing in the current setting: greyed AND unticked
+    (a greyed tick looked like it was working), why in its tooltip. The user's own
+    tick comes back as soon as the option works again; ui_state saves that tick.
+    tip: the tooltip when available (default: the one it had)."""
+    if w.property("_tip0") is None:
+        w.setProperty("_tip0", w.toolTip() or "")
+    base = tip if tip is not None else w.property("_tip0")
+    if not ok:
+        if w.isEnabled():
+            w.setProperty("_want", bool(w.isChecked()))
+            w.blockSignals(True); w.setChecked(False); w.blockSignals(False)
+            w.setEnabled(False)
+        w.setToolTip((base + "\n\n" if base else "") + ("Not available here: " + why if why else
+                                                         "Not available here."))
+        return
+    if not w.isEnabled():
+        w.setEnabled(True)
+        want = w.property("_want")
+        if want is not None:
+            w.blockSignals(True); w.setChecked(bool(want)); w.blockSignals(False)
+        w.setProperty("_want", None)
+    w.setToolTip(base)
+
+
+class EmptyHint(QWidget):
+    """(20/11) What an empty list says: an icon in its workspace's colour, a title and one
+    line, in the middle of the list's viewport while its model has no row (fades in / out).
+    Drawn over the view, never in the way of the mouse."""
+
+    def __init__(self, view, icon: str, ws_key: str, title: str, text: str):
+        super().__init__(view.viewport())
+        self.view, self.icon, self.ws_key, self.title, self.text = view, icon, ws_key, title, text
+        self._a = 0.0
+        self._an = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        view.viewport().installEventFilter(self)
+        m = view.model()
+        for sig in (m.rowsInserted, m.rowsRemoved, m.modelReset, m.layoutChanged):
+            sig.connect(self._sync)
+        self.setGeometry(view.viewport().rect())
+        self._sync(animate=False)
+
+    def eventFilter(self, o, e):
+        if e.type() == QEvent.Type.Resize:
+            self.setGeometry(self.view.viewport().rect())
+        return False
+
+    def _sync(self, *_a, animate=True):
+        try:
+            empty = self.view.model().rowCount() == 0
+        except RuntimeError:
+            return
+        to = 1.0 if empty else 0.0
+        if empty:
+            self.show()
+            self.raise_()
+        from . import motion
+        if self._an is not None:
+            try:
+                self._an.stop()
+            except RuntimeError:
+                pass
+            self._an = None
+        if not animate or not motion.enabled() or not self.isVisible():
+            self._a = to
+            self.setVisible(empty)
+            self.update()
+            return
+        a0 = self._a
+
+        def step(t):
+            self._a = a0 + (to - a0) * t
+            self.update()
+
+        def done():
+            self._an = None
+            if self._a < 0.01:
+                self.hide()
+        self._an = motion.run(self, 260 if empty else 140, step, done)
+
+    def paintEvent(self, e):
+        if self._a <= 0.01:
+            return
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QColor, QFont, QPainter
+        from . import brand, theme
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.setOpacity(self._a)
+        W, H = self.width(), self.height()
+        if H < 120:
+            return
+        s = 52
+        y = H * 0.40 - s / 2 + 6 * (1 - self._a)
+        pm = brand.icon_tile(self.icon, theme.ws_color(self.ws_key), s, 26)
+        p.drawPixmap(QRectF((W - s) / 2, y, s, s), pm, QRectF(pm.rect()))
+        f = QFont(self.font())
+        f.setPointSizeF(f.pointSizeF() * 1.1)
+        f.setWeight(QFont.Weight.DemiBold)
+        p.setFont(f)
+        p.setPen(QColor(theme.TEXT))
+        r = QRectF(12, y + s + 12, W - 24, 22)
+        p.drawText(r, int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop), self.title)
+        f2 = QFont(self.font())
+        p.setFont(f2)
+        p.setPen(QColor(theme.TEXT3))
+        r2 = QRectF(18, r.bottom() + 4, W - 36, H - r.bottom() - 8)
+        p.drawText(r2, int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap),
+                   self.text)

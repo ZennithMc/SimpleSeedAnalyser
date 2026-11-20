@@ -43,7 +43,7 @@ from .draw_library import (DrawLibraryDialog, autosave_path, new_entry_path, rea
                            write_json)
 from .draw_model import CELL_SIZES, MAX_SIDE, WEIGHTS, DrawModel, now_iso
 from .sessions_page import SessionsPage, fmt_int, fmt_rate, fmt_time
-from .widgets import EasySlider, Segmented, body, section_title
+from .widgets import EasySlider, Segmented, body, section_title, set_available
 from .world import random_seed
 
 TOOLS = [  # key, icon, label, shortcut, tip
@@ -624,6 +624,10 @@ class DrawPage(QWidget):
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._menu)
         v.addWidget(self.list, 1)
+        from .widgets import EmptyHint                     # (20/11)
+        self._res_empty = EmptyHint(self.list, "brush", "drawing", "No results yet",
+                                    "Start a search: the seeds that look most like your drawing show up "
+                                    "here, best first.")
         self.stale_lbl = body("", small=True); self.stale_lbl.setStyleSheet(f"color: {theme.WARN}; font-size: 8pt;")
         self.stale_lbl.hide(); v.addWidget(self.stale_lbl)
         return right
@@ -637,8 +641,8 @@ class DrawPage(QWidget):
         def labeled(text, w, tip=None):
             c = QVBoxLayout(); c.setSpacing(2)
             lab = QLabel(text.upper()); lab.setObjectName("FieldLabel"); c.addWidget(lab); c.addWidget(w)
-            if tip:
-                w.setToolTip(tip); lab.setToolTip(tip)
+            if tip:                          # (19/11) on the control only
+                w.setToolTip(tip)
             row.addLayout(c)
 
         self.min_score = QSpinBox(); self.min_score.setRange(1, 100); self.min_score.setValue(75)
@@ -665,7 +669,7 @@ class DrawPage(QWidget):
         dice.clicked.connect(lambda: (self.start_seed.setText(str(random_seed())),
                                       self.start_src.edited(self.start_seed.text())))
         self.start_src.bind_dice(dice)
-        row.addLayout(self.start_src.layout(sw, "First seed of the search."))
+        row.addLayout(self.start_src.layout(sw))
         # (19/10) search a seed list instead of a range (as on the Sessions page)
         self.list_btn = QPushButton("Seed list…")
         self.list_btn.setToolTip("Search the seeds of a list (.txt / .seeds / .csv) instead of a range.")
@@ -693,7 +697,7 @@ class DrawPage(QWidget):
                                   "(Resume continues exactly where it stopped).")
         row.addStretch(1)
         self.b_start = AdaptiveButton("  Start"); self.b_start.setProperty("kind", "primary")
-        icons.bind(self.b_start, "play", 16, "#ffffff", "#ffffff"); self.b_start.clicked.connect(self._start_clicked)
+        icons.bind(self.b_start, "play", 16, "on_accent", "on_accent"); self.b_start.clicked.connect(self._start_clicked)
         self.b_pause = AdaptiveButton("  Pause"); icons.bind(self.b_pause, "pause", 16)
         self.b_pause.clicked.connect(self.pause)
         self.b_stop = AdaptiveButton("  Stop"); icons.bind(self.b_stop, "stop", 16)
@@ -731,7 +735,7 @@ class DrawPage(QWidget):
         b = self.tool_btns.get(key)
         if b is not None:
             b.setChecked(True)
-        self.filled.setEnabled(key in ("rect", "circle"))
+        set_available(self.filled, key in ("rect", "circle"), "only for rectangles and circles.")
         self.map.setFocus()
 
     def _brush_from_map(self, r):
@@ -1403,7 +1407,7 @@ class DrawPage(QWidget):
         _xd(self.b_start, (not running) and _modern,
             "" if _modern else f"Draw needs Java 1.18 or newer ({self.world.version_name} selected).")
         self.b_start.setText("  Resume" if can_resume else "  Start")
-        icons.bind(self.b_start, "play", 16, "#ffffff", "#ffffff")
+        icons.bind(self.b_start, "play", 16, "on_accent", "on_accent")
         self.b_pause.setEnabled(st == "running")
         self.b_stop.setEnabled(running or st == "paused")
         for w in (self.threads, self.rule_kind, self.rule_stack):

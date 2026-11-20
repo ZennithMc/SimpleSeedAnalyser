@@ -33,7 +33,7 @@ from .map_view import MapView
 from .search_runner import SearchRunner
 from .sessions_page import SessionsPage, fmt_int, fmt_rate, fmt_time
 from .stronghold_dialogs import eye_color
-from .widgets import Segmented, body, section_title
+from .widgets import Segmented, body, section_title, set_available
 from .world import random_seed
 
 MODES = ("Eyes", "Top Y", "Broken portal")
@@ -101,6 +101,41 @@ def gpu_family(mc: int) -> bool:
         return False
 
 
+def gpu_use(mode, mc, scan, seed_list, min_eyes):
+    """(19/11) (does the GPU take part in this search, why not) — as the engine
+    (stronghold_eyes.search_end_portal_seeds) decides; the box is greyed otherwise"""
+    if mode != "Eyes":
+        return False, ("Top Y has its own GPU option (1.16 families)." if mode == "Top Y"
+                       else "broken portals are searched on the CPU.")
+    if not gpu_ready():
+        return False, "no usable CUDA GPU (see the GPU chip in the top bar)."
+    if scan:
+        return False, ("the first ring / all 128 strongholds are checked on the CPU: the time goes "
+                       "into the exact check of each stronghold's rooms, which the GPU cannot do.")
+    try:
+        import gaider_cuda as gc
+    except Exception:                                    # noqa: BLE001
+        return False, "the GPU library cannot be loaded."
+    if seed_list is not None:
+        if min_eyes < 12:
+            return False, ("with a seed list the GPU only counts 12-eye portals; below 12 every "
+                           "stronghold is checked exactly on the CPU.")
+        if not getattr(gc, "has_eyes_arr", lambda: False)():
+            return False, "this GPU library cannot count the eyes of a seed list (rebuild it)."
+        return True, ""
+    if mc <= 21:
+        if not getattr(gc, "has_lcg", lambda: False)():
+            return False, "the GPU kernel for 1.13 – 1.17 is not in this build."
+        return True, ""
+    try:
+        import gaider_layouts as gl
+        if not gl.is_available():
+            return False, "the stronghold layouts library is not available (rebuild it)."
+    except Exception:                                    # noqa: BLE001
+        return False, "the stronghold layouts library is not available."
+    return True, ""
+
+
 def support(mode: str, mc: int, all128: bool, gpu: bool, min_eyes: int = 12, fast: bool = False):
     """(runs, [notes]) for this combination — derived from the backends."""
     notes = []
@@ -127,8 +162,9 @@ def support(mode: str, mc: int, all128: bool, gpu: bool, min_eyes: int = 12, fas
             notes.append("1.19.0 – 1.19.2 (for 1.19.3 / 1.19.4 choose “Java 1.19”).")
         if gpu and all128 and not pre118:
             notes.append("GPU: the all-128 scan runs on the CPU in 1.18+.")
-        elif gpu and all128:
-            notes.append("GPU computes the 128 positions; eyes are checked on the CPU.")
+        elif gpu and all128:                     # (19/11) biome_gpu was retired (26/09)
+            notes.append("GPU: the all-128 scan runs on the CPU — what takes the time is the "
+                         "exact check of each stronghold's rooms, which the GPU cannot do.")
         elif gpu and gpu_family(mc):
             notes.append("GPU scans 48-bit families: Start is a 48-bit value and each "
                          "family is its 65 536 seeds.")
@@ -740,8 +776,8 @@ class StrongholdPage(QWidget):
         def labeled(text, w, tip=None):
             c = QVBoxLayout(); c.setSpacing(2)
             lab = QLabel(text.upper()); lab.setObjectName("FieldLabel"); c.addWidget(lab); c.addWidget(w)
-            if tip:
-                w.setToolTip(tip); lab.setToolTip(tip)
+            if tip:                          # (19/11) on the control only
+                w.setToolTip(tip)
             row.addLayout(c)
 
         self.smode = Segmented(["Incremental", "48-bit family"], "Incremental")
@@ -779,7 +815,7 @@ class StrongholdPage(QWidget):
         self.threads = QSpinBox(); self.threads.setRange(1, max(1, min(61, os.cpu_count() or 4)))
         self.threads.setAlignment(Qt.AlignmentFlag.AlignCenter)   # (17/10) centred number
         self.threads.setValue(max(1, (os.cpu_count() or 4) - 1))
-        labeled("Processes", self.threads, "Worker processes (every one is used).")
+        labeled("Processes", self.threads)
         self.rule_kind = QComboBox()
         for text, key in (("Never", "never"), ("Seeds searched", "seeds"),
                           ("Results found", "results"), ("Time", "time")):
@@ -801,7 +837,7 @@ class StrongholdPage(QWidget):
         labeled("Source", self.list_btn)
         row.addStretch(1)
         self.b_start = AdaptiveButton("  Start"); self.b_start.setProperty("kind", "primary")
-        icons.bind(self.b_start, "play", 16, "#ffffff", "#ffffff"); self.b_start.clicked.connect(self._start)
+        icons.bind(self.b_start, "play", 16, "on_accent", "on_accent"); self.b_start.clicked.connect(self._start)
         self.b_stop = AdaptiveButton("  Stop"); icons.bind(self.b_stop, "stop", 16)
         self.b_stop.setProperty("kind", "danger"); self.b_stop.clicked.connect(self._stop)
         # Pause / Resume (03/10): Pause stops where the search is and keeps the
@@ -835,16 +871,16 @@ class StrongholdPage(QWidget):
     def _refresh_support(self, *_):
         mc = int(self.world.mc)
         gpu_ok = gpu_ready()
-        self.use_gpu.setEnabled(gpu_ok and self.mode == "Eyes")
-        if not gpu_ok:
-            self.use_gpu.setToolTip("No usable CUDA GPU (see the GPU chip in the top bar).")
+        _a128 = self.all128.scan() if (self.all128.isEnabled() and self.all128.isChecked()) else False
+        ok, why = gpu_use(self.mode, mc, _a128, self.seed_list, self.min_eyes.value())
+        set_available(self.use_gpu, ok, why)
         if self.mode == "Top Y":
             fam_ok = self._topy_family(mc, self.all128.isChecked(), self.seed_list,
                                        self.min_y.value())
             tg_ok, tg_why = topy_gpu_ready()
             self.topy_gpu.setVisible(fam_ok)
-            self.topy_gpu.setEnabled(fam_ok and tg_ok)
-            self.topy_gpu.setToolTip(self._topy_gpu_tip + ("" if tg_ok else "\n\nUnavailable: " + tg_why))
+            set_available(self.topy_gpu, fam_ok and tg_ok, tg_why if fam_ok else "",
+                          tip=self._topy_gpu_tip)
         n = self.min_eyes.value()
         p = p_eyes_at_least(n) if self.eyes_cmp.currentIndex() == 0 else \
             math.comb(12, n) * 0.1 ** n * 0.9 ** (12 - n)
@@ -859,17 +895,14 @@ class StrongholdPage(QWidget):
             import lake_portals as lp
             lakes_ok = mc in lp.LAKE_VERSIONS
             for cb in (self.src_lava, self.src_water):
-                cb.setEnabled(lakes_ok)
-                if not lakes_ok:
-                    cb.setToolTip("Lakes break end portals in 1.16 only (frames are protected "
-                                  "against them from 1.17 / 1.18).")
+                set_available(cb, lakes_ok, "lakes break end portals in 1.16 only (frames are "
+                                            "protected against them from 1.17 / 1.18).")
             for cb in (self.src_ruined, self.src_lava, self.src_water):
                 cb.restyle()                      # theme colours may have changed
             _src = self._broken_sources(mc)
             self.broken_pick.set_causes([c[3] for c in CAUSES if c[0] in _src])
             ok, why = self._auto_status(mc)
-            self.auto_check.setEnabled(ok)
-            self.auto_check.setToolTip(self._auto_tip + "\n\n" + why)
+            set_available(self.auto_check, ok, why, tip=self._auto_tip + ("\n\n" + why if why else ""))
             # the panel shows only what needs attention; the rest is in the tooltips
             if not ok:
                 warn = why
@@ -969,7 +1002,7 @@ class StrongholdPage(QWidget):
     def _pause_resume(self):
         if self.runner.state == "running":
             self._pausing = True
-            self.runner.stop()
+            self.runner.stop(wait=True)              # (15/11) a pause: the exact point reached
         elif self._paused is not None:
             self._start(resume=True)
 

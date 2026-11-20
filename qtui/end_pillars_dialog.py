@@ -11,13 +11,13 @@ from __future__ import annotations
 import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QRadialGradient
 from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QGridLayout, QHBoxLayout,
                                QLabel, QPushButton, QVBoxLayout, QWidget)
 
 import end_pillars as ep
 
-from . import theme
+from . import motion, theme
 from .widgets import Segmented, body, section_title
 
 DIRS = ["east", "east-south-east", "south-south-east", "south-south-west", "west-south-west",
@@ -88,14 +88,29 @@ class PillarRing(QWidget):
         c, r = self._geom()
         # the island and the ring
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(theme.BG2))
+        # (20/11) the island: End stone, lit from the middle, a soft rim of the void around it
+        halo = QRadialGradient(c, r + 46)
+        glow = QColor("#8a5cf6")
+        glow.setAlphaF(0.16 if not theme.IS_LIGHT else 0.10)
+        halo.setColorAt(0.80, glow)
+        glow.setAlphaF(0.0)
+        halo.setColorAt(1.0, glow)
+        p.setBrush(halo)
+        p.drawEllipse(c, r + 46, r + 46)
+        stone = QRadialGradient(c, r + 24)
+        stone.setColorAt(0.0, motion.mix(theme.BG2, "#dcd59b", 0.16))
+        stone.setColorAt(0.75, motion.mix(theme.BG2, "#dcd59b", 0.07))
+        stone.setColorAt(1.0, QColor(theme.BG2))
+        p.setBrush(stone)
+        p.setPen(QPen(motion.mix(theme.BG2, "#dcd59b", 0.22), 1))
         p.drawEllipse(c, r + 24, r + 24)
+        p.setPen(Qt.PenStyle.NoPen)
         p.setPen(QPen(QColor(theme.LINE), 1, Qt.PenStyle.DashLine))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(c, r, r)
         # the exit portal (fountain)
-        p.setPen(QPen(QColor(theme.TEXT3), 1))
-        p.setBrush(QColor("#2a2a2a"))
+        p.setPen(QPen(QColor("#6b5a8e"), 1.2))          # bedrock rim, the void inside
+        p.setBrush(QColor("#0d0a14"))
         p.drawEllipse(c, r * 0.09, r * 0.09)
         # compass
         f = QFont(self.font()); f.setPointSizeF(8.5); f.setBold(True); p.setFont(f)
@@ -145,6 +160,7 @@ class EndPillarsDialog(QDialog):
         self.setMinimumSize(760, 600)
         pillars = dict(pillars or {})
         v = QVBoxLayout(self); v.setSpacing(10)
+        _t = QLabel("End pillars"); _t.setObjectName("PageTitle"); v.addWidget(_t)     # (20/11)
         v.addWidget(body(
             "Enter the 10 obsidian pillars around the End's fountain, seen from above with north "
             "up (pillar 1 is due east, then they go clockwise). For each one give its height "

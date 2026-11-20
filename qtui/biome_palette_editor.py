@@ -54,8 +54,10 @@ class _Row(QWidget):
     def __init__(self, ed, bid, name):
         super().__init__()
         self.ed, self.bid, self.name = ed, bid, name
-        h = QHBoxLayout(self); h.setContentsMargins(4, 1, 4, 1); h.setSpacing(8)
-        self.sw = QPushButton(); self.sw.setFixedSize(30, 20)
+        self.setObjectName("BioRow")                 # (15/11) a soft row under the mouse
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        h = QHBoxLayout(self); h.setContentsMargins(4, 2, 2, 2); h.setSpacing(7)
+        self.sw = QPushButton(); self.sw.setFixedSize(30, 22)
         self.sw.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sw.setToolTip("Change the colour")
         self.sw.clicked.connect(lambda: ed.edit_color(bid))
@@ -74,8 +76,8 @@ class _Row(QWidget):
 
     def refresh(self, rgb):
         c = QColor(*rgb)
-        self.sw.setStyleSheet(f"QPushButton {{ background: {c.name()}; border: 1px solid {theme.LINE2};"
-                              f" border-radius: 5px; padding: 0; min-height: 0; }}"
+        self.sw.setStyleSheet(f"QPushButton {{ background: {c.name()}; border: 1px solid "
+                              f"{theme._rgba('#ffffff', 0.20)}; border-radius: 11px; padding: 0; min-height: 0; }}"
                               f"QPushButton:hover {{ border: 2px solid {theme.TEXT}; }}")
         self.hex.setText(c.name())
 
@@ -96,14 +98,19 @@ class BiomePaletteEditor(QDialog):
         self.chosen = None                  # the palette kept at Close
 
         root = QHBoxLayout(self); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
+        self.setStyleSheet(f"QWidget#BioRow {{ border-radius: 9px; }}"
+                           f"QWidget#BioRow:hover {{ background: {theme._rgba(theme.TEXT, 0.05)}; }}")
         # ── left: palettes ──────────────────────────────────────────────────
         side = QFrame(); side.setObjectName("SidePanel"); side.setFixedWidth(250)
         sv = QVBoxLayout(side); sv.setContentsMargins(14, 16, 12, 12); sv.setSpacing(8)
         t = QLabel("Biome colours"); t.setObjectName("PageTitle"); sv.addWidget(t)
         sv.addWidget(section_title("Palettes"))
         self.list = QListWidget(); self.list.setIconSize(QSize(40, 14))
-        self.list.setStyleSheet("QListWidget { background: transparent; border: 0; }"
-                                "QListWidget::item { padding: 6px 4px; border-radius: 6px; }")
+        self.list.setStyleSheet("QListWidget { background: transparent; border: 0; outline: 0; }"
+                                "QListWidget::item { background: transparent; border: 0; }")
+        from .palette_editor import _PaletteCard        # (15/11) the same cards as the noise palettes
+        self.list.setItemDelegate(_PaletteCard(self.list))
+        self.list.setMouseTracking(True)
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list.currentItemChanged.connect(lambda *_: self._list_changed())
         sv.addWidget(self.list, 1)

@@ -9,7 +9,10 @@ Saved at close in <data dir>/ui_state.json, restored at the next launch:
   * the Layers panel: every landmark / structure ticked, grid, noise overlay
     (palette, opacity, caves, octaves, arrows), biome colours, icon size;
   * the Stronghold page: every setting, its seed list, its results and a
-    paused search (Resume continues it).
+    paused search (Resume continues it);
+  * (15/11) the Loot page: the structure, its chests, what is wanted, Find / Most /
+    Layout, the area, the run bar (mode, processes, stop rule) and the last results.
+SSA always opens on Home (15/11): every page is as it was left, one click away.
 The Sessions page (autosave.session) and the Draw page keep their own autosave.
 Everything is best effort: a missing / older / broken file only means defaults.
 """
@@ -45,7 +48,9 @@ def grab(obj, names=None, skip=(), texts=()):
             if isinstance(w, Segmented):
                 out[name] = ["seg", w.value()]
             elif isinstance(w, QCheckBox) or (isinstance(w, QPushButton) and w.isCheckable()):
-                out[name] = ["chk", bool(w.isChecked())]
+                want = w.property("_want")       # (19/11) greyed by set_available: the user's tick
+                out[name] = ["chk", bool(want) if (want is not None and not w.isEnabled())
+                             else bool(w.isChecked())]
             elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
                 out[name] = ["num", w.value()]
             elif isinstance(w, QComboBox):
@@ -71,7 +76,9 @@ def put(obj, saved):
                     w.set_value(v)
                     w.changed.emit(v)
             elif kind == "chk" and hasattr(w, "setChecked"):
-                if w.isChecked() != bool(v):
+                if not w.isEnabled() and w.property("_want") is not None:
+                    w.setProperty("_want", bool(v))  # greyed now: ticked again when it works
+                elif w.isChecked() != bool(v):
                     w.setChecked(bool(v))
             elif kind == "num" and isinstance(w, (QSpinBox, QDoubleSpinBox)):
                 w.setValue(v)
@@ -259,6 +266,10 @@ def save(win, heavy=True):
         st["layers"] = _grab_layers(win.layers)
     except Exception:                           # noqa: BLE001
         _log("save layers")
+    try:
+        st["loot"] = win.loot.ui_save()
+    except Exception:                           # noqa: BLE001
+        _log("save loot page")
     shd = None
     try:
         shd = _grab_stronghold(win.strongholds)
@@ -271,7 +282,12 @@ def save(win, heavy=True):
         _log("write ui_state.json")
     if heavy and shd is not None:
         try:
-            _write(_heavy_path(), {k: shd[k] for k in ("results", "paused") if k in shd})
+            h = {k: shd[k] for k in ("results", "paused") if k in shd}
+            try:
+                h["loot_results"] = win.loot.ui_results()
+            except Exception:                   # noqa: BLE001
+                _log("save loot results")
+            _write(_heavy_path(), h)
         except Exception:                       # noqa: BLE001
             _log("write ui_state_results.json")
 
@@ -292,6 +308,9 @@ def load():
         with open(_heavy_path(), encoding="utf-8") as f:
             h = json.load(f)
         if isinstance(h, dict):
+            lr = h.pop("loot_results", None)
+            if lr is not None:
+                st["loot_results"] = lr
             st.setdefault("stronghold", {}).update(h)
     except FileNotFoundError:
         pass
@@ -363,10 +382,12 @@ def restore(win, st=None):
             _put_stronghold(win.strongholds, st["stronghold"])
         except Exception:                       # noqa: BLE001
             _log("restore stronghold page")
-    try:
-        page = st.get("page")
-        if page in win._page_index:
-            win.show_page(page)
+    if st.get("loot"):
+        try:
+            win.loot.ui_restore(st["loot"], st.get("loot_results"))
+        except Exception:                       # noqa: BLE001
+            _log("restore loot page")
+    try:                                        # (15/11) always on Home at launch
         win.link.repaint_all()
     except Exception:                           # noqa: BLE001
         _log("restore page")

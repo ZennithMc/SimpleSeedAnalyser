@@ -33,6 +33,13 @@ TOKEN_LABELS = [   # (key, label shown in the editor)
 ]
 
 BUILTIN = {
+    # (13/11) the 1.3 look's own theme: neutral charcoal, one colour per workspace
+    # (EXTRAS["Prism"]["ws"])
+    "Prism": dict(
+        base_top="#17181b", base_bottom="#0f1012", bg0="#0b0c0e", bg1="#1a1b1f",
+        bg2="#232429", bg3="#2d2f36", bg4="#3a3c45", line="#2a2c32", line2="#3b3e48",
+        text="#f4f4f5", text2="#b4b6be", text3="#7b7e89",
+        accent="#5b9dff", ok="#34d399", warn="#f5b83d", danger="#fb7185"),
     "Slate": dict(
         base_top="#171c26", base_bottom="#0f1218", bg0="#10141b", bg1="#1a1f2a",
         bg2="#212735", bg3="#283042", bg4="#313a4f", line="#252c3a", line2="#343d50",
@@ -239,7 +246,13 @@ BUILTIN.update({
 # per theme: description, backdrop (procedural, backdrops.py), second accent
 # (two-tone buttons) and panel opacity (the backdrop shows through a little)
 EXTRAS = {
-    "Slate": dict(desc="Default — cool slate gradient"),
+    # (14/11) SSA's own theme: two colours per workspace (gradients, lights), and
+    # "live": the window's background is painted and animated (motion.Backdrop)
+    "Prism": dict(desc="SSA's own look — a colour per workspace, alive", live=True, panel=0.62,
+                  ws=dict(home=["#5b9dff", "#b17cff"], map=["#34d399", "#22c1dc"],
+                          sessions=["#5b9dff", "#7c6cff"], loot=["#f5b83d", "#ff8a4c"],
+                          seedcrack=["#a78bfa", "#f472b6"], drawing=["#fb7185", "#fbbf5d"])),
+    "Slate": dict(desc="Cool slate gradient"),
     "Midnight": dict(desc="Deep night blue — editable"),
     "Daylight": dict(desc="Light — editable"),
     "Obsidian Gold": dict(desc="Black marble with gold veins", accent2="#f3d27a", panel=0.84,
@@ -359,7 +372,7 @@ ACCENT2 = ""
 PANEL = ""
 BACKDROP = None
 EDITABLE = ("Midnight", "Daylight")
-DEFAULT_THEME = "Slate"
+DEFAULT_THEME = "Prism"
 
 # live values (module globals read everywhere)
 THEME = DEFAULT_THEME
@@ -367,18 +380,24 @@ TOKENS: dict = dict(BUILTIN[DEFAULT_THEME])
 BASE_TOP = BASE_BOTTOM = BG0 = BG1 = BG2 = BG3 = BG4 = LINE = LINE2 = ""
 TEXT = TEXT2 = TEXT3 = ACCENT = ACCENT_H = ACCENT_P = ACCENT_SOFT = ACCENT_LINE = ""
 OK = WARN = DANGER = HOVER_LINE = OVERLAY = ""
+ON_ACCENT = "#ffffff"               # text / icons on an accent-filled button
+WORKSPACE = None                    # the page on screen (set_workspace)
 IS_LIGHT = False
 ELEVATED = True
 
 RADIUS = 6
 SP = 8
 
-UI_FAMILIES = ["Segoe UI Variable Text", "Segoe UI", "Inter", "Helvetica Neue", "Arial"]
+# (13/11) Inter is shipped (assets/fonts, SIL Open Font License): the same
+# typography on Windows and Linux; the system fonts are the fallback
+UI_FAMILIES = ["Inter", "Segoe UI Variable Text", "Segoe UI", "Helvetica Neue", "Arial"]
+DISPLAY_FAMILIES = ["Inter Display", "Inter", "Segoe UI Variable Display", "Segoe UI", "Arial"]
 MONO_FAMILIES = ["Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono"]
 
 
 class _Signals(QObject):
     changed = Signal()
+    accent = Signal()                # the workspace (so theme.ACCENT) changed
 
 
 signals = _Signals()
@@ -472,6 +491,78 @@ def set_theme(name: str, tokens: dict | None = None) -> None:
     ACCENT2 = ex.get("accent2") or ACCENT_H
     PANEL = _rgba(BG1, ex["panel"]) if ex.get("panel") and not tokens_overridden(tokens) else BG1
     BACKDROP = ex.get("backdrop")
+    global ON_ACCENT
+    ON_ACCENT = on_accent(ACCENT)
+    if WORKSPACE:
+        _ws_accent()
+
+
+def on_accent(a: str) -> str:
+    """Text colour on a button filled with the accent a"""
+    return "#14110a" if QColor(a).lightness() > 150 else "#ffffff"
+
+
+def accent2(a: str | None = None) -> str:
+    """Second colour of the accent gradient (the theme's own, else a lighter
+    accent). A workspace's own pair: ws_pair()."""
+    return EXTRAS.get(THEME, {}).get("accent2") or _mix(a or ACCENT, "#ffffff", 0.30)
+
+
+def is_live() -> bool:
+    """SSA's own theme: an animated, painted background (motion.Backdrop)"""
+    return bool(EXTRAS.get(THEME, {}).get("live"))
+
+
+def _mix(a: str, b: str, t: float) -> str:
+    a, b = QColor(a), QColor(b)
+    return QColor(round(a.red() + (b.red() - a.red()) * t), round(a.green() + (b.green() - a.green()) * t),
+                  round(a.blue() + (b.blue() - a.blue()) * t)).name()
+
+
+# ── one colour per workspace (13/11) ────────────────────────────────────────
+WS_KEYS = ("home", "map", "sessions", "loot", "seedcrack", "drawing")
+
+
+def ws_pair(key) -> tuple:
+    """(colour, second colour) of a workspace: the theme's own pair, else its accent"""
+    v = (EXTRAS.get(THEME, {}).get("ws") or {}).get(key)
+    if isinstance(v, (list, tuple)):
+        return v[0], v[1]
+    a = v or TOKENS.get("accent", ACCENT)
+    return a, accent2(a)
+
+
+def ws_color(key) -> str:
+    return ws_pair(key)[0]
+
+
+def _set_accent(a: str, a2: str | None = None) -> None:
+    global ACCENT, ACCENT_H, ACCENT_P, ACCENT_SOFT, ACCENT_LINE, ACCENT2, ON_ACCENT
+    ACCENT = a
+    ACCENT_H = _shade(a, 1.15)
+    ACCENT_P = _shade(a, 0.87)
+    ACCENT_SOFT = _rgba(a, 0.16 if not IS_LIGHT else 0.12)
+    ACCENT_LINE = _rgba(a, 0.45)
+    ACCENT2 = a2 or EXTRAS.get(THEME, {}).get("accent2") or ACCENT_H
+    ON_ACCENT = on_accent(a)
+
+
+def set_workspace(key) -> None:
+    """The page on screen. In a theme with one colour per workspace the accent
+    follows it: the stylesheet's rules are scoped by the pages' `ws` property,
+    and what is painted by hand reads theme.ACCENT (signals.accent → repaint)."""
+    global WORKSPACE
+    WORKSPACE = key
+    _ws_accent()
+    signals.accent.emit()
+
+
+def _ws_accent() -> None:
+    """theme.ACCENT* = the colours of the workspace on screen"""
+    if (EXTRAS.get(THEME, {}).get("ws") or {}).get(WORKSPACE):
+        _set_accent(*ws_pair(WORKSPACE))
+    else:
+        _set_accent(TOKENS.get("accent", ACCENT))
 
 
 def _lum(hex_: str) -> float:
@@ -518,6 +609,37 @@ def _pick(families):
     return families[-1]
 
 
+_FONTS_LOADED = False
+
+
+def load_fonts() -> None:
+    """Register the shipped fonts (assets/fonts) once, before the first font is asked for"""
+    global _FONTS_LOADED
+    if _FONTS_LOADED:
+        return
+    _FONTS_LOADED = True
+    d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "fonts")
+    try:
+        for fn in sorted(os.listdir(d)):
+            if fn.lower().endswith((".ttf", ".otf")):
+                QFontDatabase.addApplicationFont(os.path.join(d, fn))
+    except OSError:
+        pass
+
+
+def num_font(pt: float = 9.5, weight: QFont.Weight = QFont.Weight.Medium, display=False) -> QFont:
+    """The UI font with tabular figures and a slashed zero: seeds, coordinates, counts"""
+    f = QFont(_pick(DISPLAY_FAMILIES if display else UI_FAMILIES))
+    f.setPointSizeF(pt)
+    f.setWeight(weight)
+    try:
+        f.setFeature(QFont.Tag("tnum"), 1)
+        f.setFeature(QFont.Tag("zero"), 1)
+    except Exception:                    # Qt < 6.7: proportional figures
+        pass
+    return f
+
+
 def ui_font(pt: float = 9.5, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
     f = QFont(_pick(UI_FAMILIES))
     f.setPointSizeF(pt)
@@ -540,7 +662,8 @@ def qcolor(hex_: str) -> QColor:
 def _assets() -> dict:
     svg = {
         "check": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7" '
-                 'fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+                 f'fill="none" stroke="{ON_ACCENT}" stroke-width="2.2" stroke-linecap="round" '
+                 'stroke-linejoin="round"/></svg>',
         "down": f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4" fill="none" '
                 f'stroke="{TEXT2}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
         "up": f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4 10l4-4 4 4" fill="none" '
@@ -551,7 +674,7 @@ def _assets() -> dict:
     d = os.path.join(tempfile.gettempdir(), "ssa_qt_assets")
     os.makedirs(d, exist_ok=True)
     out = {}
-    tag = QColor(TEXT2).name()[1:]
+    tag = QColor(TEXT2).name()[1:] + QColor(ON_ACCENT).name()[1:]
     for name, s in svg.items():
         path = os.path.join(d, f"{name}_{tag}.svg")
         try:
@@ -589,6 +712,17 @@ def frame_style() -> str:
 
 
 def stylesheet() -> str:
+    """The application's stylesheet: the base rules, then the 1.3 look (13/11).
+    Built with the theme's own accent; the workspace colours are scoped rules."""
+    _set_accent(TOKENS.get("accent", ACCENT))
+    try:
+        return _base_stylesheet() + _look()
+    finally:
+        if WORKSPACE:
+            _ws_accent()
+
+
+def _base_stylesheet() -> str:
     mono = _pick(MONO_FAMILIES)
     A = _assets()
     root_bg = f"qlineargradient(x1:0, y1:0, x2:0.35, y2:1, stop:0 {BASE_TOP}, stop:1 {BASE_BOTTOM})"
@@ -631,7 +765,7 @@ QToolButton#NavButton {{ background: {pill}; }}
 QWidget {{ color: {TEXT}; background: transparent; selection-background-color: {ACCENT}; selection-color: white; }}
 QMainWindow, #Root {{ background: {root_bg}; {root_img} }}
 QDialog {{ background: {BG1}; }}
-QToolTip {{ background: {BG2}; color: {TEXT}; border: 1px solid {LINE2}; padding: 5px 8px; border-radius: 4px; }}
+QToolTip {{ background: {BG2}; color: {TEXT}; border: 1px solid {LINE2}; padding: 6px 10px; border-radius: 10px;{_tip_margin()} }}
 
 /* ---------- regions ---------- */
 #TopBar, #NavRail, #StatusBar {{ background: {chrome_bg}; border: 0; }}
@@ -799,6 +933,249 @@ QMenu::item:disabled {{ color: {TEXT3}; }}
 """
 
 
+# ── the 1.3 look (13/11) ─────────────────────────────────────────────────────
+# Appended to the base rules: larger radii, inset fields, gradient primary
+# buttons, the top tabs, cards. Everything comes from the theme's tokens, so
+# every theme (built-in, user, picture) gets it.
+def _accent_rules(p: str, a: str, a2: str | None = None) -> str:
+    """The rules that carry the accent, for the widgets under the selector p
+    ("" = everywhere, 'QWidget[ws="loot"] ' = one workspace)."""
+    a2, on = a2 or accent2(a), on_accent(a)
+    grad = f"qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {a}, stop:1 {a2})"
+    soft = _rgba(a, 0.16 if not IS_LIGHT else 0.12)
+    return f"""
+{p}QPushButton[kind="primary"] {{ background: {grad}; border: 0; color: {on}; }}
+{p}QPushButton[kind="primary"]:hover {{ background: {a2}; }}
+{p}QPushButton[kind="primary"]:pressed {{ background: {_shade(a, 0.87)}; }}
+{p}QPushButton[kind="primary"]:disabled {{ background: {_rgba(a, 0.30)}; color: {_rgba(on, 0.70)}; border: 0; }}
+{p}QPushButton[seg]:checked {{ background: {soft}; color: {TEXT}; border-color: {_rgba(a, 0.55)}; }}
+{p}QPushButton[seg]:checked:disabled {{ background: {_rgba(a, 0.08)}; color: {TEXT3}; border: 1px dashed {_rgba(a, 0.45)}; }}
+{p}QLineEdit:focus, {p}QSpinBox:focus, {p}QDoubleSpinBox:focus, {p}QTimeEdit:focus, {p}QComboBox:focus {{ border-color: {a}; }}
+{p}QCheckBox::indicator:hover {{ border-color: {a}; }}
+{p}QCheckBox::indicator:checked {{ background: {a}; border-color: {a}; }}
+{p}QTreeView::indicator:checked, {p}QTreeWidget::indicator:checked {{ background: {a}; border-color: {a}; }}
+{p}QSlider::sub-page:horizontal {{ background: {a}; }}
+{p}QProgressBar::chunk {{ background: {grad}; }}
+{p}QToolButton:checked {{ background: {soft}; border-color: {_rgba(a, 0.45)}; }}
+{p}QToolButton#MapTool:checked {{ border: 1px solid {a}; }}
+{p}QPushButton#BiomeChip:checked {{ background: {soft}; border-color: {a}; }}
+{p}QTableView::item:selected, {p}QTreeView::item:selected, {p}QListView::item:selected, {p}QListWidget::item:selected {{ background: {soft}; }}
+{p}QMenu::item:selected {{ background: {soft}; }}
+{p}QAbstractItemView {{ selection-background-color: {soft}; selection-color: {TEXT}; }}
+{p}QLineEdit, {p}QAbstractSpinBox, {p}QTextEdit, {p}QPlainTextEdit {{ selection-background-color: {a}; selection-color: {on}; }}
+{p}QPushButton#TypeButton:hover {{ border-color: {_rgba(a, 0.45)}; }}
+{p}QFrame#AreaRow[active="true"] {{ background: {_rgba(a, 0.10)}; border: 1px solid {_rgba(a, 0.42)}; }}
+{p}QFrame#CrackSource:hover {{ background: {_rgba(a, 0.07)}; border-color: {_rgba(a, 0.45)}; }}
+{p}QFrame#CrackSource[used="true"] {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {_rgba(a, 0.16)}, stop:1 {_rgba(a, 0.04)}); border-color: {_rgba(a, 0.55)}; }}
+""" + (f"""
+{p}#SidePanel, {p}#Surface, {p}QFrame#RunBar {{ border: 1px solid qlineargradient(x1:0, y1:0, x2:1, y2:1,
+    stop:0 {_rgba(a, 0.55)}, stop:0.22 {LINE}, stop:0.78 {LINE}, stop:1 {_rgba(a2, 0.40)}); }}
+{p}QLabel#FieldLabel {{ color: {_mix(TEXT3, a, 0.42)}; }}
+{p}QLabel#SectionTitle {{ color: {_mix(TEXT2, a, 0.62)}; }}
+{p}QFrame#HLine {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {_rgba(a, 0.55)}, stop:0.5 {LINE}, stop:1 {_rgba(a2, 0.35)}); }}
+{p}QPushButton[kind="ghost"]:hover {{ border-color: {_rgba(a, 0.55)}; background: {_rgba(a, 0.10)}; }}
+{p}QToolButton:hover {{ background: {_rgba(a, 0.14)}; }}
+{p}QScrollBar::handle:vertical:hover, {p}QScrollBar::handle:horizontal:hover {{ background: {_rgba(a, 0.55)}; }}
+""" if is_live() else "")
+
+
+def _tip_margin() -> str:
+    """(19/11) the help bubbles' transparent margin (their shadow), where their window is
+    translucent (qtui/bubbles.py)"""
+    try:
+        from PySide6.QtGui import QGuiApplication
+        from .bubbles import MARGIN
+        if QGuiApplication.platformName() in ("windows", "xcb", "cocoa", "offscreen"):
+            return f" margin: {MARGIN}px;"
+    except Exception:
+        pass
+    return ""
+
+
+def field_bg() -> str:
+    """Background of the inset fields (inputs, segmented controls, capsules)"""
+    return _mix(BG1, "#000000", 0.26 if not IS_LIGHT else 0.035)
+
+
+def _look() -> str:
+    R, PR = RADIUS, 14
+    a = ACCENT
+    field = field_bg()
+    top = _mix(BG1, "#ffffff", 0.045)
+    panel = (f"qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {top}, stop:0.10 {BG1}, stop:1 {BG1})"
+             if PANEL == BG1 else PANEL)
+    if is_live() and PANEL != BG1:               # glass: the lights of the workspace show through
+        ga = float(EXTRAS.get(THEME, {}).get("panel", 0.62))
+        panel = (f"qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_rgba(top, min(1.0, ga + 0.14))}, "
+                 f"stop:0.12 {_rgba(BG1, ga + 0.06)}, stop:1 {_rgba(BG1, ga)})")
+    disp = _pick(DISPLAY_FAMILIES)
+    s = ""
+    if not BACKDROP and not is_live():      # a soft light of the accent, top left (live: motion.Backdrop)
+        s += (f"QMainWindow, #Root {{ background: qradialgradient(cx:0.08, cy:0, radius:1.05, fx:0.08, fy:0, "
+              f"stop:0 {_mix(BASE_TOP, a, 0.11)}, stop:0.28 {BASE_TOP}, stop:1 {BASE_BOTTOM}); }}\n")
+    s += f"""
+#SidePanel, #Surface, QFrame#RunBar {{ background: {panel}; border: 1px solid {LINE}; border-radius: {PR}px; }}
+QLabel#PanelTitle {{ font-family: "{disp}"; font-size: 13.5pt; font-weight: 700; }}
+QLabel#AppName {{ font-family: "{disp}"; font-size: 12pt; font-weight: 700; }}
+QLabel#PageTitle {{ font-family: "{disp}"; font-weight: 700; }}
+QLabel#FieldLabel {{ font-size: 7pt; font-weight: 700; letter-spacing: 1.3px; color: {TEXT3}; }}
+QLabel#SectionTitle {{ font-size: 7.5pt; letter-spacing: 1.3px; }}
+QFrame#AreaRow {{ border: 1px solid transparent; border-radius: 10px; }}
+QFrame#CrackSource {{ background: {_rgba(TEXT, 0.04)}; border: 1px solid {LINE}; border-radius: 12px; }}
+QFrame#AreaRow[active="false"]:hover {{ background: {_rgba(TEXT, 0.035)}; border: 1px solid {LINE}; }}
+QFrame#AreaRow[active="false"] QLabel {{ color: {TEXT3}; }}
+QToolTip {{ border-radius: 10px; padding: 5px 10px; background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_mix(BG3, '#ffffff', 0.04)}, stop:1 {BG3}); }}
+QMenu {{ border-radius: 12px; padding: 6px; }}
+QMenu::item {{ padding: 7px 20px; border-radius: 7px; }}
+
+QPushButton {{ border-radius: {R}px; padding: 6px 13px; }}
+QPushButton[kind="primary"] {{ font-weight: 700; padding: 7px 16px; }}
+QPushButton[kind="ghost"] {{ border: 1px solid {LINE2}; color: {TEXT}; }}
+QFrame#RunBar QPushButton {{ min-height: 24px; padding: 7px 18px; border-radius: {R + 3}px; font-weight: 600; }}
+QFrame#RunBar QPushButton[kind="primary"] {{ padding: 7px 28px; font-size: 10.5pt; font-weight: 700; }}
+QToolButton {{ border-radius: {R}px; }}
+QToolButton#PanelTool {{ padding: 5px; border-radius: 9px; }}
+
+QPushButton[seg="mid"], QPushButton[seg="first"], QPushButton[seg="last"], QPushButton[seg="only"] {{
+    border-radius: 0; padding: 4px 11px; background: {field}; border: 1px solid {LINE2}; color: {TEXT2}; }}
+QPushButton[seg="first"] {{ border-top-left-radius: {R}px; border-bottom-left-radius: {R}px; }}
+QPushButton[seg="last"] {{ border-top-right-radius: {R}px; border-bottom-right-radius: {R}px; }}
+QPushButton[seg="only"] {{ border-radius: {R}px; }}
+QPushButton[seg]:checked {{ font-weight: 600; }}
+QPushButton[seg]:disabled {{ background: transparent; border: 1px dashed {LINE2}; }}
+
+QLineEdit, QSpinBox, QDoubleSpinBox, QTimeEdit, QComboBox {{
+    background: {field}; border: 1px solid {LINE2}; border-radius: {R}px; padding: 5px 9px; }}
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QTimeEdit:disabled, QComboBox:disabled {{
+    background: transparent; border: 1px dashed {LINE2}; }}
+QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 5px; background: {field}; }}
+QCheckBox::indicator:disabled {{ background: transparent; }}
+QTreeView::indicator, QTreeWidget::indicator {{ width: 15px; height: 15px; border-radius: 5px; background: {field}; }}
+QScrollBar:vertical {{ width: 8px; margin: 3px 1px; }}
+QScrollBar::handle:vertical {{ border-radius: 3px; }}
+QLabel#Chip {{ border-radius: 11px; padding: 3px 11px; min-height: 16px; }}
+QProgressBar {{ border-radius: 3px; background: {field}; }}
+QProgressBar::chunk {{ border-radius: 3px; }}
+#StatusBar QLabel {{ color: {TEXT3}; font-size: 8.5pt; }}
+
+/* conditions and results: cards painted by their delegates (sessions_page) */
+QTreeWidget#CondTree {{ font-size: 9.75pt; font-weight: 500; }}
+QTreeWidget#CondTree::item {{ padding: 9px 2px; border-radius: 0; background: transparent; }}
+QTreeWidget#CondTree::item:hover, QTreeWidget#CondTree::item:selected {{ background: transparent; }}
+QTableView#Results::item, QTableView#Results::item:selected, QTableView#Results::item:hover {{ background: transparent; }}
+
+/* top bar: the seed capsule, the workspace tabs, the tools */
+QFrame#SeedCapsule {{ background: {field}; border: 1px solid {LINE2}; border-radius: 13px; }}
+QFrame#SeedCapsule QLineEdit#SeedEdit {{ background: transparent; border: 0; font-family: "{_pick(UI_FAMILIES)}";
+    font-size: 11.5pt; font-weight: 600; padding: 0 4px; }}
+QFrame#SeedCapsule QToolButton {{ border: 0; border-radius: 9px; }}
+QToolButton#VersionButton {{ border-radius: 13px; padding: 8px 26px 8px 13px; background: {field};
+    font-weight: 600; min-height: 22px; }}
+QToolButton#TopTool {{ border: 0; border-radius: 10px; padding: 7px; }}
+QToolButton#TopTool:hover {{ background: {BG3}; }}
+QFrame#TopTabs {{ background: {field}; border: 1px solid {LINE}; border-radius: 14px; }}
+QToolButton#NavButton {{ color: {TEXT2}; border: 0; border-radius: 10px; padding: 6px 13px 6px 10px;
+    font-size: 9.5pt; font-weight: 600; }}
+QToolButton#NavButton:hover {{ background: {BG3}; color: {TEXT}; }}
+QToolButton#NavButton:checked {{ border: 0; }}
+
+/* Home */
+QFrame#WsTile {{ background: {panel}; border: 1px solid {LINE}; border-radius: 16px; }}
+QFrame#RecentRow {{ border-radius: 10px; background: {_rgba(BG2, 0.55)}; }}
+QFrame#RecentRow:hover {{ background: {BG3}; }}
+QLabel#TileTitle {{ font-family: "{disp}"; font-size: 12.5pt; font-weight: 700; }}
+QLabel#NewChip {{ border-radius: 12px; padding: 5px 12px; font-weight: 600; font-size: 9pt; }}
+QPushButton#VerPill {{ border: 1px solid transparent; border-radius: 11px; padding: 3px 10px; min-height: 0;
+    background: transparent; color: {TEXT3}; font-size: 8.5pt; font-weight: 600; }}
+QPushButton#VerPill:hover {{ color: {TEXT}; background: {_rgba(TEXT, 0.06)}; }}
+QPushButton#VerPill:checked {{ color: {TEXT}; background: {_rgba(a, 0.16)}; border-color: {_rgba(a, 0.45)}; }}
+QPushButton#CardLink {{ border: 0; background: transparent; color: {TEXT2}; padding: 4px 8px; font-weight: 600; }}
+QPushButton#CardLink:hover {{ color: {TEXT}; background: {_rgba(TEXT, 0.06)}; border-radius: 9px; }}
+QLabel#NewsDetail {{ color: {TEXT2}; }}
+
+/* Settings (19/11) */
+QFrame#SetGroup {{ background: {_rgba(TEXT, 0.035)}; border: 1px solid {LINE}; border-radius: 14px; }}
+QFrame#SetRow {{ border-radius: 10px; background: transparent; border: 0; }}
+QFrame#SetRow:hover {{ background: {_rgba(TEXT, 0.04)}; }}
+QLabel#SetTitle {{ font-weight: 600; }}
+QLabel#SetPageTitle {{ font-family: "{disp}"; font-size: 16pt; font-weight: 700; }}
+QLabel#SetSection {{ color: {TEXT3}; font-size: 7.5pt; font-weight: 700; letter-spacing: 1.3px; padding-left: 6px; }}
+QPushButton#SetNavButton {{ border: 0; background: transparent; color: {TEXT2}; text-align: left;
+    padding: 6px 10px 6px 14px; font-weight: 600; font-size: 9.5pt; border-radius: 10px; }}
+QPushButton#SetNavButton:hover {{ background: transparent; color: {TEXT}; border: 0; }}
+QPushButton#SetNavButton:checked {{ color: {TEXT}; background: transparent; border: 0; }}
+QPushButton#SetNavButton[dim="true"] {{ color: {TEXT3}; }}
+QFrame#SetBar {{ background: transparent; border: 0; border-top: 1px solid {LINE}; }}
+QFrame#AboutHero {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {_rgba(a, 0.16)},
+    stop:0.55 {_rgba(a, 0.05)}, stop:1 {_rgba(TEXT, 0.02)}); border: 1px solid {_rgba(a, 0.32)}; border-radius: 16px; }}
+QLabel#AboutName {{ font-family: "{disp}"; font-size: 17pt; font-weight: 700; }}
+
+/* Seed Library (19/11) */
+QPushButton#ShelfButton {{ background: transparent; border: 0; color: transparent; text-align: left; }}
+QFrame#SeedHead {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {_rgba("#f5b942", 0.13)},
+    stop:0.45 {_rgba(BG1, 0.0)}, stop:1 {_rgba(a, 0.07)}); border: 1px solid {_rgba("#f5b942", 0.30)};
+    border-radius: 18px; }}
+QLineEdit#SeedName {{ font-family: "{disp}"; font-size: 18pt; font-weight: 700; background: transparent;
+    border: 1px solid transparent; border-radius: 8px; padding: 2px 6px; }}
+QLineEdit#SeedName:hover {{ border-color: {LINE2}; }}
+QLineEdit#SeedName:focus {{ border-color: #f5b942; background: {_rgba(BG2, 0.8)}; }}
+QPushButton#TagChip {{ background: {_rgba("#f5b942", 0.14)}; color: #f5c25a; border: 0; border-radius: 9px;
+    padding: 2px 10px; font-size: 8.5pt; font-weight: 600; min-height: 18px; max-height: 20px; }}
+QPushButton#TagChip:hover {{ background: {_rgba(DANGER, 0.18)}; color: {DANGER}; }}
+QLineEdit#TagAdd {{ background: {_rgba("#f5b942", 0.05)}; border: 1px dashed {_rgba("#f5b942", 0.55)}; border-radius: 9px;
+    padding: 1px 10px; font-size: 8.5pt; font-weight: 600; color: #f5c25a; min-height: 18px; max-height: 20px; }}
+QLineEdit#TagAdd:hover {{ background: {_rgba("#f5b942", 0.12)}; border-color: #f5b942; }}
+QLineEdit#TagAdd:focus {{ border: 1px solid #f5b942; background: {_rgba(BG2, 0.85)}; color: {TEXT}; }}
+QFrame#MapEdSide {{ background: {_rgba(BG1, 0.72)}; border: 1px solid {LINE}; border-radius: 16px; }}
+QLabel#MapEdSection {{ color: {TEXT3}; font-size: 7.6pt; font-weight: 700; letter-spacing: 1px; padding-top: 4px; }}
+QLineEdit#MapEdNum {{ background: {_rgba(BG3, 0.9)}; border: 1px solid {LINE}; border-radius: 8px; padding: 4px 8px; }}
+QLineEdit#MapEdNum:focus {{ border-color: #f5b942; }}
+QPushButton#MapPlace {{ background: {_rgba(TEXT, 0.06)}; border: 1px solid {LINE}; border-radius: 11px;
+    padding: 3px 11px; font-size: 8.5pt; font-weight: 600; }}
+QPushButton#MapPlace:hover {{ background: {_rgba("#f5b942", 0.14)}; border-color: {_rgba("#f5b942", 0.6)}; color: #f5c25a; }}
+QPushButton#MapChip {{ background: {_rgba(TEXT, 0.04)}; border: 1px solid {LINE}; border-radius: 11px;
+    padding: 3px 10px 3px 7px; font-size: 8.5pt; color: {TEXT3}; }}
+QPushButton#MapChip:hover {{ border-color: {LINE2}; color: {TEXT2}; }}
+QPushButton#MapChip:checked {{ background: {_rgba("#f5b942", 0.15)}; border-color: {_rgba("#f5b942", 0.65)}; color: {TEXT}; }}
+QScrollArea#MapEdChips, QScrollArea#MapEdChips > QWidget > QWidget {{ background: transparent; }}
+QLabel#LibToast {{ background: {_rgba(BG3, 0.94)}; color: {TEXT}; border: 1px solid {_rgba("#f5b942", 0.55)};
+    border-radius: 12px; padding: 7px 16px; font-weight: 600; }}
+QLabel#MapEdZoom {{ color: #f5c25a; font-weight: 700; }}
+QLineEdit#AddSeedNum {{ background: {_rgba(BG3, 0.9)}; border: 1px solid {LINE}; border-radius: 10px; padding: 6px 10px; }}
+QLineEdit#AddSeedNum:focus {{ border-color: #f5b942; }}
+QPushButton#AddBlock {{ background: {_rgba(TEXT, 0.05)}; border: 1px solid {LINE}; border-radius: 10px;
+    padding: 6px 12px; font-weight: 600; }}
+QPushButton#AddBlock:hover {{ background: {_rgba("#f5b942", 0.14)}; border-color: {_rgba("#f5b942", 0.55)}; }}
+QScrollArea#BoardScroll {{ background: {_rgba(BG1, 0.55)}; border: 1px solid {LINE}; border-radius: 18px; }}
+QScrollArea#BoardScroll > QWidget > QWidget {{ background: transparent; }}
+QLineEdit#BlockCaption {{ background: transparent; border: 0; color: #ffffff; font-weight: 600; }}
+QLineEdit#FlatEdit {{ background: {_rgba(TEXT, 0.05)}; border: 1px solid transparent; border-radius: 6px;
+    padding: 2px 5px; }}
+QLineEdit#FlatEdit:focus {{ border-color: #f5b942; }}
+"""
+    s += _accent_rules("", a)
+    for k in WS_KEYS:
+        c = ws_color(k)
+        # (the checked tab's pill is painted, and slides, by TopTabs)
+        s += (f'QToolButton#NavButton[page="{k}"]:checked {{ color: {c}; background: transparent; }}\n'
+              f'QFrame#WsTile[ws="{k}"]:hover {{ border-color: {_rgba(c, 0.8)}; }}\n')
+        if (EXTRAS.get(THEME, {}).get("ws") or {}).get(k):
+            s += _accent_rules(f'QWidget[ws="{k}"] ', *ws_pair(k))
+    if is_live():                                # (14/11 bis) no plain black window, menu or tip
+        h1, h2 = ws_pair("home")
+        s += f"""
+QDialog {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {_mix(BG1, h1, 0.22)},
+    stop:0.42 {_mix(BG1, h1, 0.05)}, stop:1 {_mix(BG1, h2, 0.20)}); }}
+QMenu {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {_mix(BG2, h1, 0.14)}, stop:1 {_mix(BG2, h2, 0.10)});
+    border: 1px solid {_rgba(h1, 0.40)}; }}
+QToolTip {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {_mix(BG3, h1, 0.20)}, stop:1 {_mix(BG3, h2, 0.10)}); border: 1px solid {_rgba(h1, 0.50)}; }}
+#SidePanel[float="1"] {{ background: {_rgba(BG1, 0.90)}; }}
+#SidePanel[float="1"] QCheckBox, #SidePanel[float="1"] QLabel#Body {{ color: {TEXT}; }}
+QComboBox QAbstractItemView {{ background: {_mix(BG2, h1, 0.10)}; border: 1px solid {_rgba(h1, 0.40)}; }}
+"""
+    return s
+
+
 def _palette() -> QPalette:
     pal = QPalette()
     for role, col in (
@@ -819,8 +1196,10 @@ def apply(app: QApplication, name: str | None = None, tokens: dict | None = None
         name = os.environ.get("SSA_THEME") or _saved_theme_name()
     set_theme(name, tokens)
     if not getattr(app, "_ssa_fusion", False):   # once: re-setting the style on each
-        app.setStyle("Fusion")                   # theme change cost ~1 s (full re-polish)
+        from . import bubbles                    # theme change cost ~1 s (full re-polish)
+        bubbles.install(app)                     # (19/11) Fusion + the round help bubbles
         app._ssa_fusion = True
+    load_fonts()
     app.setFont(ui_font(9.5))
     app.setPalette(_palette())
     app.setStyleSheet(stylesheet())
@@ -830,7 +1209,11 @@ def apply(app: QApplication, name: str | None = None, tokens: dict | None = None
 def _saved_theme_name() -> str:
     try:
         from PySide6.QtCore import QSettings
-        v = QSettings("SSA", "SimpleSeedAnalyser").value("ui/theme", DEFAULT_THEME)
+        qs = QSettings("SSA", "SimpleSeedAnalyser")
+        if int(qs.value("ui/look", 0) or 0) < 2:     # (14/11) the redesign: SSA's own theme, once —
+            qs.setValue("ui/look", 2)                 # a theme chosen afterwards is kept as before
+            qs.setValue("ui/theme", DEFAULT_THEME)
+        v = qs.value("ui/theme", DEFAULT_THEME)
         return v if v in BUILTIN else DEFAULT_THEME
     except Exception:
         return DEFAULT_THEME

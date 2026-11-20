@@ -12,15 +12,16 @@ The seed / version live in the top bar, always visible, shared by every page.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 
-from PySide6.QtCore import QObject, QSize, Qt, Signal
-from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (QColor, QFont, QGuiApplication, QKeySequence, QLinearGradient, QPainter, QPen,
+                           QShortcut)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFrame, QHBoxLayout, QLabel,
-                               QLineEdit, QMainWindow, QStackedWidget,
-                               QToolButton, QVBoxLayout, QWidget)
+                               QLineEdit, QMainWindow, QToolButton, QVBoxLayout, QWidget)
 
-from . import icons, theme
+from . import icons, motion, theme
 from .layers_panel import LayersPanel
 from .map_view import MapView
 from .map_drawer import MapDrawer
@@ -41,64 +42,302 @@ class _GpuProbe(QObject):
     done = Signal(bool, str, str)            # usable, short text, details
 
 
+class TopTabs(QFrame):
+    """(13/11) The workspaces, as tabs in the top bar (the left rail is gone: its
+    84 px go to the pages). Same interface as the old rail: add(), group."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("TopTabs")
+        self.setFixedHeight(42)
+        self.lay = QHBoxLayout(self); self.lay.setContentsMargins(4, 4, 4, 4); self.lay.setSpacing(2)
+        self.group = QButtonGroup(self); self.group.setExclusive(True)
+        # (14/11) the current tab's pill is painted here: it slides to the new tab
+        # and takes its workspace's colours on the way
+        self._pill = None                     # QRectF
+        self._pc = (QColor(theme.ACCENT), QColor(theme.ACCENT))
+        self._pan = None
+        self.group.buttonToggled.connect(lambda b, on: on and self.move_pill(b))
+        # (15/11) under the mouse: a faint pill of the hovered tab's colours glides from tab to tab
+        self._ghost = None                    # QRectF
+        self._gc = (QColor(theme.ACCENT), QColor(theme.ACCENT))
+        self._ga = 0.0
+        self._gan = None
+
+    def eventFilter(self, o, e):
+        t = e.type()
+        if t == QEvent.Type.Enter and o in self.group.buttons():
+            self._ghost_to(o)
+        elif t == QEvent.Type.Leave and o in self.group.buttons():
+            self._ghost_to(None)
+        return False
+
+    def _ghost_to(self, b):
+        if self._gan is not None:
+            try:
+                self._gan.stop()
+            except RuntimeError:
+                pass
+            self._gan = None
+        if not motion.enabled():
+            self._ga = 0.0
+            self.update()
+            return
+        a0 = self._ga
+        if b is None:
+            def out(t):
+                self._ga = a0 * (1.0 - t)
+                self.update()
+            self._gan = motion.run(self, 200, out)
+            return
+        r1 = QRectF(b.geometry())
+        c1, c2 = (QColor(c) for c in theme.ws_pair(b.property("page")))
+        r0 = QRectF(self._ghost) if (self._ghost is not None and a0 > 0.05) else QRectF(r1)
+        g0 = self._gc
+
+        def step(t):
+            self._ghost = QRectF(r0.x() + (r1.x() - r0.x()) * t, r0.y() + (r1.y() - r0.y()) * t,
+                                 r0.width() + (r1.width() - r0.width()) * t,
+                                 r0.height() + (r1.height() - r0.height()) * t)
+            self._gc = (motion.mix(g0[0], c1, t), motion.mix(g0[1], c2, t))
+            self._ga = a0 + (1.0 - a0) * t
+            self.update()
+        self._gan = motion.run(self, 190, step)
+
+    def move_pill(self, b, animate=True):
+        c1, c2 = (QColor(c) for c in theme.ws_pair(b.property("page")))
+        r1 = QRectF(b.geometry())
+        if self._pan is not None:
+            try:
+                self._pan.stop()
+            except RuntimeError:
+                pass
+            self._pan = None
+        if self._pill is None or not animate or not motion.enabled() or not self.isVisible():
+            self._pill, self._pc = r1, (c1, c2)
+            self.update()
+            return
+        r0, (a0, b0) = QRectF(self._pill), self._pc
+
+        def step(t):
+            self._pill = QRectF(r0.x() + (r1.x() - r0.x()) * t, r0.y() + (r1.y() - r0.y()) * t,
+                                r0.width() + (r1.width() - r0.width()) * t,
+                                r0.height() + (r1.height() - r0.height()) * t)
+            self._pc = (motion.mix(a0, c1, t), motion.mix(b0, c2, t))
+            self.update()
+        self._pan = motion.run(self, 280, step)
+
+    def snap(self):
+        b = self.group.checkedButton()
+        if b is not None:
+            self.move_pill(b, animate=False)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        QTimer.singleShot(0, self.snap)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QTimer.singleShot(0, self.snap)
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self._pill is None:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._ghost is not None and self._ga > 0.02:
+            gr = self._ghost.adjusted(0.5, 0.5, -0.5, -0.5)
+            gg = QLinearGradient(gr.topLeft(), gr.bottomRight())
+            g1, g2 = QColor(self._gc[0]), QColor(self._gc[1])
+            g1.setAlphaF(0.13 * self._ga)
+            g2.setAlphaF(0.07 * self._ga)
+            gg.setColorAt(0, g1)
+            gg.setColorAt(1, g2)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(gg)
+            p.drawRoundedRect(gr, 10, 10)
+        r = self._pill.adjusted(0.5, 0.5, -0.5, -0.5)
+        c1, c2 = QColor(self._pc[0]), QColor(self._pc[1])
+        g = QLinearGradient(r.topLeft(), r.bottomRight())
+        c1.setAlphaF(0.24)
+        c2.setAlphaF(0.14)
+        g.setColorAt(0, c1)
+        g.setColorAt(1, c2)
+        edge = QColor(self._pc[0])
+        edge.setAlphaF(0.50)
+        p.setBrush(g)
+        p.setPen(QPen(edge, 1))
+        p.drawRoundedRect(r, 10, 10)
+
+    def add(self, key, label, icon_name, tip):
+        b = QToolButton(); b.setObjectName("NavButton")
+        b.setText(label); b.setToolTip(tip if tip and tip != label else "")   # (15/11) not the name again
+        b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        b.setCheckable(True); b.setFixedHeight(34)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setProperty("page", key); b.setProperty("tabIcon", icon_name)
+        self.group.addButton(b)
+        self.lay.addWidget(b)
+        b.installEventFilter(self)            # (15/11) the hover pill
+        self.restyle(b)
+        return b
+
+    def restyle(self, only=None):
+        """Icons in the workspace's colour when the tab is the current one."""
+        for b in ([only] if only is not None else self.group.buttons()):
+            icons.bind(b, str(b.property("tabIcon")), 18, "text2", theme.ws_color(b.property("page")))
+            b.setIconSize(QSize(18, 18))
+
+
 class TopBar(QFrame):
+    """(13/11) mark · workspace tabs · — · seed capsule · version · world type ·
+    tools · GPU. Narrow windows: the tabs lose their text, then the tools fold
+    into one menu (_fit)."""
     def __init__(self, world: WorldState, parent=None):
         super().__init__(parent)
         self.setObjectName("TopBar")
         self.world = world
-        self.setFixedHeight(58)
-        lay = QHBoxLayout(self); lay.setContentsMargins(16, 6, 16, 6); lay.setSpacing(10)
+        self.setFixedHeight(64)
+        lay = QHBoxLayout(self); lay.setContentsMargins(18, 10, 16, 8); lay.setSpacing(10)
 
-        name = QLabel("SimpleSeedAnalyser"); name.setObjectName("AppName")
-        lay.addWidget(name)
-        lay.addSpacing(18)
+        self.mark = QLabel(); self.mark.setFixedSize(30, 30)
+        self._mark_shine = motion.Shine(self.mark, hover=True, every=(9.0, 19.0), radius=9)   # (15/11)
+        lay.addWidget(self.mark)
+        self.name = QLabel("SSA"); self.name.setObjectName("AppName")
+        lay.addWidget(self.name)
+        lay.addSpacing(8)
+        self.tabs = TopTabs()
+        lay.addWidget(self.tabs)
+        lay.addStretch(1)
 
-        # seed
-        col = QVBoxLayout(); col.setSpacing(2)
-        col.addWidget(field_label("Seed"))
-        srow = QHBoxLayout(); srow.setSpacing(4)
+        # seed: its sigil, the field, random, copy — one capsule
+        cap = QFrame(); cap.setObjectName("SeedCapsule"); cap.setFixedHeight(40)
+        ch = QHBoxLayout(cap); ch.setContentsMargins(8, 3, 5, 3); ch.setSpacing(3)
+        self.sigil = QLabel(); self.sigil.setFixedSize(26, 26)
+        self.sigil.setToolTip("This seed's sigil: the same seed looks the same everywhere in SSA.")
+        ch.addWidget(self.sigil); ch.addSpacing(4)
         self.seed = QLineEdit(str(world.seed)); self.seed.setObjectName("SeedEdit")
-        self.seed.setMinimumWidth(250)
-        self.seed.setToolTip("Numeric seed, or any text (hashed exactly like Minecraft does).\n"
+        self.seed.setMinimumWidth(214)
+        self.seed.setToolTip("Seed: a number, or any text (hashed exactly like Minecraft does).\n"
                              "Press Enter to apply.")
         self.seed.returnPressed.connect(self._apply_seed)
         self.seed.editingFinished.connect(self._apply_seed)
-        srow.addWidget(self.seed)
+        ch.addWidget(self.seed)
         for ic, tip, fn in (("dice", "Random seed  (Ctrl+R)", self.random),
                             ("copy", "Copy seed", self._copy)):
             b = QToolButton(); icons.bind(b, ic, 18); b.setToolTip(tip)
-            b.setFixedSize(30, 30); b.clicked.connect(fn); srow.addWidget(b)
-        col.addLayout(srow)
-        lay.addLayout(col)
+            b.setFixedSize(30, 30); b.clicked.connect(fn); ch.addWidget(b)
+        # (19/11) the Seed Library: ★ keeps this seed (then opens it there); right click: the library
+        self.star = QToolButton(); self.star.setFixedSize(30, 30)
+        self.star.setIconSize(QSize(18, 18))
+        self.star.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.star.clicked.connect(lambda: self.window().seed_star())
+        self.star.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.star.customContextMenuRequested.connect(lambda *_: self.window().open_seed_library())
+        ch.addWidget(self.star)
+        lay.addWidget(cap)
 
-        # version
-        col = QVBoxLayout(); col.setSpacing(2)
-        col.addWidget(field_label("Version"))
-        # (31/10) a button: the major versions, each opening its exact versions
-        self.version = QToolButton(); self.version.setObjectName("VersionButton")
+        # version: a button, the major versions, each opening its exact versions (31/10)
+        class _VersionButton(QToolButton):      # (14/11) a click: the panel of all the versions;
+            openPicker = Signal()               # a right click: the former menus
+            def mousePressEvent(self, e):
+                if e.button() == Qt.MouseButton.LeftButton:
+                    self.openPicker.emit(); e.accept()
+                elif e.button() == Qt.MouseButton.RightButton:
+                    self.showMenu()
+                else:
+                    super().mousePressEvent(e)
+        self.version = _VersionButton(); self.version.setObjectName("VersionButton")
+        self.version.openPicker.connect(self._open_version_picker)
         self.version.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.version.setMinimumWidth(130)
+        self.version.setMinimumWidth(118)
         self.version.setCursor(Qt.CursorShape.PointingHandCursor)
         self._build_version_menu()
         self._show_version()
-        col.addWidget(self.version)
-        lay.addLayout(col)
+        lay.addWidget(self.version)
 
-        # world type
-        col = QVBoxLayout(); col.setSpacing(2)
-        col.addWidget(field_label("World type"))
         self.large = QCheckBox("Large biomes")
         self.large.setChecked(world.large_biomes)
         self.large.toggled.connect(lambda on: self.world.set(large_biomes=on))
-        col.addWidget(self.large)
-        lay.addLayout(col)
+        lay.addWidget(self.large)
+        lay.addSpacing(4)
 
-        lay.addStretch(1)
+        self.tools = []                       # Tools, Keys, Theme, Settings (add_tool)
+        self._tools_at = lay.count()
+        self.more = QToolButton(); self.more.setObjectName("TopTool")
+        icons.bind(self.more, "more", 20); self.more.setIconSize(QSize(20, 20))
+        self.more.setFixedSize(36, 36); self.more.setToolTip("Tools · Keys · Theme · Settings")
+        self.more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.more.hide()
+        lay.addWidget(self.more)
         self.gpu = QLabel("GPU: checking…"); self.gpu.setObjectName("Chip")
         self.gpu.setProperty("state", "off")
-        self.gpu.setFixedHeight(22)
         lay.addWidget(self.gpu, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._mode = -1
+        self._need = None
         world.changed.connect(self._sync)
+        self.restyle()
+
+    def add_tool(self, text, icon_name, tip, fn):
+        """An icon button right of the world settings (and a line of the « more »
+        menu of a narrow window)."""
+        b = QToolButton(); b.setObjectName("TopTool")
+        icons.bind(b, icon_name, 20, "text2", "text"); b.setIconSize(QSize(20, 20))
+        b.setFixedSize(36, 36); b.setToolTip(f"{text} — {tip}" if tip else text)   # (19/11) an icon: its name
+        b.clicked.connect(fn)
+        self.layout().insertWidget(self._tools_at + len(self.tools), b)
+        self.tools.append((b, text, icon_name, fn))
+        from PySide6.QtWidgets import QMenu
+        m = QMenu(self.more)
+        for _b, t, ic, f in self.tools:
+            m.addAction(icons.icon(ic, 16), t, f)
+        self.more.setMenu(m)
+        self._need = None
+        return b
+
+    def restyle(self):
+        """Theme-dependent pictures (the mark, the sigil, the tabs' icons)."""
+        from . import brand
+        self.mark.setPixmap(brand.mark(30, *theme.ws_pair(theme.WORKSPACE)))
+        self.sigil.setPixmap(brand.sigil(self.world.seed, 26))
+        self.seed.setFont(theme.num_font(11.5, QFont.Weight.DemiBold))
+        self.tabs.restyle()
+        QTimer.singleShot(0, self.tabs.snap)
+        self._need = None
+        self._fit()
+
+    # the widths the three layouts need are measured once (per theme / tool set)
+    def _apply_mode(self, mode):
+        for b in self.tabs.group.buttons():
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon if mode == 0
+                                 else Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.name.setVisible(mode == 0)
+        for b, *_r in self.tools:
+            b.setVisible(mode < 2)
+        self.more.setVisible(mode == 2)
+
+    def _fit(self):
+        if self._need is None:
+            need = []
+            for m in (0, 1, 2):
+                self._apply_mode(m)
+                self.tabs.layout().invalidate()     # (the tabs' own layout is asked again now,
+                self.tabs.updateGeometry()          #  not at the next layout request)
+                self.layout().invalidate()
+                need.append(self.layout().minimumSize().width())
+            self._need, self._mode = need, -1
+            # the bar must not hold the window at its widest layout
+            self.setMinimumWidth(need[2])
+        w = self.width()
+        mode = 0 if w >= self._need[0] else (1 if w >= self._need[1] else 2)
+        if mode != self._mode:
+            self._mode = mode
+            self._apply_mode(mode)
+            QTimer.singleShot(0, self.tabs.snap)     # the tabs moved: the pill follows
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._fit()
 
     def _apply_seed(self):
         v = parse_seed(self.seed.text())
@@ -134,6 +373,20 @@ class TopBar(QFrame):
         m.aboutToShow.connect(self._check_version_menu)
         self._vmenu = m
         self.version.setMenu(m)
+
+    def _open_version_picker(self):
+        import time
+        from .version_picker import VersionPicker
+        from .world import GAME_VERSIONS, current_exact, major_of
+        if time.monotonic() - VersionPicker.closed_at < 0.25:      # the click that just closed it
+            return
+        majors = {}
+        for name in VERSION_NAMES:
+            for ex in GAME_VERSIONS.get(name, []):
+                majors.setdefault(major_of(ex), []).append((ex, name))
+        pk = VersionPicker(list(majors.items()), current_exact(self.world.version_name), VERSION_TIPS, self)
+        pk.picked.connect(self._pick_version)
+        pk.popup_under(self.version)
 
     def _check_version_menu(self):
         from .world import current_exact
@@ -176,44 +429,49 @@ class TopBar(QFrame):
         ex = current_exact(self.world.version_name)
         self.version.setText(f"Java {ex}")
         tip = VERSION_TIPS.get(self.world.version_name)
-        self.version.setToolTip(f"Same world generation: {tip}" if tip else "")
+        self.version.setToolTip((f"Same world generation: {tip}\n" if tip else "") +
+                                "Click: all the versions · right click: the list")
 
     def _copy(self):
         QGuiApplication.clipboard().setText(str(self.world.seed))
 
+    def sync_star(self, pop=False):
+        """(19/11) ★ filled (gold) when this seed — version, world type — is in the Seed Library."""
+        from .seed_store import store
+        w = self.world
+        kept = store().find(w.seed, w.version_name, w.large_biomes) is not None
+        gold = "#f5b942"
+        self.star.setIcon(icons.icon("star_fill" if kept else "star", 18, gold if kept else theme.TEXT2,
+                                     gold if kept else theme.TEXT))
+        self.star.setToolTip("In the Seed Library — click to open it there" if kept
+                             else "Keep this seed in the Seed Library  (right click: open the library)")
+        if pop and motion.enabled():
+            import math
+
+            def step(t):
+                k = 1 + 0.45 * math.sin(math.pi * t)
+                self.star.setIconSize(QSize(int(18 * k), int(18 * k)))
+            motion.run(self.star, 300, step, lambda: self.star.setIconSize(QSize(18, 18)))
+
     def _sync(self):
+        from . import brand
+        if getattr(self, "_sigil_seed", None) != self.world.seed:
+            self._sigil_seed = self.world.seed
+            self.sigil.setPixmap(brand.sigil(self.world.seed, 26))
+            motion.fade_in(self.sigil, 320)             # (14/11) a new seed: its sigil appears
         if parse_seed(self.seed.text()) != self.world.seed:
             self.seed.setText(str(self.world.seed))
         self._show_version()
         if self.large.isChecked() != self.world.large_biomes:
             self.large.setChecked(self.world.large_biomes)
+        if hasattr(self, "star"):
+            self.sync_star()
 
     def set_gpu(self, ok, text, details):
         self.gpu.setText(text)
         self.gpu.setProperty("state", "ok" if ok else "off")
         self.gpu.setToolTip(details)
         self.gpu.style().unpolish(self.gpu); self.gpu.style().polish(self.gpu)
-
-
-class NavRail(QFrame):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("NavRail")
-        self.setFixedWidth(76)
-        self.lay = QVBoxLayout(self); self.lay.setContentsMargins(8, 10, 8, 10); self.lay.setSpacing(4)
-        self.group = QButtonGroup(self); self.group.setExclusive(True)
-
-    def add(self, key, label, icon_name, tip):
-        b = QToolButton(); b.setObjectName("NavButton")
-        icons.bind(b, icon_name, 22, "text3", "text")
-        b.setIconSize(QSize(22, 22))
-        b.setText(label); b.setToolTip(tip)
-        b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        b.setCheckable(True); b.setFixedSize(60, 54)
-        b.setProperty("page", key)
-        self.group.addButton(b)
-        self.lay.addWidget(b, 0, Qt.AlignmentFlag.AlignHCenter)
-        return b
 
 
 class Placeholder(QWidget):
@@ -237,13 +495,15 @@ class MainWindow(QMainWindow):
         self.resize(1480, 900)
         self.world = WorldState()
 
-        root = QWidget(); root.setObjectName("Root")
+        motion.install_dialog_fade()             # (14/11) dialogs fade in
+        root = motion.Backdrop()                 # (14/11) objectName "Root"; SSA's theme: living lights
         v = QVBoxLayout(root); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
         self.top = TopBar(self.world); v.addWidget(self.top)
-        mid = QHBoxLayout(); mid.setContentsMargins(0, 0, 0, 0); mid.setSpacing(0)
+        # (13/11) the workspaces are tabs of the top bar: no rail, the pages get its width
+        mid = QHBoxLayout(); mid.setContentsMargins(10, 0, 0, 0); mid.setSpacing(0)
         v.addLayout(mid, 1)
-        self.nav = NavRail(); mid.addWidget(self.nav)
-        self.pages = QStackedWidget(); mid.addWidget(self.pages, 1)
+        self.nav = self.top.tabs
+        self.pages = motion.FadeStack(); mid.addWidget(self.pages, 1)      # (14/11) pages cross-fade
 
         # Sessions page (own map, same world)
         # the wheel scrolls panels, never changes a slider / combo / spin box
@@ -262,6 +522,8 @@ class MainWindow(QMainWindow):
         self._wheel_scan.start()
         _QT.singleShot(0, _scan)
         # every map of the window shares engine, view and layers (map_link.py)
+        from . import memory                      # (15/11) its caches sized from this PC's RAM
+        memory.apply()
         self.link = MapLink(self.world, self)
         self.sessions = SessionsPage(self.world, link=self.link)
         self.strongholds = StrongholdPage(self.world, link=self.link)
@@ -290,43 +552,35 @@ class MainWindow(QMainWindow):
                         "drawing": MapDrawer(self.drawing.map)}
         self.drawers["map"].set_content(self.layers)
 
+        from .home_page import HomePage                    # (13/11)
+        self.home = HomePage(self)
         pages = [
-            ("map", "Map", "map", "Explore the seed: biomes, structures, landmarks", mp),
-            ("sessions", "Sessions", "sessions", "Custom search sessions", self.sessions),
+            ("home", "Home", "home", "", self.home),
+            ("map", "Map", "map", "", mp),                      # (19/11) no tip: the tab says it
+            ("sessions", "Sessions", "sessions", "", self.sessions),
             # (06/11) the Stronghold page is gone from the rail (all of it is in the
             # Sessions' Stronghold condition); its object stays for the shared state
-            ("loot", "Loot", "chest", "Find seeds by the loot of their chests · every loot table",
-             self.loot),
-            ("seedcrack", "Crack", "forest", "Seedcracking: rebuild the trees you saw in 3D "
-                                             "and crack the structure seed (Java 1.16 – 1.17)",
-             self.seedcrack),
-            ("drawing", "Draw", "brush", "Draw a terrain over the map and find the seeds "
-                                         "that look like it", self.drawing),
+            ("loot", "Loot", "chest", "", self.loot),
+            ("seedcrack", "Crack", "forest", "Seedcracking — Java 1.16 – 1.17", self.seedcrack),
+            ("drawing", "Draw", "brush", "", self.drawing),
         ]
         self._page_index = {}
         for key, label, ic, tip, w in pages:
             self._page_index[key] = self.pages.addWidget(w)
+            w.setProperty("ws", key)             # the stylesheet's rules of its workspace colour
             b = self.nav.add(key, label, ic, tip)
             b.clicked.connect(lambda _=False, k=key: self.show_page(k))
-        self.nav.lay.addStretch(1)
         _tools = [("Tools", "tools", "Paste seed + coordinates · measure · seed-list converter · "
                                      "legend · fullscreen", None),
                   ("Keys", "keyboard", "Keyboard shortcuts  (F1)", self.show_shortcuts),
-                  ("Theme", "palette", "Appearance: themes and colours", self.open_theme),
-                  ("Settings", "gear", "Settings: what SSA does by itself instead of asking",
-                   self.open_settings)]
+                  ("Theme", "palette", "Themes and colours", self.open_theme),
+                  ("Settings", "gear", "", self.open_settings)]
         for text, ic, tip, fn in _tools:
-            cl = QToolButton(); cl.setObjectName("NavButton"); cl.setText(text)
-            icons.bind(cl, ic, 22, "text3", "text"); cl.setIconSize(QSize(22, 22))
-            cl.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon); cl.setFixedSize(60, 54)
-            cl.setToolTip(tip)
+            cl = self.top.add_tool(text, ic, tip, fn or self._tools_menu)
             if fn is None:                       # the Tools menu
                 self.tools_btn = cl
-                cl.clicked.connect(self._tools_menu)
-            else:
-                cl.clicked.connect(fn)
-            self.nav.lay.addWidget(cl, 0, Qt.AlignmentFlag.AlignHCenter)
         self.nav.group.buttons()[0].setChecked(True)
+        theme.set_workspace("home")
 
         # status bar
         sb = QFrame(); sb.setObjectName("StatusBar"); sb.setFixedHeight(26)
@@ -346,6 +600,10 @@ class MainWindow(QMainWindow):
         self.drawing.status.connect(self._flash)
         self.world.changed.connect(self._world_status)
         self._world_status()
+        from .seed_store import store as _seed_store              # (19/11) the ★ follows the library
+        _seed_store().changed.connect(lambda *_: self.top.sync_star())
+        theme.signals.changed.connect(lambda *_: self.top.sync_star())
+        self.top.sync_star()
         # version / large biomes locked while a search runs (a change applied
         # to the map but not to the running engine → results of another world)
         for r in (self.sessions.runner, self.strongholds.runner):
@@ -386,7 +644,7 @@ class MainWindow(QMainWindow):
         self.layers.legend.toggled.connect(self.set_legend)
         QShortcut(QKeySequence("Ctrl+/"), self, activated=self.show_shortcuts)
         self._probe_gpu()
-        theme.signals.changed.connect(lambda: icons.refresh(self))
+        theme.signals.changed.connect(self._theme_changed)
         # last session back as it was (autosave.session), then a light periodic
         # autosave (only when something changed) in case of a crash
         from PySide6.QtCore import QTimer
@@ -412,13 +670,32 @@ class MainWindow(QMainWindow):
         # console, killed or crashed, never runs closeEvent)
         self._ui_timer = QTimer(self, singleShot=True, interval=2000,
                                 timeout=lambda: ui_state.save(self, heavy=False))
-        for sig in (self.world.changed, self.layers.changed):
+        for sig in (self.world.changed, self.layers.changed, self.loot.changed):
             sig.connect(self._ui_timer.start)
         self.link.viewMoved.connect(self._ui_timer.start)
         self._ui_sh_sig = None
         self._autosave_timer = QTimer(self, interval=90_000, timeout=self._periodic_autosave)
         self._autosave_timer.start()
         self._autosave_sig = None
+        # (20/11) SSA opens with a short animation (launch.py) — not when the animations are off
+        self._launching = (motion.enabled() and bool(_prefs.get("launch_anim"))
+                           and not os.environ.get("SSA_NO_LAUNCH"))
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if getattr(self, "_launching", False) and not getattr(self, "_launch_started", False):
+            self._launch_started = True
+            try:
+                from .launch import LaunchVeil
+                self._veil = LaunchVeil(self, on_open=self.home.launch_reveal, on_end=self._launch_end)
+            except Exception as ex:                      # noqa: BLE001 — cosmetic only
+                print(f"[launch] {ex}", flush=True)
+                self._launch_end()
+                self.home.launch_reveal()
+
+    def _launch_end(self):
+        self._launching = False
+        self._veil = None
 
     # ── keyboard: noise layers / arrows / help ─────────────────────────────
     def _page_has_map(self):
@@ -583,8 +860,8 @@ class MainWindow(QMainWindow):
         a_leg.setCheckable(True); a_leg.setChecked(self.map.legend_on())
         a_full = m.addAction(icons.icon("fullscreen", 16),
                              ("Leave fullscreen" if self.isFullScreen() else "Fullscreen") + "\tF11")
-        b = self.tools_btn
-        act = m.exec(b.mapToGlobal(b.rect().topRight()))
+        b = self.tools_btn if self.tools_btn.isVisible() else self.top.more
+        act = m.exec(b.mapToGlobal(b.rect().bottomLeft()))
         if act is a_paste:
             self.paste_seed_coords()
         elif act is a_meas and can_measure:
@@ -622,6 +899,41 @@ class MainWindow(QMainWindow):
             QSettings("SimpleSeedAnalyser", "SSA").setValue("map/legend", bool(on))
         except Exception:
             pass
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        from PySide6.QtCore import QEvent, QTimer
+        if e.type() == QEvent.Type.WindowStateChange and self.isFullScreen():
+            QTimer.singleShot(0, self._fullscreen_border)
+
+    def _fullscreen_border(self):
+        """(13/11) Windows: the Crack tab's 3D view (QOpenGLWidget) makes the whole
+        window an OpenGL one, and a fullscreen OpenGL window is not composited by the
+        DWM: menus, combo lists, tooltips and dialogs then open BEHIND it (the Add
+        button's menu never showed). Qt's documented workaround is a 1-pixel border
+        in fullscreen (QWindowsWindowFunctions::setHasBorderInFullScreen, private in
+        Qt 6), set here through the Win32 API; Qt restores its own style when the
+        window leaves fullscreen."""
+        if sys.platform != "win32" or not self.isFullScreen():
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            get, put = u.GetWindowLongPtrW, u.SetWindowLongPtrW
+            get.restype, get.argtypes = ctypes.c_ssize_t, [wintypes.HWND, ctypes.c_int]
+            put.restype, put.argtypes = ctypes.c_ssize_t, [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+            u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+            GWL_STYLE, WS_BORDER = -16, 0x00800000
+            hwnd = wintypes.HWND(int(self.winId()))
+            st = get(hwnd, GWL_STYLE)
+            if not st & WS_BORDER:
+                put(hwnd, GWL_STYLE, st | WS_BORDER)
+                # NOSIZE | NOMOVE | NOZORDER | NOACTIVATE | FRAMECHANGED
+                u.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x1 | 0x2 | 0x4 | 0x10 | 0x20)
+        except Exception as ex:                          # noqa: BLE001 — cosmetic only
+            print(f"[fullscreen] border: {ex}", flush=True)
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
@@ -680,6 +992,12 @@ class MainWindow(QMainWindow):
             self._wheel_scan.stop()
         except Exception:
             pass
+        lib = getattr(self, "_seed_library", None)        # (19/11 bis) its own window: closed with SSA
+        if lib is not None:
+            try:
+                lib.close()
+            except RuntimeError:
+                pass
         from . import ui_state
         ui_state.save(self)                  # everything comes back at the next launch (03/10)
         if self.strongholds.runner.state in ("running", "pausing", "stopping"):
@@ -713,6 +1031,23 @@ class MainWindow(QMainWindow):
                 pass
         super().closeEvent(e)
 
+    # ── (19/11) the Seed Library ──────────────────────────────────────────────
+    def open_seed_library(self, seed_id=None, add=False):
+        from .seed_library import open_library
+        return open_library(self, seed_id, add=add)
+
+    def seed_star(self):
+        """★ of the top bar: keeps the current seed; already kept: opens it in the library."""
+        from .seed_store import store
+        w = self.world
+        s = store().find(w.seed, w.version_name, w.large_biomes)
+        if s is not None:
+            self.open_seed_library(s["id"])
+            return
+        store().add_seed(w.seed, w.version_name, w.large_biomes)
+        self.top.sync_star(pop=True)
+        self._flash("Kept in the Seed Library — ★ again opens it there.")
+
     def open_settings(self):
         from .settings_dialog import SettingsDialog
         SettingsDialog(self).exec()
@@ -735,6 +1070,7 @@ class MainWindow(QMainWindow):
         if d is not None:                      # the one Layers panel follows the page
             d.set_content(self.layers)
             self.layers.map = d.map
+        self._enter_workspace(key)
         self.pages.setCurrentIndex(self._page_index[key])
         for b in self.nav.group.buttons():
             if b.property("page") == key:
@@ -747,6 +1083,31 @@ class MainWindow(QMainWindow):
             if page.focusPolicy() == Qt.FocusPolicy.NoFocus:
                 page.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
             page.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _enter_workspace(self, key):
+        """(13/11) The theme's colour of this workspace (theme.set_workspace). A page
+        that styles itself (its own _style) does it again under its colour, once
+        per theme."""
+        theme.set_workspace(key)
+        from . import brand
+        self.top.mark.setPixmap(brand.mark(30, *theme.ws_pair(key)))   # the mark wears the workspace's colours
+        page = self.pages.widget(self._page_index[key])
+        fn = getattr(page, "_style", None)
+        sig = (theme.THEME, theme.ACCENT, id(theme.TOKENS))
+        if callable(fn) and getattr(page, "_ws_sig", None) != sig:
+            try:
+                fn()
+            except Exception:
+                pass
+            page._ws_sig = sig
+        page.update()
+
+    def _theme_changed(self):
+        icons.refresh(self)
+        self.top.restyle()
+        key = next((k for k, i in self._page_index.items() if i == self.pages.currentIndex()), None)
+        if key:
+            self._enter_workspace(key)
 
     def _crack_open_map(self, seed, version_name, x, z):
         """Seedcracking → a world seed on the map, centred on the trees."""

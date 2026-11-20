@@ -129,19 +129,26 @@ class EngineDialog(QDialog):
 
         v = QVBoxLayout(self); v.setContentsMargins(18, 16, 18, 14); v.setSpacing(10)
         t = QLabel("Engine for this session"); t.setObjectName("PageTitle"); v.addWidget(t)
-        v.addWidget(body("The GPU never replaces the CPU: it pre-filters the seeds on ONE "
-                         "condition, then the C engine re-checks every survivor with the whole "
-                         "session — results are always exact. The analysis runs the real search "
-                         "a few seconds with each option, in each search mode (Incremental and "
-                         "48-bit family), and keeps the fastest.",
-                         muted=True, small=True))
+        # (15/11) one line; the whole explanation is the tooltip of the line and of the title
+        how = ("The GPU never replaces the CPU: it pre-filters the seeds on ONE condition, then the C engine\n"
+               "re-checks every survivor with the whole session — results are always exact.\n"
+               "The analysis runs the real search a few seconds with each option, in each search mode\n"
+               "(Incremental and 48-bit family), and keeps the fastest.")
+        short = body("Results are always exact: the GPU only pre-filters, the CPU re-checks.  ⓘ",
+                     muted=True, small=True)
+        short.setToolTip(how); t.setToolTip(how)
+        v.addWidget(short)
         row = QHBoxLayout()
         self.seg = Segmented([m[1] for m in MODES], dict((k, l) for k, l, _t in MODES).get(mode, "Auto"))
         self._key_of = {l: k for k, l, _t in MODES}
         self.radios = {k: self.seg.buttons[l] for k, l, _t in MODES}
         for k, l, tip in MODES:
             self.radios[k].setToolTip(tip)
-        row.addWidget(self.seg); row.addStretch(1)
+        from .param_visuals import ChoiceCards   # (15/11) the four modes as cards (the control stays the truth)
+        self.cards = ChoiceCards(self.seg, {dict((k, l) for k, l, _t in MODES)[k]: g for k, g in
+                                            (("auto", "auto"), ("plan", "plan"), ("as_set", "set"),
+                                             ("cpu", "cpu"))})
+        row.addWidget(self.cards, 1)
         v.addLayout(row)
         self.radios["plan"].setEnabled(plan is not None)
 

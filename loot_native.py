@@ -27,7 +27,8 @@ import sys
 
 import loot_engine as le
 
-_SRC = ("cubiomes_src/loot_vm.c",)
+_SRC = ("cubiomes_src/loot_vm.c", "cubiomes_src/loot_reverse.c",   # (15/11) + Reverse
+        "cubiomes_src/treecrack_core.h")
 _LIB = None
 _LIB_ERR = None
 _PROGS = {}                          # (version, table) → _Prog | None (Python engine)
@@ -68,7 +69,8 @@ def _compile():
         return None
     tmp = out + ".building"
     cmd = ["gcc", "-O2", "-shared", "-fPIC", "-fno-fast-math", "-ffp-contract=off",
-           "-o", tmp, os.path.join(here, "cubiomes_src", "loot_vm.c"), "-lm"]
+           "-o", tmp, os.path.join(here, "cubiomes_src", "loot_vm.c"),
+           os.path.join(here, "cubiomes_src", "loot_reverse.c"), "-lm"]
     if platform.system() == "Windows":
         cmd = [c for c in cmd if c != "-lm"] + ["-static-libgcc"]
     try:

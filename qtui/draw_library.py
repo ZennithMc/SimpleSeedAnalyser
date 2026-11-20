@@ -157,12 +157,19 @@ class DrawLibraryDialog(QDialog):
         self.setWindowTitle("Drawings library")
         self.resize(820, 560)
         self.setStyleSheet(f"""
-            QListWidget#DrawLib {{ background: {theme.BG1}; border: 1px solid {theme.LINE}; border-radius: 8px; }}
-            QListWidget#DrawLib::item {{ border-radius: 6px; padding: 4px; color: {theme.TEXT}; }}
-            QListWidget#DrawLib::item:selected {{ background: {theme.ACCENT_SOFT}; }}
+            QListWidget#DrawLib {{ background: {theme.PANEL or theme.BG1}; border: 1px solid {theme.LINE};
+                                   border-radius: 14px; padding: 8px; outline: 0; }}
+            QListWidget#DrawLib::item {{ border-radius: 12px; padding: 7px 5px 5px 5px; color: {theme.TEXT2};
+                                         border: 1px solid transparent; }}
+            QListWidget#DrawLib::item:hover {{ background: {theme._rgba(theme.TEXT, 0.06)};
+                                               border: 1px solid {theme.LINE2}; color: {theme.TEXT}; }}
+            QListWidget#DrawLib::item:selected {{ background: {theme.ACCENT_SOFT};
+                                                  border: 1px solid {theme.ACCENT}; color: {theme.TEXT}; }}
             QPlainTextEdit#LibDesc {{ background: {theme.BG2}; border: 1px solid {theme.LINE2};
                                      border-radius: 6px; padding: 6px; color: {theme.TEXT}; }}
         """)
+        from .seed_library import SkyBackdrop          # (20/11) a new sky at each opening
+        self._sky = SkyBackdrop(self)
         v = QVBoxLayout(self); v.setContentsMargins(16, 14, 16, 14); v.setSpacing(10)
         top = QHBoxLayout()
         t = QLabel("Drawings"); t.setObjectName("PanelTitle"); top.addWidget(t)
@@ -174,7 +181,8 @@ class DrawLibraryDialog(QDialog):
         mid = QHBoxLayout(); mid.setSpacing(12); v.addLayout(mid, 1)
         self.list = QListWidget(); self.list.setObjectName("DrawLib")
         self.list.setViewMode(QListWidget.ViewMode.IconMode)
-        self.list.setIconSize(QSize(96, 96)); self.list.setGridSize(QSize(124, 136))
+        self.list.setIconSize(QSize(112, 112)); self.list.setGridSize(QSize(142, 158))   # (15/11) larger cards
+        self.list.setSpacing(4)
         self.list.setResizeMode(QListWidget.ResizeMode.Adjust); self.list.setMovement(QListWidget.Movement.Static)
         self.list.setWordWrap(True)
         self.list.currentItemChanged.connect(self._show)
@@ -222,7 +230,7 @@ class DrawLibraryDialog(QDialog):
         self.list.clear()
         entries = list_entries()
         for m in entries:
-            it = QListWidgetItem(QIcon(thumb(m, 96)), m.get("name") or "?")
+            it = QListWidgetItem(QIcon(thumb(m, 112)), m.get("name") or "?")
             it.setData(Qt.ItemDataRole.UserRole, m)
             it.setToolTip(describe(m))
             self.list.addItem(it)

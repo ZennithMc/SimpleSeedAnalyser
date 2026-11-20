@@ -8,12 +8,17 @@ page has the same layers — which are shared by the linked maps anyway.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPropertyAnimation, Qt
-from PySide6.QtWidgets import QToolButton, QVBoxLayout, QWidget
+import time
+
+from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent, QObject, QPoint,
+                            QPropertyAnimation, Qt, QTimer)
+from PySide6.QtGui import QCursor, QPainter
+from PySide6.QtWidgets import (QAbstractSlider, QAbstractSpinBox, QApplication, QComboBox, QLineEdit,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from . import icons
 
-PANEL_W = 288
+PANEL_W = 304
 MARGIN = 8
 TAB_W, TAB_H = 22, 64
 
@@ -32,6 +37,37 @@ class _Host(QWidget):
     def mouseMoveEvent(self, e): e.accept()
     def mouseDoubleClickEvent(self, e): e.accept()
     def wheelEvent(self, e): e.accept()
+    def contextMenuEvent(self, e): e.accept()
+
+
+class _Snap(QWidget):
+    """(15/11) The open drawer as a picture while the map moves under it: each
+    frame of the map (pan, zoom, tiles arriving) repainted the 75 widgets of the
+    Layers panel floating over it — a third of the frame. The picture is the
+    panel itself (QWidget.grab, its glass background included), shown in its
+    place; the live panel comes back as soon as the map rests or the cursor
+    comes near."""
+
+    def __init__(self, parent, drawer):
+        super().__init__(parent)
+        self.d = drawer
+        self.pm = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.hide()
+
+    def paintEvent(self, _e):
+        if self.pm is not None:
+            QPainter(self).drawPixmap(0, 0, self.pm)
+
+    def enterEvent(self, e):
+        super().enterEvent(e)
+        self.d.thaw()
+
+    def mousePressEvent(self, e): e.accept(); self.d.thaw()
+    def mouseReleaseEvent(self, e): e.accept()
+    def mouseMoveEvent(self, e): e.accept(); self.d.thaw()
+    def mouseDoubleClickEvent(self, e): e.accept()
+    def wheelEvent(self, e): e.accept(); self.d.thaw()
     def contextMenuEvent(self, e): e.accept()
 
 
@@ -54,10 +90,88 @@ class MapDrawer(QObject):
         self._anim.valueChanged.connect(lambda _v: self._place_tab())
         self._anim.finished.connect(self._anim_done)
         map_view.installEventFilter(self)
+        self.snap = _Snap(map_view, self)
+        self._frozen = self._pending = False
+        self._last_frame = 0.0
+        self._idle = QTimer(self)
+        self._idle.setSingleShot(True)
+        self._idle.setInterval(260)
+        self._idle.timeout.connect(self.thaw)
+        map_view._frame_hook = self._on_frame
+        # the panel changes (seed / version, theme, a layer): the live one comes back
+        # (the next moves of the map take a new picture of it)
+        self._watched = set()
+        world = getattr(map_view, "world", None)
+        if world is not None and hasattr(world, "changed"):
+            world.changed.connect(self.thaw)
+        from . import theme
+        theme.signals.changed.connect(self.thaw)
+        theme.signals.accent.connect(self.thaw)
         self._apply(animate=False)
+
+    # (15/11) the panel as a picture while the map moves ---------------------
+    def _on_frame(self):
+        """Called by the map at each of its frames (inside its paint: nothing is
+        moved here). Two frames close together = the map is moving."""
+        now = time.monotonic()
+        quick = now - self._last_frame < 0.15
+        self._last_frame = now
+        if self._frozen:
+            self._idle.start()
+            # the cursor came onto the picture without an Enter (a drag released over it…)
+            if QApplication.mouseButtons() == Qt.MouseButton.NoButton and \
+                    self.snap.rect().adjusted(-12, -12, 12, 12).contains(self.snap.mapFromGlobal(QCursor.pos())):
+                QTimer.singleShot(0, self.thaw)
+        elif quick and not self._pending and self.host.isVisible():
+            self._pending = True
+            QTimer.singleShot(0, self._freeze)
+
+    def _may_freeze(self):
+        h = self.host
+        if not h.isVisible() or not self.opened or not self.map.isVisible() \
+                or self._anim.state() == QAbstractAnimation.State.Running:
+            return False
+        if QApplication.activePopupWidget() is not None:          # a list or menu open
+            return False
+        g = QWidget.mouseGrabber()
+        if g is not None and (g is h or h.isAncestorOf(g)):
+            return False
+        if h.rect().adjusted(-12, -12, 12, 12).contains(h.mapFromGlobal(QCursor.pos())):
+            return False
+        f = QApplication.focusWidget()                            # typing in a field of the panel
+        if f is not None and h.isAncestorOf(f) and isinstance(
+                f, (QAbstractSpinBox, QLineEdit, QComboBox, QAbstractSlider)):
+            return False
+        return True
+
+    def _freeze(self):
+        self._pending = False
+        if self._frozen or not self._may_freeze():
+            return
+        self.snap.pm = self.host.grab()
+        self.snap.setGeometry(self.host.geometry())
+        self.snap.show()
+        self.snap.raise_()
+        self.tab.raise_()
+        self._frozen = True
+        self.host.move(self.map.width() + 40, self.host.y())     # out of the map: not painted
+        self._idle.start()
+
+    def thaw(self):
+        if not self._frozen:
+            return
+        self._frozen = False
+        self._idle.stop()
+        self.host.move(self.snap.pos())
+        self.snap.hide()
+        self.snap.pm = None
 
     # content ---------------------------------------------------------------
     def set_content(self, w):
+        self.thaw()
+        if id(w) not in self._watched and hasattr(w, "changed"):
+            self._watched.add(id(w))
+            w.changed.connect(self.thaw)
         lay = self.host.layout()
         if lay.indexOf(w) < 0:
             lay.addWidget(w)
@@ -77,6 +191,7 @@ class MapDrawer(QObject):
         self.tab.raise_()
 
     def _apply(self, animate=True):
+        self.thaw()
         h = max(100, self.map.height() - 2 * MARGIN)
         self.host.setFixedSize(PANEL_W, h)
         icons.bind(self.tab, "chevron-right" if self.opened else "chevron-left", 16)

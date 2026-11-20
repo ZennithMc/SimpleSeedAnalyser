@@ -2,12 +2,28 @@ SimpleSeedAnalyser — Updates
 =============================
 
 ------------------------------------------------------------------------------
+v2.0.0 — 2026-11-20
+------------------------------------------------------------------------------
+
+# SimpleSeedAnalyser v2.0.0 — New UI design, Seed Library, loot Reverse & dungeons
+
+- **New interface**: SSA was fully redesigned: its own special living theme, a colour for each workspace, smooth transitions, sigils and more. Aiming for a smoother and more comfortable experience, most of the changes can still be turned off in the Settings
+- **Seed Library**: keep your seeds with the ★ next to the seed: names, tags, favourites and your own libraries. Each seed is customizable and gets its own page with live mini maps, screenshots and notes
+- **Loot Reverse** (1.16 – 1.17): goes from the loot you want back to the seeds that have it, up to thousands of times faster than testing seeds one by one: buried treasures, desert pyramids, jungle temples, igloos, shipwrecks, ocean ruins, ruined portals and dungeons
+- **Loot**: dungeons, strongholds and mineshafts are now searchable, "Whole structure" odds, the loot seed under every chest, numbered results
+- **Map**: much smoother (2 to 5× faster to move around), its memory adapts to your PC (Settings → Performance), and a new look for structures (the old one can be switched back)
+- **Settings**: new settings and an updated interface
+
+-**Bug fixed**: mineshaft and slime chunk conditions ignoring their count, the Stronghold search stuck at 0 seeds/s with a seed list, the progress showing 100 % while still searching, unavailable options that stayed checked, the Home banner using the old spawn algorithm
+
+
+------------------------------------------------------------------------------
 v1.2.0
 ------------------------------------------------------------------------------
 
 # SimpleSeedAnalyser v1.2.0 — Chest loot, 3D SeedCracking, every structure layouts on map & village parameters (1.18+)
 
-- **Chest loot**: click a structure to see each of its chests exactly as in the game, in every version (checked on real servers): pyramids, temples, shipwrecks, ocean ruins, buried treasures, igloos, ruined portals, villages, outposts, mansions, strongholds, mineshafts, dungeons, ancient cities, camps, bastions, fortresses and End cities
+- **Chest loot**: click a structure to see each of its chests exactly as in the game, in every version (checked in game): pyramids, temples, shipwrecks, ocean ruins, buried treasures, igloos, ruined portals, villages, outposts, mansions, strongholds, mineshafts, dungeons, ancient cities, camps, bastions, fortresses and End cities
 - **Loot tab**: find seeds by the loot of their chests (Find / Most / Layout), with the exact probability of what you ask for
 - **Structure plans**: detailed top-down plans on the map with the chests in yellow, and /tp commands right above each chest
 - **Crack tab**: seedcracking from the trees you saw (1.16 – 1.17, 3D view), from structures and from the End pillars, GPU accelerated

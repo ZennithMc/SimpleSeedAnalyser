@@ -99,17 +99,25 @@ def _crash_log():
                     _new = [ln.strip() for ln in _r.read().splitlines()]
                 _n = sum(1 for ln in _new if ln.startswith("--- ") and ln.endswith(" ---"))
                 _fatal = next((ln for ln in _new if "fatal exception" in ln.lower()), "")
+                # (19/11) Windows: faulthandler also writes exceptions that were HANDLED (a DLL
+                # probed at launch — 0xc0000139 at every start —, a driver's own access test):
+                # a session that ended normally did not crash
+                if any(ln.startswith("===== SSA closed normally") for ln in _new):
+                    _fatal = ""
                 _last = next((ln for ln in reversed(_new)
                               if ln and ":" in ln and not ln.startswith(
                                   ("---", "File ", "~", "^", "(same", "Thread ", "Current ",
                                    "=====", "<"))), "")
-                if _n == 0 and _fatal:      # (17/10) a crash, no Python error
+                if _n == 0 and not _fatal:  # (19/11) nothing to say: handled exceptions only
+                    _msg = ""
+                elif _n == 0 and _fatal:    # (17/10) a crash, no Python error
                     _msg = (f"SSA closed unexpectedly last time ({_fatal}) — details in {path}")
                 else:
                     _msg = (f"{_n or 'One'} error{'s' if _n > 1 else ''} recorded during the "
                             f"previous session (last: {(_last or _fatal)[:120]}) — details in {path}")
-                print("[SSA] " + _msg)
-                os.environ["SSA_CRASH_NOTICE"] = _msg      # shown in the status bar too
+                if _msg:
+                    print("[SSA] " + _msg)
+                    os.environ["SSA_CRASH_NOTICE"] = _msg      # shown in the status bar too
         except OSError:
             pass
         if os.path.exists(path) and os.path.getsize(path) > 2_000_000:   # keep it small
@@ -122,6 +130,15 @@ def _crash_log():
         with open(mark, "w") as m:          # everything before this point was announced
             m.write(str(f.tell()))
         faulthandler.enable(file=f, all_threads=True)
+
+        def _closed():                      # (19/11) a normal end, for the next launch
+            try:
+                f.write(f"===== SSA closed normally {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+                f.flush()
+            except Exception:
+                pass
+        import atexit
+        atexit.register(_closed)
     except Exception as e:
         print(f"[SSA] crash log unavailable: {e}")
         return

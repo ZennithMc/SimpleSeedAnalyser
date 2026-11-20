@@ -15,15 +15,16 @@ from __future__ import annotations
 
 import copy
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFrame,
-                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QSpinBox,
-                               QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import (QAbstractButton, QAbstractSpinBox, QCheckBox, QComboBox, QDialog, QFrame,
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QSizePolicy,
+                               QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
 from condition_types import (CATEGORY_COLORS, CONDITION_TYPES, _build_octave_options)
 
 from . import icons, theme
+from .area_pad import AreaPad
 from .session_model import (IMPORTED_TYPES, NO_AREA, NO_INSTANCES, TYPE_INFO, new_condition,
                             type_color, type_icon, type_name)
 from .widgets import DecimalSpin, Segmented, body, hline, section_title
@@ -44,12 +45,6 @@ STRUCTURE_KEYS = {t["key"] for t in CONDITION_TYPES if t["category"] == "Structu
     {"stronghold", "fortress", "bastion", "end_city", "mineshaft", "desert_well"}
 
 
-def _swatch(color, size=12):
-    pm = QPixmap(size, size)
-    pm.fill(QColor(color))
-    return QIcon(pm)
-
-
 def _spin(lo=-30_000_000, hi=30_000_000, val=0, step=16, suffix=""):
     s = QSpinBox()
     s.setRange(lo, hi)
@@ -60,15 +55,212 @@ def _spin(lo=-30_000_000, hi=30_000_000, val=0, step=16, suffix=""):
     return s
 
 
+class _Scrub(QObject):
+    """(14/11) The label of a number is a handle: dragged sideways it changes
+    the value (4 pixels a step, Shift: 10 steps), as in design tools."""
+
+    def __init__(self, label, spin):
+        super().__init__(label)
+        self.label, self.spin = label, spin
+        self._x0 = None
+        self._v0 = 0
+        label.setCursor(Qt.CursorShape.SizeHorCursor)
+        label.installEventFilter(self)
+
+    def eventFilter(self, o, e):
+        t = e.type()
+        try:
+            if t == QEvent.Type.MouseButtonPress and e.button() == Qt.MouseButton.LeftButton \
+                    and self.spin.isEnabled():
+                self._x0, self._v0 = e.globalPosition().x(), self.spin.value()
+                return True
+            if t == QEvent.Type.MouseMove and self._x0 is not None:
+                k = 10 if e.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+                n = int((e.globalPosition().x() - self._x0) / 4.0)
+                self.spin.setValue(self._v0 + n * k * self.spin.singleStep())
+                return True
+            if t == QEvent.Type.MouseButtonRelease and self._x0 is not None:
+                self._x0 = None
+                return True
+        except RuntimeError:
+            self._x0 = None
+        return False
+
+
 def _field(label, w, tip=None):
     row = QHBoxLayout(); row.setSpacing(8)
     lab = body(label, wrap=False)
     lab.setMinimumWidth(118)
     row.addWidget(lab)
     row.addWidget(w, 1)
-    if tip:
-        lab.setToolTip(tip); w.setToolTip(tip)
+    if tip:                                  # (19/11) on the field only, not twice
+        w.setToolTip(tip)
+    if isinstance(w, QAbstractSpinBox) and label:
+        _Scrub(lab, w)                       # (its ↔ cursor says the label can be dragged)
     return row
+
+
+class _OctaveCell(QCheckBox):
+    """(14/11) An octave of a climate noise as a cell: its wave (the higher the
+    octave, the finer the detail) and its name; lit when it counts. Still a
+    QCheckBox for the form."""
+
+    def __init__(self, slot):
+        super().__init__(slot)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def sizeHint(self):
+        return QSize(52, 42)
+
+    def minimumSizeHint(self):
+        return QSize(40, 42)
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+    def enterEvent(self, e):
+        super().enterEvent(e)
+        self.update()
+
+    def leaveEvent(self, e):
+        super().leaveEvent(e)
+        self.update()
+
+    def paintEvent(self, e):
+        import math
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        on, live = self.isChecked(), self.isEnabled()
+        if not live:
+            p.setOpacity(0.32)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        a = theme.ACCENT
+        hov = self.underMouse() and live
+        p.setBrush(QColor(theme._mix(theme.field_bg(), a, 0.26 if on else 0.05 if hov else 0.0)))
+        p.setPen(QPen(QColor(theme._mix(theme.LINE2 if hov else theme.LINE, a, 0.75 if on else 0.0)), 1))
+        p.drawRoundedRect(r, 8, 8)
+        try:
+            k = int(self.text()[0])
+        except (ValueError, IndexError):
+            k = 0
+        cycles = 0.75 * (1.55 ** k)              # octave 0: one slow wave … octave 5: fine ripples
+        phase = 0.0 if self.text().endswith("A") else math.pi / 2
+        x0, x1, yc, amp = r.left() + 7, r.right() - 7, r.top() + 13, 5.0
+        pts = [QPointF(x0 + (x1 - x0) * i / 40.0,
+                       yc - amp * math.sin(phase + 2 * math.pi * cycles * i / 40.0)) for i in range(41)]
+        pen = QPen(QColor(a if on else theme.TEXT3), 1.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawPolyline(pts)
+        f = QFont(self.font())
+        f.setPointSizeF(8.0)
+        f.setWeight(QFont.Weight.Bold if on else QFont.Weight.Medium)
+        p.setFont(f)
+        p.setPen(QColor(theme.TEXT if on else theme.TEXT3))
+        p.drawText(QRectF(r.left(), r.bottom() - 17, r.width(), 15), Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+class _AreaMode(QObject):
+    """Which of the three ways gives the area: "Radius" / "Square" / "Box" (the
+    names the form has always used; Segmented's value() / set_value() / changed)."""
+    changed = Signal(str)
+
+    def __init__(self, modes, current, parent=None):
+        super().__init__(parent)
+        self.modes = list(modes)
+        self._v = current if current in self.modes else self.modes[0]
+
+    def value(self) -> str:
+        return self._v
+
+    def set_value(self, v: str):               # silent, as Segmented's
+        if v in self.modes:
+            self._v = v
+
+    def choose(self, v: str):
+        if v in self.modes and v != self._v:
+            self._v = v
+            self.changed.emit(v)
+
+
+class _RadioDot(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.on = False
+        self.setFixedSize(16, 16)
+
+    def set_on(self, on):
+        self.on = bool(on)
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        a = QColor(theme.ACCENT)
+        p.setPen(QPen(a if self.on else QColor(theme.TEXT3), 1.5))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QRectF(2, 2, 12, 12))
+        if self.on:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(a)
+            p.drawEllipse(QRectF(5, 5, 6, 6))
+
+
+class _ModeRow(QFrame):
+    """One of the ways to give the area, as a line (Cubiomes Viewer's three lines,
+    in its order). The line of the current mode is lit and its fields live; a
+    click anywhere on another line chooses that one."""
+
+    def __init__(self, mode, label, area):
+        super().__init__()
+        self.setObjectName("AreaRow")
+        self.mode, self.area = mode, area
+        self.v = QVBoxLayout(self); self.v.setContentsMargins(9, 5, 7, 5); self.v.setSpacing(5)
+        self.top = QHBoxLayout(); self.top.setSpacing(8)
+        self.radio = _RadioDot(); self.radio.setVisible(len(area.modes) > 1)
+        self.lab = body(label, wrap=False)
+        self.top.addWidget(self.radio); self.top.addWidget(self.lab); self.top.addStretch(1)
+        self.v.addLayout(self.top)
+        self.fields = []
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def add(self, w):
+        self.top.addWidget(w); self.fields.append(w)
+
+    def set_active(self, on):
+        self.setProperty("active", bool(on))
+        self.radio.set_on(on)
+        for w in self.fields:
+            w.setEnabled(bool(on))
+        self.setCursor(Qt.CursorShape.ArrowCursor if on else Qt.CursorShape.PointingHandCursor)
+        self.style().unpolish(self); self.style().polish(self)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.area.choose(self.mode)
+        super().mousePressEvent(e)
+
+
+def _type_tile(t, size=38, isz=22):
+    """The type's icon on a tile of its colour (a dot when it has no icon)"""
+    dpr = 2.0
+    pm = QPixmap(int(size * dpr), int(size * dpr)); pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    c = QColor(type_color(t)); bg = QColor(c); bg.setAlphaF(0.17)
+    p.setPen(Qt.PenStyle.NoPen); p.setBrush(bg)
+    p.drawRoundedRect(QRectF(0, 0, size, size), size * 0.28, size * 0.28)
+    ic = type_icon(t, isz)
+    o = (size - isz) / 2
+    if ic is not None:
+        src = ic.pixmap(isz * 2, isz * 2)
+        p.drawPixmap(QRectF(o, o, isz, isz), src, QRectF(src.rect()))
+    else:
+        p.setBrush(c); p.drawEllipse(QRectF(size / 2 - 6, size / 2 - 6, 12, 12))
+    p.end()
+    return pm
 
 
 class _SegChoice(Segmented):
@@ -86,40 +278,110 @@ class _SegChoice(Segmented):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-class _Card(QFrame):
-    """A clickable family card: icon, name, number of conditions."""
-    clicked = Signal()
+FAMILY_COLORS = {"Structures": CATEGORY_COLORS["Structures"], "Nether": CATEGORY_COLORS["Nether"],
+                 "End": CATEGORY_COLORS["End"], "Biomes": CATEGORY_COLORS["Biomes"], "Climate": "#5fb3ff",
+                 "Algorithm helpers": "#b8c0d4", "Presets": "#f5b83d", "Others": CATEGORY_COLORS["World"]}
 
-    def __init__(self, icon, name, n, parent=None):
+
+class _PickTile(QAbstractButton):
+    """(14/11) A tile of the « Add a condition » panel: a family (big: its name
+    and how many conditions) or one condition, on its colour. Under the mouse
+    the tile takes its colour."""
+
+    def __init__(self, icon, color, name, sub="", big=False, parent=None):
         super().__init__(parent)
-        self.setObjectName("FamilyCard")
+        self.icon_, self.color, self.name, self.sub, self.big = icon, QColor(color), name, sub, big
+        self._hv = 0.0
+        self._an = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(46)
-        h = QHBoxLayout(self); h.setContentsMargins(12, 0, 12, 0); h.setSpacing(12)
-        ic = QLabel(); ic.setPixmap(icon.pixmap(24, 24)); h.addWidget(ic)
-        t = QLabel(name); f = t.font(); f.setBold(True); f.setPointSizeF(f.pointSizeF() * 1.05)
-        t.setFont(f); h.addWidget(t, 1)
-        c = QLabel(str(n)); c.setObjectName("Muted"); h.addWidget(c)
-        ch = QLabel("›"); ch.setObjectName("Muted"); h.addWidget(ch)
-        self._style(False)
+        self.setFixedHeight(72 if big else 50)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(120)
 
-    def _style(self, hover):
-        self.setStyleSheet(
-            f"QFrame#FamilyCard {{ background: {theme.BG2}; border-radius: 8px;"
-            f" border: 1px solid {theme.ACCENT if hover else theme.LINE2}; }}"
-            f"QFrame#FamilyCard QLabel {{ background: transparent; border: none; color: {theme.TEXT}; }}"
-            f"QFrame#FamilyCard QLabel#Muted {{ color: {theme.TEXT3}; }}")
+    def _glide(self, to):
+        from . import motion
+        if self._an is not None:
+            try:
+                self._an.stop()
+            except RuntimeError:
+                pass
+            self._an = None
+        if not motion.enabled():
+            self._hv = to
+            self.update()
+            return
+        h0 = self._hv
+
+        def step(t):
+            self._hv = h0 + (to - h0) * t
+            self.update()
+        self._an = motion.run(self, 140, step)
 
     def enterEvent(self, e):
-        self._style(True); super().enterEvent(e)
+        super().enterEvent(e)
+        self._glide(1.0)
 
     def leaveEvent(self, e):
-        self._style(False); super().leaveEvent(e)
+        super().leaveEvent(e)
+        self._glide(0.0)
 
-    def mouseReleaseEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
-            self.clicked.emit()
-        super().mouseReleaseEvent(e)
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        h = max(self._hv, 1.0 if self.hasFocus() else 0.0)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        c = self.color.name()
+        p.setBrush(QColor(theme._mix(theme.BG2, c, 0.04 + 0.11 * h)))
+        p.setPen(QPen(QColor(theme._mix(theme.LINE2, c, 0.10 + 0.62 * h)), 1))
+        p.drawRoundedRect(r, 12, 12)
+        ts = 42 if self.big else 30
+        tx, ty = 13 if self.big else 10, (self.height() - ts) / 2
+        bg = QColor(self.color)
+        bg.setAlphaF(0.17 + 0.10 * h)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(bg)
+        p.drawRoundedRect(QRectF(tx, ty, ts, ts), ts * 0.28, ts * 0.28)
+        isz = 24 if self.big else 18
+        if self.icon_ is not None:
+            src = self.icon_.pixmap(isz * 2, isz * 2)
+            p.drawPixmap(QRectF(tx + (ts - isz) / 2, ty + (ts - isz) / 2, isz, isz), src, QRectF(src.rect()))
+        else:
+            p.setBrush(self.color)
+            p.drawEllipse(QRectF(tx + ts / 2 - 5, ty + ts / 2 - 5, 10, 10))
+        x = tx + ts + (12 if self.big else 9)
+        f = QFont(self.font())
+        f.setWeight(QFont.Weight.DemiBold)
+        f.setPointSizeF(10.0 if self.big else 9.25)
+        p.setFont(f)
+        p.setPen(QColor(theme.TEXT))
+        if self.big:
+            while p.fontMetrics().horizontalAdvance(self.name) > r.right() - x - 6 and f.pointSizeF() > 8.6:
+                f.setPointSizeF(f.pointSizeF() - 0.25)       # a long family name is set a little smaller
+                p.setFont(f)
+            fm = p.fontMetrics()
+            p.drawText(QRectF(x, ty + 1, r.right() - x - 6, fm.height()),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       fm.elidedText(self.name, Qt.TextElideMode.ElideRight, int(r.right() - x - 6)))
+            f2 = QFont(self.font())
+            f2.setPointSizeF(8.25)
+            p.setFont(f2)
+            p.setPen(QColor(theme._mix(theme.TEXT3, c, 0.25 + 0.45 * h)))
+            p.drawText(QRectF(x, ty + ts - p.fontMetrics().height() - 1, r.right() - x - 26,
+                              p.fontMetrics().height()),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.sub)
+            arrow = QColor(c)                   # the arrow comes with the mouse
+            arrow.setAlphaF(h)
+            pen = QPen(arrow, 1.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            ax, ay = r.right() - 15 + 3.0 * h, ty + ts - 8
+            p.drawPolyline([QPointF(ax - 3, ay - 4.5), QPointF(ax + 1.5, ay), QPointF(ax - 3, ay + 4.5)])
+        else:
+            p.drawText(QRectF(x, 3, r.right() - x - 6, self.height() - 6),
+                       int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter) |
+                       int(Qt.TextFlag.TextWordWrap), self.name)
 
 
 class TypePicker(QWidget):
@@ -142,11 +404,21 @@ class TypePicker(QWidget):
                           "lavalake_spawn116_preset", "elytra_spawn_preset"], "spawn"),
               ("Others", None, "slime")]
 
+    # (15/11) the structures in a logical order: the common land ones first (the
+    # village was among the last), then the sea, underground, the rare ones and the
+    # 1.16 features (any structure not listed: after, in its usual order)
+    STRUCT_ORDER = ["village", "first_stronghold", "desert_pyramid", "jungle_temple", "igloo", "hut",
+                    "outpost", "mansion", "abandoned_camp", "monument", "shipwreck", "ocean_ruin",
+                    "treasure", "ruined_portal", "mineshaft", "ancient_city", "trial_chambers",
+                    "trail_ruins", "desert_well", "dungeon", "lava_lake"]
+
     @classmethod
     def _members(cls, keys):
         live = [t for t in CONDITION_TYPES if not t.get("disabled")]
         if keys == "structures":
-            return [t for t in live if t["category"] == "Structures"]
+            ts = [t for t in live if t["category"] == "Structures"]
+            pos = {k: i for i, k in enumerate(cls.STRUCT_ORDER)}
+            return sorted(ts, key=lambda t: (pos.get(t["key"], len(pos)), ts.index(t)))
         if keys is not None:
             by = {t["key"]: t for t in live}
             return [by[k] for k in keys if k in by]
@@ -156,7 +428,7 @@ class TypePicker(QWidget):
 
     def __init__(self, mc_ok=None, parent=None):
         super().__init__(parent)
-        from PySide6.QtWidgets import QStackedWidget
+        from .motion import FadeStack
         v = QVBoxLayout(self); v.setContentsMargins(14, 12, 14, 12); v.setSpacing(8)
         top = QHBoxLayout()
         self.back = QToolButton(); icons.bind(self.back, "chevron-left", 16)
@@ -171,20 +443,22 @@ class TypePicker(QWidget):
         self.search = QLineEdit(); self.search.setPlaceholderText("Search a condition…")
         self.search.textChanged.connect(self._filter)
         v.addWidget(self.search)
-        self.stack = QStackedWidget()
+        self.stack = FadeStack(slide=16, ms=190)        # (14/11) families ↔ conditions glide
         v.addWidget(self.stack, 1)
-        home = QWidget(); hl = QVBoxLayout(home); hl.setContentsMargins(0, 4, 0, 0); hl.setSpacing(8)
+        home = QWidget(); hl = QGridLayout(home); hl.setContentsMargins(0, 4, 0, 0); hl.setSpacing(8)
         self.pages = {}
+        i = 0
         for name, keys, ikey in self.GROUPS:
             types = self._members(keys)
             if not types:
                 continue
-            icn = type_icon(ikey, 24) or _swatch(type_color(types[0]["key"]), 18)
-            card = _Card(icn, name, len(types))
-            card.clicked.connect(lambda g=name: self._open(g))
-            hl.addWidget(card)
+            card = _PickTile(type_icon(ikey, 24), FAMILY_COLORS.get(name, "#9aa3b8"), name,
+                             f"{len(types)} conditions", big=True)
+            card.clicked.connect(lambda _=False, g=name: self._open(g))
+            hl.addWidget(card, i // 2, i % 2)
+            i += 1
             self.pages[name] = self._type_page(types)
-        hl.addStretch(1)
+        hl.setRowStretch(i // 2 + 1, 1)
         self.stack.addWidget(home)
         self.home = home
         for pg in self.pages.values():
@@ -199,12 +473,12 @@ class TypePicker(QWidget):
         sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         inner = QWidget(); lay = QVBoxLayout(inner)
         lay.setContentsMargins(0, 4, 4, 4); lay.setSpacing(4)
-        sc.buttons = []
+        sc.groups = []                             # (title or None, grid, [(tile, search key)])
         groups = []
         if flat:                                   # search: grouped by family
+            have = {t["key"] for t in types}
             for name, keys, _i in self.GROUPS:
-                ks = {t["key"] for t in self._members(keys)}
-                groups.append((name, [t for t in types if t["key"] in ks]))
+                groups.append((name, [t for t in self._members(keys) if t["key"] in have]))
         else:
             groups.append((None, types))
         for gname, ts in groups:
@@ -213,16 +487,18 @@ class TypePicker(QWidget):
             h = None
             if gname:
                 h = section_title(gname); lay.addWidget(h)
-            for t in ts:
-                b = QPushButton("  " + t["name"]); b.setObjectName("TypeButton")
-                b.setIcon(type_icon(t["key"], 18) or _swatch(type_color(t["key"]), 10))
-                b.setIconSize(QSize(18, 18))
-                b.setToolTip(t.get("desc") or t["name"])
-                b.setCursor(Qt.CursorShape.PointingHandCursor)
+            grid = QGridLayout(); grid.setContentsMargins(0, 0, 0, 0); grid.setSpacing(6)
+            grid.setColumnStretch(0, 1); grid.setColumnStretch(1, 1)
+            tiles = []
+            for i, t in enumerate(ts):
+                b = _PickTile(type_icon(t["key"], 18), type_color(t["key"]), t["name"])
+                if t.get("desc"):                  # (15/11) no tooltip repeating the name
+                    b.setToolTip(t["desc"])
                 b.clicked.connect(lambda _=False, k=t["key"]: self.chosen.emit(k))
-                lay.addWidget(b)
-                sc.buttons.append((b, t["name"].lower() + " " + t["key"] + " "
-                                   + (gname or "").lower(), h))
+                grid.addWidget(b, i // 2, i % 2)
+                tiles.append((b, t["name"].lower() + " " + t["key"] + " " + (gname or "").lower()))
+            lay.addLayout(grid)
+            sc.groups.append((h, grid, tiles))
             lay.addSpacing(6)
         lay.addStretch(1)
         sc.setWidget(inner)
@@ -243,14 +519,15 @@ class TypePicker(QWidget):
         if not q:
             self._home()
             return
-        heads = {}
-        for b, key, h in self.results.buttons:
-            on = q in key
-            b.setVisible(on)
+        for h, grid, tiles in self.results.groups:
+            shown = [b for b, key in tiles if q in key]
+            for b, _key in tiles:                  # the matching tiles, packed two by two
+                grid.removeWidget(b)
+                b.setVisible(b in shown)
+            for i, b in enumerate(shown):
+                grid.addWidget(b, i // 2, i % 2)
             if h is not None:
-                heads[h] = heads.get(h, False) or on
-        for h, on in heads.items():
-            h.setVisible(on)
+                h.setVisible(bool(shown))
         self.stack.setCurrentWidget(self.results)
         self.title.setText("Search")
         self.back.setVisible(True)
@@ -452,12 +729,14 @@ class ConditionForm(QWidget):
         # header
         hdr = QFrame(); hdr.setObjectName("FormHeader")
         hl = QHBoxLayout(hdr); hl.setContentsMargins(14, 12, 10, 10); hl.setSpacing(8)
-        self.dot = QLabel(); self.dot.setFixedSize(12, 12)
+        self.dot = QLabel(); self.dot.setFixedSize(38, 38)
         hl.addWidget(self.dot)
         col = QVBoxLayout(); col.setSpacing(0)
         self.title = QLabel(); self.title.setObjectName("PanelTitle")
-        self.subtitle = QLabel(); self.subtitle.setObjectName("Muted")
-        col.addWidget(self.title); col.addWidget(self.subtitle)
+        self.cat = QLabel(); self.cat.setObjectName("FormCat")               # the category, then the type
+        self.subtitle = QLabel(); self.subtitle.setObjectName("Muted")       # a note (several conditions edited)
+        self.subtitle.setVisible(False)
+        col.addWidget(self.cat); col.addWidget(self.title); col.addWidget(self.subtitle)
         hl.addLayout(col, 1)
         self.change_btn = QPushButton("Change type"); self.change_btn.setProperty("kind", "ghost")
         self.change_btn.clicked.connect(self.changeTypeRequested.emit)
@@ -474,9 +753,10 @@ class ConditionForm(QWidget):
         self.err = QLabel(); self.err.setObjectName("Error"); self.err.setWordWrap(True)
         foot.addWidget(self.err, 1)
         cancel = QPushButton("Cancel"); cancel.clicked.connect(self.cancelled.emit)
-        self.ok = QPushButton("Save"); self.ok.setProperty("kind", "primary")
+        self.ok = QPushButton("OK"); self.ok.setProperty("kind", "primary")
+        self.ok.setMinimumWidth(84)
         self.ok.clicked.connect(self._save)
-        foot.addWidget(cancel); foot.addWidget(self.ok)
+        foot.addWidget(self.ok); foot.addWidget(cancel)
         v.addLayout(foot)
 
     # ── building ────────────────────────────────────────────────────────────
@@ -501,48 +781,28 @@ class ConditionForm(QWidget):
     def _build(self):
         self._building = True
         self._range_bars = []
+        self._bands = []
         c = self.cond
         t = c.get("type", "")
         info = TYPE_INFO.get(t, {})
-        ic = type_icon(t, 22)
-        if ic is not None:
-            self.dot.setFixedSize(22, 22); self.dot.setStyleSheet("")
-            self.dot.setPixmap(ic.pixmap(22, 22))
-        else:
-            self.dot.setFixedSize(12, 12); self.dot.clear()
-            self.dot.setStyleSheet(f"background:{type_color(t)}; border-radius:6px;")
+        self.pad = None
+        self.dot.setPixmap(_type_tile(t))
         self.title.setText(type_name(t))
-        self.subtitle.setText(info.get("category", "Imported") +
-                              (f" · relative to {self.parent_label}" if self.parent_label
-                               else " · relative to the world origin"))
+        cat = info.get("category", "Imported")
+        self.cat.setText(cat.upper())
+        self.cat.setStyleSheet(f"color: {CATEGORY_COLORS.get(cat, theme.TEXT3)}; font-size: 7.5pt; "
+                               "font-weight: 700; letter-spacing: 1.2px;")
+        self.subtitle.clear(); self.subtitle.setVisible(False)
         self.change_btn.setVisible(t in TYPE_INFO)
         self.err.clear()
         w = QWidget(); lay = QVBoxLayout(w)
         lay.setContentsMargins(14, 10, 14, 14); lay.setSpacing(8)
         self.w = {}
         self.pw = {}
+        has_area = t not in NO_AREA and not info.get("no_area")
 
-        # General
-        lay.addWidget(section_title("General"))
-        self.w["label"] = QLineEdit(c.get("label", "")); self.w["label"].setPlaceholderText(type_name(t))
-        self.w["label"].textChanged.connect(self._changed)
-        lay.addLayout(_field("Label", self.w["label"]))
-        self.w["enabled"] = QCheckBox("Enabled"); self.w["enabled"].setChecked(c.get("enabled", True))
-        self.w["enabled"].toggled.connect(self._changed)
-        lay.addWidget(self.w["enabled"])
-        if self.parent_choices is not None:
-            from PySide6.QtWidgets import QComboBox as _QCB
-            pc = _QCB()
-            pc.addItem("World origin (0, 0)", 0)
-            for u, lab in self.parent_choices:
-                pc.addItem(lab, int(u))
-            i = pc.findData(self.parent_uid)
-            pc.setCurrentIndex(i if i >= 0 else 0)
-            pc.setToolTip("The condition this one is placed around (its area is centred on\n"
-                          "where that condition is satisfied), or the world origin.")
-            pc.currentIndexChanged.connect(self._parent_changed)
-            self.w["parent"] = pc
-            lay.addLayout(_field("Related to", pc))
+        # (14/11) Cubiomes Viewer's order: the type and its notes, General, Location,
+        # the type's own block, OK / Cancel
         if info.get("desc"):
             lay.addWidget(body(info["desc"], muted=True, small=True))
         dim_hint = self._dim_hint(c)
@@ -559,8 +819,19 @@ class ConditionForm(QWidget):
                                "kept as they are; the area and label can be edited here.",
                                muted=True, small=True))
 
+        # General
+        lay.addSpacing(2); lay.addWidget(section_title("General"))
+        self.w["label"] = QLineEdit(c.get("label", "")); self.w["label"].setPlaceholderText(type_name(t))
+        self.w["label"].textChanged.connect(self._changed)
+        lay.addLayout(_field("Label", self.w["label"]))
+        self.w["enabled"] = QCheckBox("Condition enabled"); self.w["enabled"].setChecked(c.get("enabled", True))
+        self.w["enabled"].toggled.connect(self._changed)
+        lay.addWidget(self.w["enabled"])
+        if not has_area:                       # no Location block: what it is placed around goes here
+            self._build_parent(lay, "Relative to")
+
         # Location
-        if t not in NO_AREA and not info.get("no_area"):   # (whole world: nothing to set)
+        if has_area:                           # (whole world: nothing to set)
             lay.addSpacing(4); lay.addWidget(section_title("Location"))
             self._build_location(lay, c, info)
 
@@ -616,34 +887,83 @@ class ConditionForm(QWidget):
         cur = {0: "Radius", 1: "Square", 2: "Box"}.get(am, "Radius")
         if cur not in modes:
             cur = modes[0]
-        self.w["area"] = Segmented(modes, cur)
+        self.w["area"] = _AreaMode(modes, cur, self)
         self.w["area"].changed.connect(self._area_mode_changed)
-        if len(modes) > 1:
-            lay.addWidget(self.w["area"])
+
+        # (14/11) the area drawn to scale around its reference, shaped by hand
+        ic = type_icon(t, 15)
+        self.pad = AreaPad(type_color(t), ic.pixmap(30, 30) if ic is not None else None)
+        self.pad.radiusChanged.connect(lambda v: self.w["radius"].setValue(v))
+        self.pad.squareChanged.connect(lambda v: self.w["square"].setValue(v))
+        self.pad.boxChanged.connect(self._pad_box)
+        lay.addWidget(self.pad)
+
+        # Instances within area  (+ Ignore reference)
+        ignore = t in STRUCTURE_KEYS and bool(self.parent_label)
+        if t not in NO_INSTANCES or ignore:
+            row = QHBoxLayout(); row.setSpacing(8)
+            if t not in NO_INSTANCES:
+                tip = ("Minimum number of instances inside the area.\n"
+                       "0 = exclusion: NO instance may be inside the area.")
+                self.w["instances"] = _spin(0, 1024, int(c.get("instances", 1)), 1)
+                self.w["instances"].setFixedWidth(74)
+                lab = body("Instances within area", wrap=False)
+                lab.setToolTip(tip); self.w["instances"].setToolTip(tip)
+                row.addWidget(lab); row.addWidget(self.w["instances"])
+                self.w["instances"].valueChanged.connect(self._changed)
+            row.addStretch(1)
+            if ignore:
+                self.w["ignore_ref"] = QCheckBox("Ignore reference")
+                self.w["ignore_ref"].setToolTip(
+                    "The parent's own instance is not counted: ticked, it asks for ANOTHER one\n"
+                    "('another village near this village'). Unticked, a condition linked to one\n"
+                    "of its own type is met by the parent itself (Cubiomes Viewer's default).\n"
+                    "Ticked by default when the parent is of the same type.")
+                self.w["ignore_ref"].setChecked(bool(c.get("ignore_ref")))
+                self.w["ignore_ref"].toggled.connect(self._changed)
+                row.addWidget(self.w["ignore_ref"])
+            lay.addLayout(row)
+
+        # Within radial distance · Within centred square of side · Custom
         r = int(c.get("radial", 0) or 0)
         if not r and int(c.get("rmax", 0) or 0) > 0:
             r = int(c["rmax"]) - 1
         self.w["radius"] = _spin(0, 30_000_000, r, 16, " blocks")
         self.w["square"] = _spin(0, 60_000_000, int(c.get("square_side", 0) or
                                                     (c.get("x2", 0) - c.get("x1", 0))), 16, " blocks")
-        box = QWidget(); g = QGridLayout(box); g.setContentsMargins(0, 0, 0, 0)
-        g.setHorizontalSpacing(6); g.setVerticalSpacing(4)
-        box.setToolTip("Two opposite corners of the box, in any order.")
-        for i, k in enumerate(("x1", "z1", "x2", "z2")):
+        for k in ("x1", "z1", "x2", "z2"):
             self.w[k] = _spin(val=int(c.get(k, 0)))
-            g.addWidget(body(k.upper(), muted=True, wrap=False), i // 2, (i % 2) * 2)
-            g.addWidget(self.w[k], i // 2, (i % 2) * 2 + 1)
-        self.w["box"] = box
         self._rows = {}
-        for key, label, wid in (("radius", "Radius", self.w["radius"]),
-                                ("square", "Square side", self.w["square"])):
-            holder = QWidget(); hl = QHBoxLayout(holder); hl.setContentsMargins(0, 0, 0, 0)
-            hl.addLayout(_field(label, wid))
-            self._rows[key] = holder; lay.addWidget(holder)
-            wid.valueChanged.connect(self._changed)
-        self._rows["box"] = box; lay.addWidget(box)
+        rows = QVBoxLayout(); rows.setSpacing(3)
+        for key, mode, label in (("radius", "Radius", "Within radial distance"),
+                                 ("square", "Square", "Within centred square of side")):
+            self.w[key].setFixedWidth(128)
+            self.w[key].valueChanged.connect(self._changed)
+            if mode in modes:
+                mr = _ModeRow(mode, label, self.w["area"])
+                mr.add(self.w[key])
+                self._rows[key] = mr; rows.addWidget(mr)
+        if "Box" in modes:
+            mr = _ModeRow("Box", "Custom", self.w["area"])
+            vis = QPushButton("From visible"); vis.setProperty("kind", "ghost")
+            vis.setToolTip("Use the part of the map that is on screen as the box.")
+            vis.clicked.connect(lambda: self.pickRequested.emit("visible"))
+            mr.top.addWidget(vis)                # stays live: it also chooses « Custom »
+            g = QGridLayout(); g.setContentsMargins(24, 0, 0, 2)
+            g.setHorizontalSpacing(6); g.setVerticalSpacing(4)
+            for i, k in enumerate(("x1", "z1", "x2", "z2")):
+                kl = body(k.upper(), muted=True, wrap=False)
+                g.addWidget(kl, i // 2, (i % 2) * 2)
+                g.addWidget(self.w[k], i // 2, (i % 2) * 2 + 1)
+                mr.fields += [kl, self.w[k]]
+            g.setColumnStretch(1, 1); g.setColumnStretch(3, 1)
+            mr.v.addLayout(g)
+            mr.setToolTip("Two opposite corners of the box, in any order.")
+            self._rows["box"] = mr; rows.addWidget(mr)
+            self.w["box"] = mr
         for k in ("x1", "z1", "x2", "z2"):
             self.w[k].valueChanged.connect(self._changed)
+        lay.addLayout(rows)
         if info.get("requires_at"):
             at = QWidget(); al = QHBoxLayout(at); al.setContentsMargins(0, 0, 0, 0); al.setSpacing(6)
             self.w["at_x"] = _spin(val=int(c.get("at_x", 0))); self.w["at_z"] = _spin(val=int(c.get("at_z", 0)))
@@ -663,23 +983,7 @@ class ConditionForm(QWidget):
         draw.clicked.connect(lambda: self.pickRequested.emit(
             "circle" if self.w["area"].value() == "Radius" else "rect"))
         lay.addWidget(draw)
-        if t not in NO_INSTANCES:
-            self.w["instances"] = _spin(0, 1024, int(c.get("instances", 1)), 1)
-            lay.addLayout(_field("Instances", self.w["instances"],
-                                 "Minimum number of instances inside the area.\n"
-                                 "0 = exclusion: NO instance may be inside the area."))
-            self.w["instances"].valueChanged.connect(self._changed)
         self._build_dy(lay, c)
-        if t in STRUCTURE_KEYS and self.parent_label:
-            self.w["ignore_ref"] = QCheckBox("Ignore the reference structure itself")
-            self.w["ignore_ref"].setToolTip(
-                "The parent's own instance is not counted: ticked, it asks for ANOTHER one\n"
-                "('another village near this village'). Unticked, a condition linked to one\n"
-                "of its own type is met by the parent itself (Cubiomes Viewer's default).\n"
-                "Ticked by default when the parent is of the same type.")
-            self.w["ignore_ref"].setChecked(bool(c.get("ignore_ref")))
-            self.w["ignore_ref"].toggled.connect(self._changed)
-            lay.addWidget(self.w["ignore_ref"])
         if t == "precise_y":
             p = c.get("params", {})
             self.w["coverage"] = DecimalSpin(2); self.w["coverage"].setRange(0, 100)
@@ -696,7 +1000,51 @@ class ConditionForm(QWidget):
             for k in ("coverage", "confidence"):
                 self.w[k].valueChanged.connect(self._changed)
             self.w["sampling"].currentTextChanged.connect(self._changed)
+        self._build_parent(lay, "Location is relative to")
         self._area_mode_changed(self.w["area"].value(), emit=False)
+
+    def _build_parent(self, lay, label):
+        """What the condition is placed around: another condition or the world origin"""
+        if self.parent_choices is None:
+            return
+        pc = QComboBox()
+        pc.addItem("World origin (0, 0)", 0)
+        for u, lab in self.parent_choices:
+            pc.addItem(lab, int(u))
+        i = pc.findData(self.parent_uid)
+        pc.setCurrentIndex(i if i >= 0 else 0)
+        pc.setToolTip("The condition this one is placed around (its area is centred on\n"
+                      "where that condition is satisfied), or the world origin.")
+        pc.currentIndexChanged.connect(self._parent_changed)
+        self.w["parent"] = pc
+        if len(label) > 14:                    # the long label sits above its list
+            lay.addWidget(body(label, wrap=False))
+            lay.addWidget(pc)
+        else:
+            lay.addLayout(_field(label, pc))
+
+    def _pad_box(self, x1, z1, x2, z2):
+        was, self._building = self._building, True
+        try:
+            for k, v in (("x1", x1), ("z1", z1), ("x2", x2), ("z2", z2)):
+                self.w[k].setValue(v)
+        finally:
+            self._building = was
+        self._changed()
+
+    def _sync_pad(self):
+        pad = getattr(self, "pad", None)
+        if pad is None or "area" not in self.w:
+            return
+        ref = self.parent_label or "0, 0"
+        if "at_x" in self.w and not self.parent_label:
+            ref = f"{self.w['at_x'].value()}, {self.w['at_z'].value()}"
+        try:
+            pad.set_state(self.w["area"].value(), self.w["radius"].value(), self.w["square"].value(),
+                          tuple(self.w[k].value() for k in ("x1", "z1", "x2", "z2")),
+                          self.w["instances"].value() if "instances" in self.w else None, ref)
+        except RuntimeError:
+            pass
 
     def _same_type_parent(self):
         """(10/10) Linked to a condition of its OWN type ("village near a
@@ -768,8 +1116,9 @@ class ConditionForm(QWidget):
         self.w["dy_on"], self.w["dy_max"] = cb, sp
 
     def _area_mode_changed(self, mode, emit=True):
-        for k, row in self._rows.items():
-            row.setVisible({"Radius": "radius", "Square": "square", "Box": "box"}[mode] == k)
+        for k, row in self._rows.items():      # the three lines stay, the current one is lit
+            row.set_active({"Radius": "radius", "Square": "square", "Box": "box"}[mode] == k)
+        self._sync_pad()
         if emit:
             self._changed()
 
@@ -793,7 +1142,6 @@ class ConditionForm(QWidget):
             "from it, e.g. a village within 200 blocks of the portal. Exact; linked conditions\n"
             "are a little slower to search.")
         sh["anchor"].changed.connect(lambda _v: self._changed())
-        lay.addLayout(_field("Position", sh["anchor"]))
         # which strongholds
         _sc = str(p.get("sh_scope", ""))
         scope = ("All 128" if (_sc == "All 128" or (not _sc and p.get("scan_128")))
@@ -806,7 +1154,21 @@ class ConditionForm(QWidget):
             "to 0, 0): about 3× slower.")
         sh["scope"].buttons["All 128"].setToolTip(
             "The filters must pass on at least one of the 128 strongholds (the slowest).")
-        lay.addLayout(_field("Strongholds", sh["scope"]))
+        # (14/11 bis) both chosen on a picture: the rings of the 128 strongholds (which ones) and
+        # the stronghold itself (where the position is taken). The two controls above stay the
+        # truth, hidden; the scene only drives them.
+        from .param_visuals import ShScene, SwitchCard
+        scene = sh["scene"] = ShScene(sh["scope"].value(), sh["anchor"].value())
+        for seg in (sh["anchor"], sh["scope"]):
+            seg.setParent(scene); seg.hide()
+
+        def _scene_pick(seg, v, scene=scene, sh=sh):
+            seg.set_value(v)
+            scene.set_state(sh["scope"].value(), sh["anchor"].value())
+            seg.changed.emit(v)
+        scene.scopeChosen.connect(lambda v: _scene_pick(sh["scope"], v))
+        scene.anchorChosen.connect(lambda v: _scene_pick(sh["anchor"], v))
+        lay.addWidget(scene)
         sh["sisters"] = QCheckBox("Hide sister seeds")
         sh["sisters"].setChecked(bool(p.get("hide_sisters", True)))
         sh["sisters"].setToolTip(
@@ -821,7 +1183,7 @@ class ConditionForm(QWidget):
             me = int(p.get("min_eyes", 0) or 0)
         except (TypeError, ValueError):
             me = 0
-        sh["eyes_on"] = QCheckBox("Eyes in the portal")
+        sh["eyes_on"] = SwitchCard("Eyes in the portal", "eye")
         sh["eyes_on"].setChecked(me > 0 or bool(p.get("eye_enabled")))
         lay.addWidget(sh["eyes_on"])
         box = QWidget(); bl = QVBoxLayout(box); bl.setContentsMargins(18, 0, 0, 0); bl.setSpacing(4)
@@ -848,7 +1210,7 @@ class ConditionForm(QWidget):
         lay.addWidget(box)
         # top Y: the same gauge as the Stronghold page
         from .stronghold_visuals import HeightGauge
-        sh["maxy_on"] = QCheckBox("Top Y")
+        sh["maxy_on"] = SwitchCard("Top Y", "height")
         sh["maxy_on"].setChecked(bool(p.get("maxy_enabled")))
         lay.addWidget(sh["maxy_on"])
         yb = QWidget(); yl = QVBoxLayout(yb); yl.setContentsMargins(18, 0, 0, 0); yl.setSpacing(4)
@@ -883,7 +1245,7 @@ class ConditionForm(QWidget):
         lay.addWidget(yb)
         # broken end portal: the same portal + causes as the Stronghold page
         from .stronghold_page import CAUSES, CauseChip
-        sh["corr"] = QCheckBox("Broken portal")
+        sh["corr"] = SwitchCard("Broken portal", "broken")
         sh["corr"].setChecked(bool(p.get("corrupt_enabled")))
         lay.addWidget(sh["corr"])
         cb_ = QWidget(); cl = QVBoxLayout(cb_); cl.setContentsMargins(18, 0, 0, 0); cl.setSpacing(4)
@@ -988,14 +1350,25 @@ class ConditionForm(QWidget):
                                       p.get("variant", "any"), "Any"))
         vg["variant"].buttons["Abandoned"].setToolTip("A zombie village (2 % of the villages): "
                                                       "zombie villagers, broken houses.")
-        lay.addLayout(_field("Abandoned", vg["variant"]))
+        # (14/11 bis) … as three pictures; the control above stays the truth, hidden
+        from .param_visuals import SwitchCard, VariantPicker
+        vp = vg["variant_pick"] = VariantPicker(vg["variant"].value())
+        vg["variant"].setParent(vp); vg["variant"].hide()
+
+        def _variant(v, vp=vp, vg=vg):
+            vg["variant"].set_value(v)
+            vp.set_value(v)
+            vg["variant"].changed.emit(v)
+        vp.chosen.connect(_variant)
+        lay.addWidget(vp)
 
         def _range_block(key, title, n, unit, tip):
             lo, hi = vf.bounds(p, key)
             head = QHBoxLayout(); head.setSpacing(8)
-            cb = QCheckBox(title); cb.setChecked(lo is not None or hi is not None)
+            cb = SwitchCard(title, "house" if key == "houses" else "forge")
+            cb.setChecked(lo is not None or hi is not None)
             cb.setToolTip(tip)
-            head.addWidget(cb); head.addStretch(1)
+            head.addWidget(cb, 1)
             rar = QLabel(""); rar.setObjectName("Muted")
             head.addWidget(rar)
             lay.addSpacing(6); lay.addLayout(head)
@@ -1140,7 +1513,8 @@ class ConditionForm(QWidget):
             "needed) made with the ruin's obsidian where it stands. Crying obsidian does not\n"
             "make a portal: it must be broken and replaced.")
         lay.addWidget(rp["frame"])
-        rp["comp"] = QCheckBox("Completable")
+        from .param_visuals import SwitchCard
+        rp["comp"] = SwitchCard("Completable", "portal")
         rp["comp"].setChecked(bool(p.get("completable")))
         rp["comp"].setToolTip(
             "Its chest holds enough obsidian to fill the frame's holes and replace its crying\n"
@@ -1151,7 +1525,7 @@ class ConditionForm(QWidget):
         # crying obsidian: a histogram with two handles, as the village's houses
         lo, hi = rpf.bounds(p, "crying")
         head = QHBoxLayout(); head.setSpacing(8)
-        rp["cry_on"] = QCheckBox("Crying obsidian in the frame")
+        rp["cry_on"] = SwitchCard("Crying obsidian in the frame", "tear")
         rp["cry_on"].setChecked(lo is not None or hi is not None)
         rp["cry_on"].setToolTip("How many crying obsidian blocks of the frame you would have to\n"
                                 "break (a diamond pickaxe) and replace.")
@@ -1298,9 +1672,11 @@ class ConditionForm(QWidget):
     def _build_params(self, lay, c, specs):
         p = c.get("params", {})
         self.pw = {}
+        late = []                              # (14/11) the biome palettes close the block, as in Cubiomes Viewer
         for key, spec in specs.items():
             typ = spec.get("type")
-            label = (spec.get("label") or key).strip()
+            label = (spec.get("label") or {"blocks_count": "Minimum block count",      # (14/11) not the raw key
+                                           "coverage_pct": "Required coverage"}.get(key) or key).strip()
             for emo in ("🔎", "📏", "💥"):
                 label = label.replace(emo, "").strip()
             val = p.get(key, spec.get("default"))
@@ -1376,9 +1752,43 @@ class ConditionForm(QWidget):
                     from PySide6.QtGui import QIntValidator
                     for e in (a, b):
                         e.setValidator(QIntValidator(0, 1000, e))
-                lay.addLayout(_field(label, box, spec.get("tip") or
-                                     "Empty = no bound. Values are ×10000 like "
-                                     "cubiomes-viewer (e.g. -4500)."))
+                par = self.pw.get("para")
+                if not spec.get("int") and par is not None and par[0] == "choice":
+                    # (14/11) the range on the parameter's own scale, cut in the game's bands;
+                    # the two fields stay the truth
+                    from .range_visuals import ClimateBand
+                    band = ClimateBand(str(par[1].currentData() or par[1].currentText()))
+
+                    def _num(e):
+                        s_ = e.text().strip().replace(",", ".").replace(" ", "")
+                        try:
+                            return int(round(float(s_))) if s_ else None
+                        except ValueError:
+                            return None
+
+                    def _from_band(lo_, hi_, a=a, b=b):
+                        for e, v in ((a, lo_), (b, hi_)):
+                            e.blockSignals(True); e.setText("" if v is None else str(int(v))); e.blockSignals(False)
+                        self._changed()
+
+                    def _to_band(_t=None, a=a, b=b, band=band):
+                        band.set_values(_num(a), _num(b))
+                    band.rangeChanged.connect(_from_band)
+                    for e in (a, b):
+                        e.textChanged.connect(_to_band)
+                    _to_band()
+                    band.setToolTip("")
+                    self._bands.append(band)
+                    self._range_bars = getattr(self, "_range_bars", []) + [band]
+                    lay.addWidget(body(label, wrap=False))
+                    lay.addWidget(band)
+                    box.setToolTip(spec.get("tip") or "Empty = no bound. Values are ×10000 like "
+                                                      "cubiomes-viewer (e.g. -4500).")
+                    lay.addWidget(box)
+                else:
+                    lay.addLayout(_field(label, box, spec.get("tip") or
+                                         "Empty = no bound. Values are ×10000 like "
+                                         "cubiomes-viewer (e.g. -4500)."))
             elif typ == "octave_choice":
                 wd = QComboBox()
                 wd.currentIndexChanged.connect(self._changed)
@@ -1387,12 +1797,22 @@ class ConditionForm(QWidget):
                 self._fill_octaves(key, p.get(spec.get("depends_on", "para")), val)
                 continue
             elif typ in ("biome_list", "biome_single"):
-                wd = QPushButton(); wd.setProperty("kind", "ghost")
-                wd.setProperty("value", val)
-                wd.clicked.connect(lambda _=False, k=key: self._pick_biomes(k))
-                lay.addLayout(_field(label, wd))
+                # (14/11) a palette in the form itself: a tile per biome in its map colour.
+                # Included and excluded biomes (Nether / End) share one palette.
+                from .biome_palette import BiomePalette
+                es = specs.get("biomes_excl") if key == "biomes_incl" else None
+                paired = bool(es) and es.get("type") == "biome_list"
+                if key == "biomes_excl" and specs.get("biomes_incl", {}).get("type") == "biome_list":
+                    continue                   # shown with the included ones
+                wd = BiomePalette(self.mc, int(spec.get("dim", 0) or 0), val,
+                                  excl=(p.get("biomes_excl", es.get("default")) or []) if paired else None,
+                                  single=(typ == "biome_single"), label=label)
+                wd.changed.connect(self._changed)
+                wd.searchRequested.connect(lambda k=key: self._pick_biomes(k))
+                late.append(wd)
                 self.pw[key] = (typ, wd, spec)
-                self._biome_text(key)
+                if paired:
+                    self.pw["biomes_excl"] = ("biome_list", wd.excl, es)
                 continue
             elif typ == "dual_height_slider":
                 # clamped: an imported cubiomes-viewer « Approx height » has no
@@ -1411,10 +1831,11 @@ class ConditionForm(QWidget):
                 hi = _y(p.get("y_max"), ymx)
                 # (08/10) a two-handle bar over the two fields, like
                 # cubiomes-viewer; "Outside range" paints the kept part outside
-                from .widgets import RangeSlider
+                # (14/11) … on a slice of the world (sky, sea level, stone, deepslate)
+                from .range_visuals import YColumn
                 box = QWidget(); bv = QVBoxLayout(box); bv.setContentsMargins(0, 0, 0, 0)
-                bv.setSpacing(2)
-                rs = RangeSlider(ymn, ymx, lo, hi)
+                bv.setSpacing(6)
+                rs = YColumn(ymn, ymx, lo, hi)
                 bl = QHBoxLayout(); bl.setContentsMargins(0, 0, 0, 0)
                 a = _spin(ymn, ymx, lo, 1); b = _spin(ymn, ymx, hi, 1)
 
@@ -1433,8 +1854,9 @@ class ConditionForm(QWidget):
                 bv.addWidget(rs); bv.addLayout(bl)
                 wd = (a, b)
                 self._range_bars = getattr(self, "_range_bars", []) + [rs]
-                lay.addLayout(_field(label, box, "Drag the two handles or type the bounds "
-                                                 f"({ymn} … {ymx})."))
+                box.setToolTip(f"Drag the two lines (or the band between them), or type the bounds ({ymn} … {ymx}).")
+                lay.addWidget(body(label, wrap=False))
+                lay.addWidget(box)
             elif typ == "spiral_step":
                 # any step in blocks (sessions use 437, 1 500 …): the old fixed list
                 # fell back to 1 for those and saving wrote step 1 (01/10)
@@ -1491,13 +1913,13 @@ class ConditionForm(QWidget):
                 lay.addWidget(body(label, wrap=False)); lay.addWidget(wd)
             elif typ == "octave_grid":
                 box = QWidget(); g = QGridLayout(box); g.setContentsMargins(0, 0, 0, 0)
-                g.setHorizontalSpacing(10); g.setVerticalSpacing(2)
+                g.setHorizontalSpacing(4); g.setVerticalSpacing(4)
                 wd = {}
                 cur = val or {}
                 for i in range(6):
                     for j, ab in enumerate("AB"):
                         slot = f"{i}{ab}"
-                        cb = QCheckBox(slot); cb.setChecked(bool(cur.get(slot)))
+                        cb = _OctaveCell(slot); cb.setChecked(bool(cur.get(slot)))
                         cb.toggled.connect(self._changed)
                         g.addWidget(cb, j, i); wd[slot] = cb
                 lay.addWidget(body(label, wrap=False)); lay.addWidget(box)
@@ -1518,6 +1940,8 @@ class ConditionForm(QWidget):
             else:
                 continue                                    # unknown widget type: value kept
             self.pw[key] = (typ, wd, spec)
+        for wd in late:
+            lay.addSpacing(2); lay.addWidget(wd)
         self._sync_enable()
 
     def _fill_octaves(self, key, para, current):
@@ -1532,6 +1956,9 @@ class ConditionForm(QWidget):
         wd.blockSignals(False)
 
     def _choice_changed(self, key):
+        if key == "para":                      # the range is shown on that parameter's scale
+            for band in getattr(self, "_bands", []):
+                band.set_param(str(self.pw[key][1].currentData() or self.pw[key][1].currentText()))
         # octave list depends on the climate parameter
         for k, (typ, wd, spec) in self.pw.items():
             if typ == "octave_choice" and spec.get("depends_on", "para") == key:
@@ -1561,8 +1988,11 @@ class ConditionForm(QWidget):
             v = dlg.value()
             if typ == "biome_single" and v is None:
                 return
-            wd.setProperty("value", v)
-            self._biome_text(key)
+            if hasattr(wd, "load"):            # the palette shows the chooser's answer
+                wd.load(v)
+            else:
+                wd.setProperty("value", v)
+                self._biome_text(key)
             self._changed()
 
     def _sync_enable(self):
@@ -1762,6 +2192,7 @@ class ConditionForm(QWidget):
     def _changed(self, *_):
         if self._building:
             return
+        self._sync_pad()
         self._sync_enable()
         self._preview_timer.start()
 
@@ -1772,7 +2203,17 @@ class ConditionForm(QWidget):
         except ValueError as e:
             self.err.setText(str(e))
             return
+        self._name_hint(c)
         self.preview.emit(c)
+
+    def _name_hint(self, c):
+        """(15/11) the empty Label field shows the name the condition will have"""
+        try:
+            from .session_model import _auto_on, auto_name
+            self.w["label"].setPlaceholderText(auto_name(dict(c, label="")) if _auto_on()
+                                               else type_name(c.get("type", "")))
+        except Exception:                                   # noqa: BLE001
+            pass
 
     def _save(self):
         try:

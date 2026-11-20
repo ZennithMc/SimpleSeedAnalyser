@@ -11,13 +11,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-VENV=${VENV:-$ROOT/.venv-build-linux}
+VENV=${VENV:-$ROOT/.venv-build-linux-313}
 
 command -v uv >/dev/null || python3 -m pip install --user uv
 # a python-build-standalone Python (uv-managed), never the build machine's own:
 # a system Python would tie the release to this machine's glibc
 export UV_PYTHON_PREFERENCE=only-managed
-PY=$(uv python find 3.11 2>/dev/null || (uv python install 3.11 >/dev/null && uv python find 3.11))
+# (20/11) Python 3.13, not 3.11: with PySide6 6.12, every Qt method returning nothing takes
+# one reference from None; under 3.11 None runs out ("none_dealloc", crash while a big session
+# loads); from 3.12 None is immortal. The Windows build uses 3.14.
+PY=$(uv python find 3.13 2>/dev/null || (uv python install 3.13 >/dev/null && uv python find 3.13))
 [ -d "$VENV" ] || uv venv -p "$PY" "$VENV"
 VIRTUAL_ENV=$VENV uv pip install -q pyinstaller pyinstaller-hooks-contrib PySide6-Essentials numpy pillow zstandard
 

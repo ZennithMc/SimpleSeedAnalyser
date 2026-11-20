@@ -693,6 +693,9 @@ class TreeView3D(QOpenGLWidget):
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
                        "3D view unavailable (OpenGL 3.3 needed)\n" + (self._gl_err or "")[:300])
             return
+        sky = _sky_gradient(self.height())      # (15/11) SSA's theme: a sky with a horizon
+        if sky is not None:
+            p.fillRect(self.rect(), sky[0])
         p.beginNativePainting()
         f = self.f
         if not (self.scene and self.scene.trees) and self._target_chunk() != getattr(self, "_empty_at", None):
@@ -702,9 +705,12 @@ class TreeView3D(QOpenGLWidget):
             self._upload()
         dpr = self.devicePixelRatioF()
         f.glViewport(0, 0, int(self.width() * dpr), int(self.height() * dpr))
-        top = _sky_color()
-        f.glClearColor(top.redF(), top.greenF(), top.blueF(), 1.0)
-        f.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        top = _sky_color() if sky is None else sky[1]     # (the fog fades into the horizon)
+        if sky is None:
+            f.glClearColor(top.redF(), top.greenF(), top.blueF(), 1.0)
+            f.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        else:
+            f.glClear(GL_DEPTH_BUFFER_BIT)
         f.glEnable(GL_DEPTH_TEST)
         f.glDepthFunc(GL_LEQUAL)
         proj, view, eye = self._matrices()
@@ -1049,6 +1055,24 @@ def _sky_color() -> QColor:
     if theme.IS_LIGHT:
         return QColor(198, 220, 240)
     return QColor(int(c.red() * 0.6 + 40 * 0.4), int(c.green() * 0.6 + 52 * 0.4), int(c.blue() * 0.6 + 70 * 0.4))
+
+
+def _sky_gradient(h):
+    """(15/11) SSA's own theme: (gradient, horizon colour) — a deep sky of the workspace's
+    colours down to a soft horizon, the fog of the ground fading into it. Other themes: None
+    (the plain sky as before)."""
+    if not theme.is_live() or theme.IS_LIGHT:
+        return None
+    from PySide6.QtGui import QLinearGradient
+    c1, c2 = theme.ws_pair("seedcrack")
+    base = _sky_color()
+    zenith = QColor(theme._mix(theme.BG0 or "#0b0c0e", c1, 0.16))
+    horizon = QColor(theme._mix(base.name(), c2, 0.16)).lighter(118)
+    g = QLinearGradient(0, 0, 0, max(1, h))
+    g.setColorAt(0.0, zenith)
+    g.setColorAt(0.55, QColor(theme._mix(zenith.name(), horizon.name(), 0.55)))
+    g.setColorAt(1.0, horizon)
+    return g, horizon
 
 
 def _voidp(off):

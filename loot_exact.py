@@ -733,48 +733,102 @@ def _in_range(n, w):
     return n >= int(w.get("min") or 0) and (w.get("max") is None or n <= int(w["max"]))
 
 
-def chest_prob(q, table, version, biome=None) -> Result:
-    tab = le.get_table(version, table)
-    if tab is None:
-        return Result(0.0, 0, note="no such table")
-    items = q.get("items") or []
-    mode = q.get("mode", "find")
-    if mode == "layout":
-        return _layout_prob(q, tab, version, biome)
-    reqs = _reqs(items)
-    # quantities: each want's total, capped where the answer no longer changes
+SLOTS = 27
+NCAP = 64                       # stacks counted up to this (beyond: as many — never seen)
+
+
+def _caps(q):
+    """each want's total is capped where the answer no longer changes"""
     caps = []
-    for i, w in enumerate(items):
-        if mode == "most" and i == 0:
+    for i, w in enumerate(q.get("items") or []):
+        if q.get("mode", "find") == "most" and i == 0:
             caps.append(10 ** 6)
         elif w.get("max") is not None:
             caps.append(int(w["max"]) + 1)
         else:
             caps.append(max(int(w.get("min") or 0), 1))
+    return caps
+
+
+def _hyper(N, cs, take):
+    """{(j_1 … j_r): p} — how many of each group of cs (disjoint) are among `take`
+    stacks drawn from N (multivariate hypergeometric)"""
+    from math import comb
+    rest = N - sum(cs)
+    tot = comb(N, take)
+    out = {}
+
+    def rec(i, js, left, num):
+        if i == len(cs):
+            if 0 <= left <= rest:
+                out[tuple(js)] = num * comb(rest, left) / tot
+            return
+        for j in range(0, min(cs[i], left) + 1):
+            rec(i + 1, js + [j], left - j, num * comb(cs[i], j))
+    rec(0, [], take, 1)
+    return out
+
+
+def chest_dist(q, table, version, biome=None, caps=None):
+    """(15/11) {vector of each want's count in the chest (capped): p} — what the
+    chest really holds: the game places 27 stacks at most (LootTable.fill: the
+    stacks are shuffled, those beyond the free slots are lost). A non-stackable
+    item can therefore never be more than 27 in one chest; when a table can give
+    more than 27 stacks, the number of stacks is followed too and the wanted
+    non-stackable items kept are drawn among them (hypergeometric)."""
+    tab = le.get_table(version, table)
+    if tab is None:
+        return None
+    items = q.get("items") or []
+    reqs = _reqs(items)
+    k = len(items)
+    caps = list(caps if caps is not None else _caps(q))
 
     def proj(st):
         b = _bits(st, items)
-        return (b, st[1]) if b else None
+        return (b, st[1]) if b else (0, 1)               # every stack (the slots count)
     T = _Tab(version, biome, reqs, proj)
-    k = len(items)
+    pools = T.pools(tab)
+    nmax = sum((max(rd) if rd else 0) * max((len(ks) for ks in roll), default=0)
+               for _qp, rd, roll in pools)
+    track = nmax > SLOTS
+    # the wanted non-stackable items whose stacks are counted one by one (disjoint)
+    single = []
+    if track:
+        seen = set()
+        for i, w in enumerate(items):
+            if le.max_stack(w["item"]) == 1 and w["item"] not in seen:
+                single.append(i)
+                caps[i] = max(caps[i], NCAP) if caps[i] < 10 ** 6 else caps[i]
+            seen.add(w["item"])
+    dim = k + (1 if track else 0)
 
     def add_vec(a, stacks):
         v = list(a)
         for b, n in stacks:
-            for i in range(k):
-                if (b >> i) & 1:
-                    v[i] = min(caps[i], v[i] + n)
+            if track:
+                v[k] = min(NCAP, v[k] + 1)
+            if b:
+                for i in range(k):
+                    if (b >> i) & 1:
+                        v[i] = min(caps[i], v[i] + n)
         return tuple(v)
-    acc = {(0,) * k: 1.0}
-    for qp, rd, roll in T.pools(tab):
+
+    def comb(a, b):
+        out = [min(caps[i], a[i] + b[i]) for i in range(k)]
+        if track:
+            out.append(min(NCAP, a[k] + b[k]))
+        return tuple(out)
+    zero = (0,) * dim
+    acc = {zero: 1.0}
+    for qp, rd, roll in pools:
         rv = {}
         for ks, p in roll.items():
-            _add(rv, add_vec((0,) * k, ks), p)
-        comb = lambda a, b: tuple(min(caps[i], a[i] + b[i]) for i in range(k))
+            _add(rv, add_vec(zero, ks), p)
         pool_d = {}
         if qp < 1:
-            _add(pool_d, (0,) * k, 1 - qp)
-        cur = {(0,) * k: 1.0}
+            _add(pool_d, zero, 1 - qp)
+        cur = {zero: 1.0}
         for r in range(0, (max(rd) if rd else 0) + 1):
             if r > 0:
                 cur = _conv(cur, rv, comb)
@@ -783,6 +837,41 @@ def chest_prob(q, table, version, biome=None) -> Result:
                 for kk, v in cur.items():
                     _add(pool_d, kk, qp * pr * v)
         acc = _conv(acc, pool_d, comb)
+    if not track:
+        return acc
+    out = {}
+    user = _caps(q)
+    for vec, p in acc.items():
+        N = vec[k]
+        base = list(vec[:k])
+        if N <= SLOTS or not single:
+            _add(out, tuple(min(user[i], base[i]) if i in single else base[i] for i in range(k)), p)
+            continue
+        cs = [base[i] for i in single]
+        if sum(cs) > N:                                  # a stack matched twice: as it is
+            _add(out, tuple(base), p)
+            continue
+        for js, ph in _hyper(N, cs, SLOTS).items():
+            v = list(base)
+            for i, j in zip(single, js):
+                v[i] = min(user[i], j)
+            _add(out, tuple(v), p * ph)
+    return out
+
+
+def chest_prob(q, table, version, biome=None) -> Result:
+    tab = le.get_table(version, table)
+    if tab is None:
+        return Result(0.0, 0, note="no such table")
+    items = q.get("items") or []
+    mode = q.get("mode", "find")
+    if mode == "layout":
+        return _layout_prob(q, tab, version, biome)
+    acc = chest_dist(q, table, version, biome)
+    return _result(acc, items)
+
+
+def _result(acc, items):
     p = sum(v for vec, v in acc.items() if all(_in_range(vec[i], w) for i, w in enumerate(items)))
     dist = None
     mx = None
@@ -791,8 +880,33 @@ def chest_prob(q, table, version, biome=None) -> Result:
         for vec, v in acc.items():
             d0[vec[0]] += v
         dist = dict(sorted(d0.items()))
-        mx = max((n for n, v in dist.items() if v > 0), default=0)
+        mx = max((n for n, v in dist.items() if v > 1e-300), default=0)
     return Result(p, mx, dist)
+
+
+def structure_prob(q, configs, version, biome=None) -> Result:
+    """(15/11) « In the whole structure »: the wanted totals over all its chests.
+    configs = {tuple of the structure's chest tables: share of the structures} (the
+    chests of one structure are filled independently, each with its own seed). A
+    structure without any of these chests counts (it holds nothing)."""
+    items = q.get("items") or []
+    caps = _caps(q)
+    k = len(items)
+    zero = (0,) * k
+
+    def comb(a, b):
+        return tuple(min(caps[i], a[i] + b[i]) for i in range(k))
+    per = {}
+    acc = {}
+    for tables, share in configs.items():
+        d = {zero: 1.0}
+        for tb in tables:
+            if tb not in per:
+                per[tb] = chest_dist(q, tb, version, biome, caps) or {zero: 1.0}
+            d = _conv(d, per[tb], comb)
+        for vec, v in d.items():
+            _add(acc, vec, share * v)
+    return _result(acc, items)
 
 
 # ── layout: the splitter and the shuffles ─────────────────────────────────────

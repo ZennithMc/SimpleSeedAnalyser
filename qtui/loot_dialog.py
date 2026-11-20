@@ -71,6 +71,26 @@ def _pix(img, size):
     return pm
 
 
+def _struct_tile(key, color, size=48, isz=30):
+    """a structure's icon on a rounded tile of its colour"""
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QColor, QPainter
+    from . import struct_icons
+    dpr = 2.0
+    pm = QPixmap(int(size * dpr), int(size * dpr)); pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    c = QColor(color); c.setAlphaF(0.20)
+    p.setPen(QColor(color).darker(110)); p.setBrush(c)
+    p.drawRoundedRect(QRectF(0.5, 0.5, size - 1, size - 1), size * 0.28, size * 0.28)
+    ic = struct_icons.pixmap(key, isz)
+    o = (size - isz) / 2
+    p.drawPixmap(QRectF(o, o, isz, isz), ic, QRectF(ic.rect()))
+    p.end()
+    return pm
+
+
 def _stack_key(st):
     return (st.item, tuple(getattr(st, "ench", []) or ()), getattr(st, "potion", None),
             getattr(st, "name_key", None))
@@ -101,8 +121,12 @@ class _FlowGrid(QWidget):
         self.grid.setContentsMargins(0, 0, 0, 0)
         self.grid.setHorizontalSpacing(16); self.grid.setVerticalSpacing(16)
         self.cols = 0
+        self.top = None                          # (15/11) a wide card above the others
 
     def add(self, w):
+        if w.property("wide"):
+            self.top = w
+            return
         w.setFixedWidth(self.min_col)
         self.cards.append(w)
 
@@ -115,13 +139,20 @@ class _FlowGrid(QWidget):
         if cols == self.cols and not force:
             return
         self.cols = cols
-        for w in self.cards:
+        for w in self.cards + ([self.top] if self.top is not None else []):
             self.grid.removeWidget(w)
+        r0 = 0
+        if self.top is not None:                 # spans every column
+            self.top.setFixedWidth(cols * self.min_col + (cols - 1) * 16)
+            self.grid.addWidget(self.top, 0, 1, 1, cols, Qt.AlignmentFlag.AlignTop)
+            r0 = 1
         for i, w in enumerate(self.cards):
-            self.grid.addWidget(w, i // cols, 1 + i % cols, Qt.AlignmentFlag.AlignTop)
-        for c in range(6):
+            self.grid.addWidget(w, r0 + i // cols, 1 + i % cols, Qt.AlignmentFlag.AlignTop)
+        for c in range(8):
             self.grid.setColumnStretch(c, 1 if c in (0, cols + 1) else 0)
-        self.grid.setRowStretch(len(self.cards) // cols + 1, 1)
+        for r in range(r0 + len(self.cards) // cols + 3):
+            self.grid.setRowStretch(r, 0)
+        self.grid.setRowStretch(r0 + len(self.cards) // cols + 1, 1)
 
 
 class ChestCard(QFrame):
@@ -141,16 +172,16 @@ class ChestCard(QFrame):
         hd.addWidget(ic)
         col = QVBoxLayout(); col.setSpacing(0)
         t = QLabel(ch["name"]); t.setObjectName("LootTitle")
-        tip = [ch.get("table", "")]
-        if ch.get("seed") is not None:
-            tip.append(f"Loot seed {ch['seed']}" + (f" / {ch['seed2']}" if ch.get("seed2") is not None else ""))
-        t.setToolTip("\n".join(x for x in tip if x))
+        t.setToolTip(ch.get("table", "") or "")
         col.addWidget(t)
         x, y, z = ch["pos"]
         where = QLabel(f"{x}  {'' if y is None else str(y) + '  '}{z}")
         where.setObjectName("LootWhere"); where.setFont(theme.mono_font(9))
         where.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         col.addWidget(where)
+        if ch.get("seed") is not None and ch.get("slots") is not None:
+            seeds = [ch["seed"]] + ([ch["seed2"]] if ch.get("seed2") is not None else [])
+            col.addWidget(_SeedLine(seeds))
         hd.addLayout(col, 1)
         notes = []
         if ch.get("approx"):
@@ -224,6 +255,47 @@ class ChestCard(QFrame):
         return tp(dim, x, ty if ty is not None else (None if y is None else y + 1), z)
 
 
+class _SeedLine(QWidget):
+    """(15/11) the chest's loot seed, shown (it was only in a tooltip): selectable,
+    and a copy button. A double chest: its two halves' seeds."""
+
+    def __init__(self, seeds):
+        super().__init__()
+        h = QHBoxLayout(self); h.setContentsMargins(0, 3, 0, 0); h.setSpacing(6)
+        lab = QLabel("LOOT SEED")
+        f = theme.ui_font(6.8); f.setBold(True)
+        f.setLetterSpacing(f.SpacingType.AbsoluteSpacing, 1.0)
+        lab.setFont(f)
+        lab.setStyleSheet(f"color: {theme.TEXT3}; background: transparent;")
+        h.addWidget(lab)
+        txt = "  ·  ".join(str(int(x)) for x in seeds)
+        val = QLabel(txt); val.setFont(theme.mono_font(8.5))
+        val.setStyleSheet(f"color: {theme.TEXT2}; background: transparent;")
+        val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        val.setCursor(Qt.CursorShape.IBeamCursor)
+        h.addWidget(val)
+        cp = QToolButton(); cp.setAutoRaise(True); cp.setFixedSize(20, 20)
+        icons.bind(cp, "copy", 13)
+        cp.setToolTip("Copy")
+        cp.setCursor(Qt.CursorShape.PointingHandCursor)
+        cp.setStyleSheet("QToolButton { border: none; background: transparent; border-radius: 5px; }"
+                         f"QToolButton:hover {{ background: {theme._rgba(theme.TEXT, 0.10)}; }}")
+
+        def _copy():
+            QGuiApplication.clipboard().setText(" ".join(str(int(x)) for x in seeds))
+            icons.bind(cp, "check", 13)
+            QTimer.singleShot(1100, lambda: _back())
+
+        def _back():
+            try:
+                icons.bind(cp, "copy", 13)
+            except RuntimeError:
+                pass
+        cp.clicked.connect(_copy)
+        h.addWidget(cp)
+        h.addStretch(1)
+
+
 class _Flow(QWidget):
     """small widgets in rows that wrap"""
 
@@ -273,10 +345,31 @@ class LootDialog(QDialog):
         self.setWindowTitle(f"Loot · {title}")
         self.resize(1240, 860)
         acc = theme.ACCENT or "#7c9cff"
+        # (15/11) SSA's theme: the window and its cards wear the structure's colour
+        try:
+            from . import struct_icons
+            sc = struct_icons.color(key) if struct_icons.known(key) else acc
+        except Exception:
+            sc = acc
+        self._scol = sc
+        bg1, bg2 = theme.BG1 or "#1b1f27", theme.BG2 or "#232833"
+        live = theme.is_live()
+        dlg_bg = (f"qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {theme._mix(bg1, sc, 0.20)}, "
+                  f"stop:0.45 {theme._mix(bg1, sc, 0.05)}, stop:1 {bg1})" if live else bg1)
+        card_bg = (f"qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {theme._mix(bg2, sc, 0.10)}, "
+                   f"stop:0.3 {theme._rgba(bg2, 0.88)}, stop:1 {theme._rgba(bg2, 0.88)})" if live else bg2)
+        card_line = theme._mix(theme.LINE2, sc, 0.35) if live else theme.LINE2
         self.setStyleSheet(
-            f"QDialog {{ background: {theme.BG1 or '#1b1f27'}; }}"
-            f"#LootCard {{ background: {theme.BG2 or '#232833'}; border: 1px solid {theme.LINE2};"
+            f"QDialog {{ background: {dlg_bg}; }}"
+            f"#LootCard {{ background: {card_bg}; border: 1px solid {card_line};"
             f" border-radius: 14px; }}"
+            f"#LootPill {{ background: {theme._rgba(theme.TEXT, 0.07)}; color: {theme.TEXT2}; border-radius: 10px;"
+            f" padding: 2px 9px; font-weight: 600; font-size: 8pt; }}"
+            f"#LootPill[tone=\"struct\"] {{ background: {theme._rgba(sc, 0.20)}; color: {theme._mix(theme.TEXT, sc, 0.45)}; }}"
+            f"#LootTotal {{ background: {theme._rgba(sc, 0.10) if live else bg2}; border: 1px solid {theme._rgba(sc, 0.40)};"
+            f" border-radius: 14px; }}"
+            f"#LootTotalTitle {{ color: {theme._mix(theme.TEXT2, sc, 0.55)}; font-size: 7.5pt; font-weight: 700;"
+            f" letter-spacing: 1.2px; }}"
             f"#LootCard[focus=\"true\"] {{ border: 2px solid #ffc928; }}"
             f"#LootTitle {{ font-size: 11pt; font-weight: 600; }}"
             f"#LootWhere {{ color: {theme.TEXT3}; }}"
@@ -290,9 +383,10 @@ class LootDialog(QDialog):
             f"#LootBanner {{ background: {theme.BG2}; border: 1px solid #d6a03f; border-radius: 10px; }}")
         v = QVBoxLayout(self); v.setContentsMargins(20, 16, 20, 14); v.setSpacing(14)
         top = QHBoxLayout(); top.setSpacing(12)
-        try:
+        try:                                             # (15/11) its icon on a tile of its colour
             from . import struct_icons
-            ic = QLabel(); ic.setPixmap(struct_icons.pixmap(key, 36)); top.addWidget(ic)
+            ic = QLabel(); ic.setFixedSize(48, 48)
+            ic.setPixmap(_struct_tile(key, sc, 48, 30)); top.addWidget(ic)
         except Exception:                                # noqa: BLE001
             pass
         tc = QVBoxLayout(); tc.setSpacing(0)
@@ -301,7 +395,10 @@ class LootDialog(QDialog):
             title, rest = title.split("  X ", 1)
             self._where = "X " + " ".join(rest.split())
         h = QLabel(title); h.setObjectName("LootHead"); tc.addWidget(h)
-        self.sub_lbl = QLabel(""); self.sub_lbl.setObjectName("LootSub"); tc.addWidget(self.sub_lbl)
+        self.sub_lbl = QLabel(""); self.sub_lbl.setObjectName("LootSub")
+        self.sub_lbl.hide()                              # (15/11) the same facts, as pills
+        self.pills = QHBoxLayout(); self.pills.setSpacing(5); self.pills.setContentsMargins(0, 3, 0, 0)
+        tc.addWidget(self.sub_lbl); tc.addLayout(self.pills)
         top.addLayout(tc, 1)
         import loot_engine as le
         subs = le.MC_SUBVERSIONS.get(self.mc)
@@ -373,6 +470,7 @@ class LootDialog(QDialog):
         ver = self.version()
         self._ver = ver
         self.sub_lbl.setText("  ·  ".join(x for x in (self._where, f"Java {ver}") if x))
+        self._set_pills([(self._where, "struct"), (f"Java {ver}", ""), ("computing…", "")])
         self._token = getattr(self, "_token", 0) + 1
         tok = self._token
         w = QWidget(); lay = QVBoxLayout(w)
@@ -410,6 +508,8 @@ class LootDialog(QDialog):
         n = sum(1 for c in res if c.get("slots") is not None)
         self.sub_lbl.setText("  ·  ".join(x for x in (self._where, f"Java {self._ver}",
                                                          f"{n} container{'s' * (n != 1)}") if x))
+        self._set_pills([(self._where, "struct"), (f"Java {self._ver}", ""),
+                         (f"{n} container{'s' * (n != 1)}", "")])
         if not res:
             w = QWidget(); lay = QVBoxLayout(w)
             m = QLabel("No chest here."); m.setObjectName("LootSub")
@@ -419,6 +519,9 @@ class LootDialog(QDialog):
             return
         grid = _FlowGrid()
         target = None
+        total = self._total_card(res)                    # (15/11) everything in the structure, first
+        if total is not None:
+            grid.add(total)
         for ch in res:
             c = ChestCard(ch, self._ver, self.key, self)
             if self.focus is not None and target is None and \
@@ -430,6 +533,50 @@ class LootDialog(QDialog):
         self.area.setWidget(grid)
         if target is not None:
             QTimer.singleShot(80, lambda t=target: self.area.ensureWidgetVisible(t, 0, 40))
+
+    def _set_pills(self, items):
+        while self.pills.count():
+            it = self.pills.takeAt(0)
+            if it.widget() is not None:
+                it.widget().deleteLater()
+        for text, tone in items:
+            if text:
+                lb = QLabel(text); lb.setObjectName("LootPill")
+                if tone:
+                    lb.setProperty("tone", tone)
+                self.pills.addWidget(lb)
+        self.pills.addStretch(1)
+
+    def _total_card(self, res):
+        """(15/11) the whole structure at a glance: every item of every container, added up"""
+        tot, rep_ = {}, {}
+        n = 0
+        for ch in res:
+            slots = ch.get("slots")
+            if not slots:
+                continue
+            n += 1
+            for st in slots:
+                if st is not None:
+                    k = _stack_key(st)
+                    tot[k] = tot.get(k, 0) + st.count
+                    rep_.setdefault(k, st)
+        if n < 2 or not tot:                             # one chest: its own card says it all
+            return None
+        card = QFrame(); card.setObjectName("LootTotal")
+        v = QVBoxLayout(card); v.setContentsMargins(16, 12, 16, 14); v.setSpacing(8)
+        hd = QHBoxLayout()
+        t = QLabel(f"WHOLE STRUCTURE  ·  {n} CONTAINERS"); t.setObjectName("LootTotalTitle")
+        hd.addWidget(t); hd.addStretch(1)
+        kinds = QLabel(f"{len(tot)} kinds of items"); kinds.setObjectName("LootMuted")
+        hd.addWidget(kinds)
+        v.addLayout(hd)
+        row = _Flow()
+        for k, c in sorted(tot.items(), key=lambda kv: (-kv[1], kv[0][0])):
+            row.add(ItemSlot(rep_[k], self._ver, k=2, count=c, framed=True))
+        v.addWidget(row)
+        card.setProperty("wide", True)
+        return card
 
     def closeEvent(self, e):
         hide_tooltip()

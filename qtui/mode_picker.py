@@ -1,44 +1,48 @@
 """
 qtui/mode_picker.py — (05/11) the search mode of the run bar: a button showing the
-chosen mode; a click unfolds every mode with a short description (the unavailable
-ones greyed, with why). value() / set_value(label) / changed(label), like Segmented.
+chosen mode; a click unfolds every mode, one line each (15/11: what each one does is
+in its tooltip; the unavailable ones greyed, why in the tooltip). value() / set_value(label) / changed(label), like Segmented.
 """
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout)
 
 from . import theme
 
 
 class _Row(QFrame):
+    """(15/11) one line per mode: its name; what it does is in the tooltip (the descriptions
+    took a lot of room). An unavailable mode is greyed, why in its tooltip."""
     clicked = Signal(str)
 
     def __init__(self, label, desc, current, enabled, why):
         super().__init__()
-        self.label, self.ok = label, enabled
+        self.label, self.ok, self.current = label, enabled, current
         self.setObjectName("ModeRow")
         self.setCursor(Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ForbiddenCursor)
-        h = QHBoxLayout(self); h.setContentsMargins(10, 7, 12, 7); h.setSpacing(10)
+        self.setToolTip(desc if enabled else (why or desc))
+        h = QHBoxLayout(self); h.setContentsMargins(10, 6, 12, 6); h.setSpacing(9)
         mark = QLabel("●" if current else ""); mark.setFixedWidth(10)
-        mark.setStyleSheet(f"color: {theme.ACCENT}; font-size: 8pt;")
-        h.addWidget(mark, 0, Qt.AlignmentFlag.AlignTop)
-        v = QVBoxLayout(); v.setSpacing(1)
+        mark.setStyleSheet(f"color: {theme.ACCENT}; font-size: 8pt; background: transparent;")
+        h.addWidget(mark)
         t = QLabel(label)
-        f = t.font(); f.setBold(True); t.setFont(f)
-        d = QLabel(desc if enabled else (why or desc)); d.setWordWrap(True)
-        d.setObjectName("Muted")
-        v.addWidget(t); v.addWidget(d)
-        h.addLayout(v, 1)
+        f = t.font(); f.setWeight(QFont.Weight.DemiBold if current else QFont.Weight.Medium); t.setFont(f)
         col = theme.TEXT if enabled else (theme.TEXT3 or theme.TEXT2)
-        t.setStyleSheet(f"color: {col};")
-        if not enabled:
-            d.setStyleSheet(f"color: {theme.TEXT3 or theme.TEXT2};")
+        t.setStyleSheet(f"color: {col}; background: transparent;")
+        h.addWidget(t, 1)
         self._hover(False)
 
     def _hover(self, on):
-        bg = (theme.ACCENT_SOFT or theme.BG3) if (on and self.ok) else "transparent"
-        self.setStyleSheet(f"#ModeRow {{ background: {bg}; border-radius: 7px; }}")
+        a = theme.ACCENT
+        if self.current:
+            bg = f"background: {theme._rgba(a, 0.18)}; border: 1px solid {theme._rgba(a, 0.45)};"
+        elif on and self.ok:
+            bg = f"background: {theme._rgba(a, 0.10)}; border: 1px solid transparent;"
+        else:
+            bg = "background: transparent; border: 1px solid transparent;"
+        self.setStyleSheet(f"#ModeRow {{ {bg} border-radius: 9px; }}")
 
     def enterEvent(self, e):
         self._hover(True)
@@ -55,15 +59,20 @@ class _Popup(QFrame):
     def __init__(self, picker):
         super().__init__(picker, Qt.WindowType.Popup)
         self.setObjectName("ModePopup")
-        self.setStyleSheet(f"#ModePopup {{ background: {theme.BG1}; border: 1px solid {theme.LINE}; "
-                           f"border-radius: 10px; }}")
+        bg = theme.BG1
+        if theme.is_live():                          # (15/11) SSA's theme: tinted, as the other popups
+            a = theme.ACCENT
+            bg = (f"qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {theme._mix(theme.BG2, a, 0.16)}, "
+                  f"stop:1 {theme._mix(theme.BG2, a, 0.04)})")
+        self.setStyleSheet(f"#ModePopup {{ background: {bg}; border: 1px solid {theme._rgba(theme.ACCENT, 0.40)}; "
+                           f"border-radius: 12px; }}")
         v = QVBoxLayout(self); v.setContentsMargins(6, 6, 6, 6); v.setSpacing(2)
         for label, desc in picker.modes:
             ok, why = picker._state.get(label, (True, ""))
             r = _Row(label, desc, label == picker._value, ok, why)
             r.clicked.connect(lambda l, p=picker: (self.close(), p.set_value(l, emit=True)))
             v.addWidget(r)
-        self.setFixedWidth(360)
+        self.setFixedWidth(max(220, picker.width()))
 
 
 class ModePicker(QPushButton):

@@ -40,11 +40,13 @@ import mc_assets as ma
 from . import icons, struct_icons, theme
 from .loot_table_dialog import STRUCT_SCOPE, LootTablesView, pct, table_label
 from .mc_widgets import ItemSlot, assets, container_icon, display_name, draw_stack, hide_tooltip
-from .widgets import AdaptiveButton, CoordEdit, Segmented, remember_path, user_path
+from .widgets import AdaptiveButton, CoordEdit, FlowLayout, Segmented, remember_path, user_path
 
-STRUCTS = ["desert_pyramid", "jungle_temple", "buried_treasure", "shipwreck", "ruined_portal",
-           "igloo", "ocean_ruin", "pillager_outpost", "village", "mansion", "ancient_city",
-           "abandoned_camp", "bastion", "fortress", "end_city"]
+# (15/11) in a logical order: the surface, the sea, underground, the Nether, the End;
+# the stronghold and the mineshaft can be searched too — (20/11) and the dungeons
+STRUCTS = ["village", "desert_pyramid", "jungle_temple", "igloo", "pillager_outpost", "mansion",
+           "abandoned_camp", "shipwreck", "ocean_ruin", "buried_treasure", "ruined_portal",
+           "dungeon", "mineshaft", "stronghold", "ancient_city", "bastion", "fortress", "end_city"]
 _ICON_KEY = {"buried_treasure": "treasure"}
 _SCOPE = dict(STRUCT_SCOPE, buried_treasure=("buried_treasure",))
 _SHORT = {"mansion": "Mansion", "abandoned_camp": "Camp", "bastion": "Bastion",
@@ -61,6 +63,8 @@ _TEX = {
     "ancient_city": ("block/deepslate_tiles", "#33373d"), "abandoned_camp": ("block/coarse_dirt", "#6f5639"),
     "bastion": ("block/polished_blackstone_bricks", "#2c2a31"), "fortress": ("block/nether_bricks", "#4b1d22"),
     "end_city": ("block/purpur_block", "#a679a6"),
+    "stronghold": ("block/stone_bricks", "#7b7b7b"), "mineshaft": ("block/oak_log", "#6b5233"),
+    "dungeon": ("block/spawner", "#3b4752"),
 }
 # how rare: the tiers of the odds card (1 in N)
 TIERS = [(3, "Common", "#3fd6a0"), (30, "Uncommon", "#8fd14f"), (300, "Rare", "#4da3ff"),
@@ -192,10 +196,29 @@ class _R:
         self.impossible = p <= 0
 
 
+def _pct_plain(p):
+    """(15/11) a percentage without exponent: 2.908e-08 % → 0.000000029 %"""
+    v = p * 100
+    if v <= 0:
+        return "0 %"
+    if v >= 0.01:
+        return f"{v:.4g} %"
+    d = max(2, -int(math.floor(math.log10(v))) + 1)
+    return f"{v:.{d}f} %"
+
+
 def _one_in(p):
     """1 / p, short: 2.4 · 4 812 · 4.81 M · 3.2 B · 1.2 × 10^15"""
-    if p <= 0:
+    if not p or p <= 0 or p != p:
         return "∞"
+    lg = -math.log10(p)                          # (15/11) log10 of 1/p: no 1/p = inf
+    if lg >= 12:                                 # for a whole structure, p can be ~1e-320
+        e = int(math.floor(lg))
+        m = 10 ** (lg - e)
+        if f"{m:.2g}" == "10":
+            m, e = 1.0, e + 1
+        sup = str(e).translate(str.maketrans("0123456789-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁻"))
+        return f"{m:.2g} × 10{sup}"
     n = 1.0 / p
     if n < 10:
         return f"{n:.2f}".rstrip("0").rstrip(".")
@@ -323,7 +346,7 @@ class _StructTile(QAbstractButton):
         self.setMinimumSize(82, 86)
         self.setMaximumHeight(86)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setToolTip(struct_icons.label(_ICON_KEY.get(key, key)))
+        # (15/11) the tile shows its name: a tooltip only says what is not written
         ref, col = _TEX.get(key, ("", "#555b66"))
         img = _texture(ref) if ref else None
         self._tex = None if img is None else QPixmap.fromImage(
@@ -333,6 +356,7 @@ class _StructTile(QAbstractButton):
                 48, 48, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation))
         self._col = col
         self._icon = struct_icons.pixmap(_ICON_KEY.get(key, key), 40)
+        self._name = _SHORT.get(key) or struct_icons.label(_ICON_KEY.get(key, key))
         self._h = 0.0
         self._s = 0.0
         self._anims = {}
@@ -414,7 +438,7 @@ class _StructTile(QAbstractButton):
         f = QFont(theme.ui_font(8.4)); f.setBold(True)
         p.setFont(f)
         tr = QRectF(r.x() + 3, r.bottom() - 26, r.width() - 6, 22)
-        txt = QFontMetricsF(f).elidedText(_SHORT.get(self.key) or self.toolTip(),
+        txt = QFontMetricsF(f).elidedText(self._name,
                                           Qt.TextElideMode.ElideRight, tr.width())
         p.setPen(_rgba("#000000", 0.85))
         p.drawText(tr.translated(1, 1), Qt.AlignmentFlag.AlignCenter, txt)
@@ -452,7 +476,6 @@ class _Elide(QLabel):
     def __init__(self, text):
         super().__init__(text)
         self.full = text
-        self.setToolTip(text)
         self.setMinimumWidth(30)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
@@ -463,6 +486,9 @@ class _Elide(QLabel):
         t = self.fontMetrics().elidedText(self.full, Qt.TextElideMode.ElideRight, self.width())
         p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), t)
         p.end()
+        tip = self.full if t != self.full else ""          # (15/11) the full text only when it is cut
+        if self.toolTip() != tip:
+            self.setToolTip(tip)
 
 
 class _WantCard(QFrame):
@@ -839,9 +865,10 @@ class _Rarity(QWidget):
         self._t.start()
         self.update()
 
-    def set_none(self, sub):
+    def set_none(self, sub, title=None):
         self._stop_busy()
-        self.state, self.title, self.big, self.sub, self.p, self.note = "none", "ONE CHEST IN", "—", sub, None, ""
+        self.state, self.title, self.big, self.sub, self.p, self.note = (
+            "none", title or getattr(self, "scope_title", "ONE CHEST IN"), "—", sub, None, "")
         self._glide(0.0, QColor(theme.TEXT3 or "#888"))
 
     def set_value(self, p, sub, title="ONE CHEST IN", big=None, note=""):
@@ -873,7 +900,17 @@ class _Rarity(QWidget):
         self._a.start()
 
     def paintEvent(self, e):
-        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        try:                                     # (15/11) an error never leaves the painter open
+            self._paint(p)
+        finally:
+            if p.isActive():
+                p.end()
+
+    def _paint(self, p):
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         path = QPainterPath(); path.addRoundedRect(r, 14, 14)
         base = QColor(theme.BG2 or "#1d2129")
@@ -950,22 +987,81 @@ class _ResultDelegate(QStyledItemDelegate):
         self.table = table
         self.born = {}                                   # row key → time added
 
+    @staticmethod
+    def _where(idx):
+        parts = str(idx.data() or "").split()
+        return f"X {parts[0]}   Z {parts[1]}" if len(parts) == 2 else " ".join(parts)
+
+    def sizeHint(self, opt, idx):
+        sz = super().sizeHint(opt, idx)
+        if idx.column() == 1:                            # the pill is wider than the plain text
+            w = QFontMetricsF(theme.num_font(8.6, QFont.Weight.DemiBold)).horizontalAdvance(self._where(idx))
+            sz.setWidth(int(w) + 30)
+        return sz
+
     def paint(self, p, opt, idx):
+        from PySide6.QtWidgets import QStyle
+        from . import brand
         h = idx.data(Qt.ItemDataRole.UserRole + 1)
         if h is not None:
             age = (time.time() - h) * 1000.0
             if age < self.FLASH:
                 t = 1.0 - age / self.FLASH
                 p.fillRect(opt.rect, _rgba(theme.ACCENT or "#7c9cff", 0.32 * t))
+        sel = bool(opt.state & QStyle.StateFlag.State_Selected)
+        col_n = idx.column()
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(opt.rect)
+        if sel or (opt.state & QStyle.StateFlag.State_MouseOver):   # (14/11) one rounded card across the row
+            card = QPainterPath()
+            row = QRectF(0.5, r.top() + 2, self.table.viewport().width() - 1, r.height() - 4)
+            card.addRoundedRect(row, 9, 9)
+            p.setClipRect(r)
+            p.fillPath(card, _rgba(theme.ACCENT or "#7c9cff", 0.20 if sel else 0.07))
+            if sel:
+                p.setPen(QPen(_rgba(theme.ACCENT or "#7c9cff", 0.55), 1)); p.drawPath(card)
+            p.setClipping(False)
+        if col_n == 0:                                   # (15/11) its number, the sigil, the seed
+            seed = str(idx.data() or "")
+            nf = theme.mono_font(8)
+            nw = QFontMetricsF(nf).horizontalAdvance("0" * len(str(max(1, self.table.rowCount())))) + 10
+            p.setFont(nf)
+            p.setPen(_rgba(theme.TEXT2 or "#aab", 0.75))
+            p.drawText(QRectF(r.left() + 4, r.top(), nw - 4, r.height()),
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, str(idx.row() + 1))
+            x0 = r.left() + nw
+            try:
+                p.drawPixmap(QRectF(x0 + 5, r.center().y() - 11, 22, 22), brand.sigil(int(seed), 22),
+                             QRectF(0, 0, 44, 44))
+            except ValueError:
+                pass
+            p.setFont(theme.num_font(10, QFont.Weight.DemiBold))
+            p.setPen(QColor(theme.TEXT))
+            tx = r.adjusted(nw + 36, 0, -4, 0)
+            p.drawText(tx, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       p.fontMetrics().elidedText(seed, Qt.TextElideMode.ElideRight, int(tx.width())))
+            p.restore()
+            return
+        if col_n == 1:                                   # where: X and Z in a pill
+            txt = self._where(idx)
+            f = theme.num_font(8.6, QFont.Weight.DemiBold); p.setFont(f)
+            w = QFontMetricsF(f).horizontalAdvance(txt) + 16
+            rr = QRectF(r.right() - w - 6, r.center().y() - 10, w, 20)
+            if rr.left() < r.left() + 2:
+                rr = QRectF(r.left() + 2, rr.top(), r.width() - 8, 20)
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(_rgba(theme.TEXT or "#ffffff", 0.07))
+            p.drawRoundedRect(rr, 10, 10)
+            p.setPen(QColor(theme.TEXT2 or "#aab"))
+            p.drawText(rr, Qt.AlignmentFlag.AlignCenter, txt)
+            p.restore()
+            return
+        p.restore()
         if idx.column() == 2:
             p.save()
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            from PySide6.QtWidgets import QStyle
-            sel = bool(opt.state & QStyle.StateFlag.State_Selected)
-            if sel:
-                p.fillRect(opt.rect, QColor(theme.ACCENT or "#4d7cff"))
             txt = str(idx.data() or "")
-            col = QColor("#ffffff") if sel else QColor(idx.data(Qt.ItemDataRole.UserRole + 2) or theme.ACCENT or "#7c9cff")
+            col = QColor(idx.data(Qt.ItemDataRole.UserRole + 2) or theme.ACCENT or "#7c9cff")
             f = QFont(theme.ui_font(8.5)); f.setBold(True); p.setFont(f)
             w = QFontMetricsF(f).horizontalAdvance(txt) + 18
             rr = QRectF(opt.rect.center().x() - w / 2, opt.rect.center().y() - 10, w, 20)
@@ -987,7 +1083,88 @@ class _Bus(QObject):
 _MODE_DESC = [
     ("Incremental", "Every seed in order, from the start seed."),
     ("Random", "Random seeds (64-bit), never the same order twice: a lucky hunt."),
+    ("Reverse", "The wanted chest first, then the seeds that have it near the centre:\n"
+                "seconds whatever the rarity, and it can tell when no chest can have it.\n"
+                "Java 1.16 – 1.17 · buried treasure, desert pyramid, jungle temple, igloo,\n"
+                "shipwreck, ocean ruin, ruined portal, dungeon."),
 ]
+REVERSE_CAP = 2000                                  # (15/11) Reverse pauses there (Resume: more)
+WORLD = 30_000_000                                  # (15/11) « Whole world » (Reverse only)
+REVERSE_SPEED_TIP = (
+    "Reverse\n"
+    "Candidates: structures one of whose chests already has a good part of what you ask\n"
+    "(found by tracing the chest's draws); their other chests are then checked.\n"
+    "Matches: the candidates whose whole structure has it.\n"
+    "1 match / …: expected from the exact odds of each candidate, at the current speed.\n"
+    "The best candidates come first: the time per match grows as they are used up.\n"
+    "… in the area: the share of matches with a structure inside the radius\n"
+    "(Whole world: every match gives seeds, the nearest to X Z first).\n"
+    "Like … structures/s: a normal search would have to check that many structures\n"
+    "every second to find them as fast (the rarity card's odds).\n"
+    "1 structure / …: the time per structure found so far (≈: dungeons, from the model\n"
+    "before the first ones).")
+
+
+STATES = 2 ** 48                                    # (15/11) the chests a table can give
+
+
+def _fmt_count(n):
+    for d, u in ((1e12, " T"), (1e9, " B"), (1e6, " M"), (1e3, " k")):
+        if n >= d:
+            return f"{n / d:.3g}{u}"
+    return f"{n:.0f}" if n >= 10 else f"{n:.2g}"
+
+
+def _exists(p):
+    """(15/11) one chest: how many of the 2^48 possible chests of the table have it
+    (p × 2^48), or for the rarest, the chance that even one does → (short, tooltip)"""
+    n = p * STATES
+    tip = ("A chest's loot comes from 48 bits of its seed: a table has 2^48 ≈ 281 trillion "
+           "possible chests.\n")
+    if n >= 3:
+        return (f"≈ {_fmt_count(n)} of 2⁴⁸ chests",
+                tip + f"About {_fmt_count(n)} of them have this (the odds × 2^48).")
+    pe = -math.expm1(-n)                                 # Poisson: at least one
+    pc = f"{pe * 100:.0f} %" if pe >= 0.01 else f"{pe * 100:.2g} %"
+    return (f"{pc} chance one exists",
+            tip + f"Only ≈ {_fmt_count(n)} expected: there may be none. Chance that at least one "
+                  f"chest has it: {pc}.\nReverse (Java 1.16 – 1.17) finds them, or tells there is none.")
+
+
+class _StatLabel(QLabel):
+    """(15/11) the run bar's status: a fixed share of the row — the progress bar beside
+    it no longer shrinks and grows with the text (its busy animation went back and
+    forth) — the text elided when it is longer (all of it in the tooltip)"""
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self._full = text
+        self._tip = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(120)
+
+    def setText(self, t):
+        if t == self._full:
+            return
+        self._full = t
+        self._elide()
+
+    def text(self):
+        return self._full
+
+    def setToolTip(self, t):
+        self._tip = t
+        self._elide()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._elide()
+
+    def _elide(self):
+        el = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, max(10, self.width() - 2))
+        QLabel.setText(self, el)
+        tip = self._tip if el == self._full else (self._full + ("\n\n" + self._tip if self._tip else ""))
+        QLabel.setToolTip(self, tip)
 
 
 class _Floating(QWidget):
@@ -1034,10 +1211,20 @@ def _empty_state(icon_img, text):
     return w
 
 
+class _ChestChip(QToolButton):
+    """a kind of chest: click = in / out of the search, double-click = only this one"""
+    solo = Signal()
+
+    def mouseDoubleClickEvent(self, e):
+        e.accept()
+        self.solo.emit()
+
+
 # ── the page ───────────────────────────────────────────────────────────────────
 class LootPage(QWidget):
     status = Signal(str)
     openOnMap = Signal(object, str, int, int)          # seed, version name, x, z
+    changed = Signal()                                 # (15/11) what is asked changed (ui_state)
 
     def __init__(self, world, parent=None):
         super().__init__(parent)
@@ -1069,7 +1256,10 @@ class LootPage(QWidget):
         self.stack = QStackedWidget()
         outer.addWidget(self.stack, 1)
         fw = QWidget(); fl = QVBoxLayout(fw); fl.setContentsMargins(0, 0, 0, 0); fl.setSpacing(10)
-        fl.addWidget(self._build_strip())
+        # (14/11) the three panels need ~1500 px: in a narrower window they scroll sideways
+        # (the window itself may now go down to ~1150 px); the run bar stays in place
+        body_w = QWidget(); bl = QVBoxLayout(body_w); bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(10)
+        bl.addWidget(self._build_strip())
         main = QHBoxLayout(); main.setSpacing(10)
         main.addWidget(self._build_query())
         from PySide6.QtWidgets import QSplitter
@@ -1080,7 +1270,12 @@ class LootPage(QWidget):
         split.setStretchFactor(0, 2); split.setStretchFactor(1, 3)
         split.setSizes([460, 700])
         main.addWidget(split, 1)
-        fl.addLayout(main, 1)
+        bl.addLayout(main, 1)
+        bsc = QScrollArea(); bsc.setWidgetResizable(True); bsc.setFrameShape(QFrame.Shape.NoFrame)
+        bsc.setStyleSheet("QScrollArea { background: transparent; } "
+                          "QScrollArea > QWidget > QWidget { background: transparent; }")
+        bsc.setWidget(body_w)
+        fl.addWidget(bsc, 1)
         fl.addWidget(self._build_runbar())
         self.stack.addWidget(fw)
         self.tables_holder = QFrame(); self.tables_holder.setObjectName("LpCard")
@@ -1113,17 +1308,21 @@ class LootPage(QWidget):
             f"#LpSub {{ color: {theme.TEXT2}; font-size: 9pt; }}"
             f"#LpCount {{ background: {theme.ACCENT_SOFT or theme.BG3}; color: {acc}; border-radius: 10px;"
             f" padding: 1px 9px; font-weight: 700; font-size: 9pt; }}"
+            f"#LpTotal {{ background: {theme.BG2}; border: 1px solid {theme.LINE2}; border-radius: 12px; }}"
             f"#LpChip {{ background: {theme.BG2}; border: 1px solid {theme.LINE2}; border-radius: 13px;"
             f" padding: 3px 10px 3px 6px; color: {theme.TEXT2}; font-weight: 600; }}"
             f"#LpChip:hover {{ border-color: {acc}; color: {theme.TEXT}; }}"
             f"#LpChip:checked {{ border-color: {acc}; color: {theme.TEXT}; background: {theme.ACCENT_SOFT or theme.BG3}; }}"
+            f"#LpChip[compact=\"true\"] {{ padding: 3px 10px; font-size: 8pt; border-radius: 11px; }}"
+            f"#LpChip[all=\"true\"] {{ font-weight: 700; color: {acc}; border-style: dashed; }}"
             f"#LpPick {{ background: {theme.BG2}; border: 1px solid {theme.LINE2}; border-radius: 10px;"
             f" text-align: left; padding: 4px 8px; font-size: 8.5pt; }}"
             f"#LpPick:hover {{ border-color: {acc}; background: {theme.ACCENT_SOFT or theme.BG3}; }}"
             f"#LpPicker {{ background: {theme.BG1}; border: 1px solid {theme.LINE2}; border-radius: 12px; }}"
             f"QTableWidget#LpTable {{ background: transparent; border: none; gridline-color: transparent; }}"
-            f"QTableWidget#LpTable::item {{ padding: 0 8px; border-bottom: 1px solid {theme.LINE}; }}"
-            f"QTableWidget#LpTable::item:selected {{ background: {theme.ACCENT_SOFT or theme.BG3}; color: {theme.TEXT}; }}")
+            f"QTableWidget#LpTable {{ selection-background-color: transparent; }}"
+            f"QTableWidget#LpTable::item {{ padding: 0 8px; border: none; }}"
+            f"QTableWidget#LpTable::item:selected {{ background: transparent; color: {theme.TEXT}; }}")
 
     # ── the structures ───────────────────────────────────────────────────────
     def _build_strip(self):
@@ -1160,8 +1359,10 @@ class LootPage(QWidget):
         self.q_tables.clicked.connect(lambda: self.open_table(self._sel_tables()[0] if self._sel_tables() else None))
         hd.addWidget(self.q_tables, 0, Qt.AlignmentFlag.AlignTop)
         v.addLayout(hd)
-        self.chest_row = QHBoxLayout(); self.chest_row.setSpacing(6)
-        self.chest_w = QWidget(); self.chest_w.setLayout(self.chest_row)
+        # (15/11) the chests wrap (16 kinds in a village: on one line the card grew past
+        # the window, its right side cut and out of reach)
+        self.chest_w = QWidget()
+        self.chest_row = FlowLayout(self.chest_w, 6, 6)
         v.addWidget(self.chest_w)
         v.addWidget(self._label("WHAT YOU WANT"))
         self.want_grid = QGridLayout(); self.want_grid.setSpacing(8)
@@ -1213,6 +1414,15 @@ class LootPage(QWidget):
         self.cz.pasted.connect(lambda xz: (self.cx.setValue(xz[0]), self.cz.setValue(xz[1]), self._query_changed()))
         lx = QLabel("X"); lx.setObjectName("LpMuted"); ar.addWidget(lx); ar.addWidget(self.cx)
         lz = QLabel("Z"); lz.setObjectName("LpMuted"); ar.addWidget(lz); ar.addWidget(self.cz)
+        # (15/11) Reverse only: the whole world (± 30 million blocks), nearest the centre first
+        self.whole = QToolButton(); self.whole.setText("Whole world"); self.whole.setObjectName("LpChip")
+        self.whole.setProperty("compact", True); self.whole.setCheckable(True)
+        self.whole.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.whole.setToolTip("Reverse: the whole world, ± 30 million blocks (the nearest to X Z first).")
+        self.whole.setChecked(True)                     # (15/11) the default in Reverse
+        self.whole.toggled.connect(lambda on: (self.radius.setEnabled(not on), self._query_changed()))
+        self.whole.hide()
+        ar.addWidget(self.whole)
         ar.addStretch(1)
         v.addLayout(ar)
         self.pal_box = QWidget()
@@ -1292,7 +1502,20 @@ class LootPage(QWidget):
         return [t for t in ls.tables(self.version) if any(t.startswith(p) for p in pre)
                 and "dispenser" not in t]
 
+    # (15/11) a radius that suits them: the strongholds are 1 300 – 2 800 blocks
+    # from 0 0 (the first ring); a mineshaft every ~250 chunks, each slow to replay
+    # (20/11) a dungeon every ~140 chunks (1.16), each chunk's terrain computed: 200
+    _RADIUS = {"stronghold": 3000, "mineshaft": 300, "dungeon": 200}
+
     def _pick_struct(self, key):
+        old = self.key
+        mem = self.__dict__.setdefault("_radius_by", {})
+        if key != old and hasattr(self, "radius"):
+            cur = self.radius.value()
+            mem[old if old in self._RADIUS else "__normal"] = cur
+            want = mem.get(key, self._RADIUS[key]) if key in self._RADIUS else mem.get("__normal", cur)
+            if want != self.radius.value():
+                self.radius.blockSignals(True); self.radius.setValue(want); self.radius.blockSignals(False)
         self.key = key
         for k, t in self.tiles.items():
             t.setChecked(k == key)
@@ -1312,22 +1535,43 @@ class LootPage(QWidget):
             if it.widget():
                 it.widget().deleteLater()
         self.chest_btns = {}
+        many = nt > 6                                   # (15/11) a village: compact chips + « All »
+        if many:
+            al = QToolButton(); al.setText("All"); al.setObjectName("LpChip")
+            al.setProperty("compact", True); al.setProperty("all", True)
+            al.setCursor(Qt.CursorShape.PointingHandCursor)
+            al.clicked.connect(self._chests_all)
+            self.chest_row.addWidget(al)
         for tb in tabs if nt > 1 else []:
             g, n = table_label(tb)
-            b = QToolButton(); b.setText(" " + (n or g)); b.setObjectName("LpChip"); b.setCheckable(True)
-            img = container_icon("barrel" if "barrel" in tb else "chest", 36, self.version)
-            if img is not None:
-                pm = QPixmap.fromImage(img); pm.setDevicePixelRatio(img.width() / 18)
-                b.setIcon(pm); b.setIconSize(QSize(18, 18))
+            b = _ChestChip(); b.setText((" " if not many else "") + (n or g)); b.setObjectName("LpChip")
+            b.setCheckable(True)
+            if not many:
+                img = container_icon("barrel" if "barrel" in tb else "chest", 36, self.version)
+                if img is not None:
+                    pm = QPixmap.fromImage(img); pm.setDevicePixelRatio(img.width() / 18)
+                    b.setIcon(pm); b.setIconSize(QSize(18, 18))
+            else:
+                b.setProperty("compact", True)
             b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             b.setChecked(True); b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setToolTip("Search in this chest (click to leave it out)")
+            b.setToolTip("Click: leave it out · double-click: only this one")
             b.toggled.connect(lambda *_: self._query_changed())
+            b.solo.connect(lambda t=tb: self._chests_solo(t))
             self.chest_row.addWidget(b)
             self.chest_btns[tb] = b
-        self.chest_row.addStretch(1)
         self.chest_w.setVisible(nt > 1)
         self._update_tiles()
+
+    def _chests_all(self):
+        for b in self.chest_btns.values():
+            b.blockSignals(True); b.setChecked(True); b.blockSignals(False)
+        self._query_changed()
+
+    def _chests_solo(self, tb):
+        for t, b in self.chest_btns.items():
+            b.blockSignals(True); b.setChecked(t == tb); b.blockSignals(False)
+        self._query_changed()
 
     def _update_tiles(self):
         ver = self.version
@@ -1336,7 +1580,7 @@ class LootPage(QWidget):
             pre = _SCOPE.get(k, ())
             ok = any(any(tb.startswith(p) for p in pre) for tb in have)
             t.setEnabled(ok)
-            t.setToolTip(struct_icons.label(_ICON_KEY.get(k, k)) + ("" if ok else "\nNot in this version"))
+            t.setToolTip("" if ok else "Not in this version")
 
     def _add_item(self):
         d = _Picker(self, self.version, self._sel_tables())
@@ -1411,7 +1655,9 @@ class LootPage(QWidget):
         mc = int(self.world.mc)
         ver, sub = _version(mc)
         tabs = self._sel_tables()
-        return dict(key=self.key, mc=mc, sub=sub, radius=self.radius.value(),
+        world = (getattr(self, "whole", None) is not None and self.whole.isChecked()
+                 and getattr(self, "smode", None) is not None and self.smode.value() == "Reverse")
+        return dict(key=self.key, mc=mc, sub=sub, radius=WORLD if world else self.radius.value(),
                     cx=self.cx.value(), cz=self.cz.value(),
                     items=[dict(w.d) for w in self.wants],
                     scope="structure" if self.scope.value().startswith("Whole") else "chest",
@@ -1430,10 +1676,108 @@ class LootPage(QWidget):
             self.paused = None                          # another query: Start begins again
         self._odds_timer.start()
         self._refresh_run()
+        if not getattr(self, "_restoring", False):
+            self.changed.emit()
+
+    # ── (15/11) kept between launches (ui_state) ─────────────────────────────
+    def ui_save(self):
+        """everything that is asked and how the search runs (not the results)"""
+        return dict(key=self.key, wants=[dict(w.d) for w in self.wants],
+                    chests={t: bool(b.isChecked()) for t, b in self.chest_btns.items()},
+                    mode=self.mode.value(), scope=self.scope.value(), layout=list(self.grid.cells),
+                    radius=self.radius.value(), cx=self.cx.value(), cz=self.cz.value(),
+                    whole=bool(self.whole.isChecked()), whole_v=2, smode=self.smode.value(),
+                    start_other=getattr(self.start_src, "other", None), threads=self.threads.value(),
+                    rule=self.rule_kind.currentData(), rule_seeds=self.rule_seeds.text(),
+                    rule_results=self.rule_results.value(),
+                    rule_time=self.rule_time.time().toString("HH:mm"), view=self.view_seg.value())
+
+    def ui_results(self, cap=5000):
+        return dict(query=self.query_running, hits=[list(h) for h in self.hits[:cap]])
+
+    def ui_restore(self, d, res=None):
+        if not isinstance(d, dict):
+            return
+        self._restoring = True
+        try:
+            key = d.get("key")
+            if key in self.tiles and key != self.key:
+                self._pick_struct(key)
+            wants = []
+            for w in d.get("wants") or []:
+                if isinstance(w, dict) and w.get("item"):
+                    x = _Want(str(w["item"]))
+                    x.d.update({k: w[k] for k in x.d if k in w})
+                    wants.append(x)
+            self.wants = wants
+            cells = d.get("layout")
+            if isinstance(cells, list) and len(cells) == 27:
+                self.grid.cells = [list(c) if isinstance(c, list) else c for c in cells]
+            for seg, v in ((self.mode, d.get("mode")), (self.scope, d.get("scope"))):
+                if v in seg.buttons and seg.value() != v:
+                    seg.set_value(v)
+                    seg.changed.emit(v)
+            self._rebuild_wants()
+            for t, on in (d.get("chests") or {}).items():
+                b = self.chest_btns.get(t)
+                if b is not None:
+                    b.blockSignals(True); b.setChecked(bool(on)); b.blockSignals(False)
+            for w, v in ((self.radius, d.get("radius")), (self.threads, d.get("threads")),
+                         (self.rule_results, d.get("rule_results"))):
+                if isinstance(v, int):
+                    w.setValue(v)
+            for w, v in ((self.cx, d.get("cx")), (self.cz, d.get("cz"))):
+                try:
+                    w.setValue(int(v))
+                except (TypeError, ValueError):
+                    pass
+            i = self.rule_kind.findData(d.get("rule"))
+            if i >= 0:
+                self.rule_kind.setCurrentIndex(i)
+            if d.get("rule_seeds"):
+                self.rule_seeds.setText(str(d["rule_seeds"]))
+            t = QTime.fromString(str(d.get("rule_time") or ""), "HH:mm")
+            if t.isValid():
+                self.rule_time.setTime(t)
+            if d.get("start_other") is not None:
+                try:
+                    self.start_src.set_other(d["start_other"])
+                except Exception:                        # noqa: BLE001
+                    pass
+            if d.get("smode") in dict(self.smode.modes):
+                self.smode.set_value(d["smode"], emit=True)
+            wh = bool(d.get("whole")) if d.get("whole_v") == 2 else True    # (15/11) default: on
+            if wh != self.whole.isChecked():
+                self.whole.setChecked(wh)
+            v = d.get("view")
+            if v in self.view_seg.buttons and self.view_seg.value() != v:
+                self.view_seg.set_value(v)
+                self.view_seg.changed.emit(v)
+        finally:
+            self._restoring = False
+        self._query_changed()
+        if isinstance(res, dict) and res.get("hits"):
+            self.query_running = dict(res.get("query") or {})
+            self.hits, self._seen = [], set()
+            self.table.setRowCount(0)
+            for h in res["hits"]:
+                try:
+                    h = (int(h[0]), int(h[1]), int(h[2]), h[3], list(h[4]))
+                except (TypeError, ValueError, IndexError):
+                    continue
+                self.hits.append(h)
+                self._seen.add(h[:3])
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                self._set_row(r, h)
+            self.res_count.setText(f"{len(self.hits):,}".replace(",", " "))
+            self.res_stack.setCurrentIndex(1 if self.hits else 0)
 
     # ── how rare: exact (loot_exact), in its own process ─────────────────────
     def _odds(self):
         q = self.query()
+        self.rarity.scope_title = ("ONE STRUCTURE IN" if q.get("scope") == "structure"
+                                   and q.get("mode") != "layout" else "ONE CHEST IN")
         if not q["items"] and not (q["mode"] == "layout" and any(c is not None for c in q["layout"])):
             self.rarity.set_none("Add what you want")
             return
@@ -1495,6 +1839,9 @@ class LootPage(QWidget):
             self.rarity.set_none("Could not compute")
             self.rarity.setToolTip(res)
             return
+        if res and res[0][0] == lf.STRUCT:
+            self._odds_structure(q, res[0], approx)
+            return
         ok = [(t, _R(*r), b) for t, r, b, _x in res if r is not None]
         tip = "\n".join(f"{table_label(t)[1] or table_label(t)[0]}: "
                         + ("impossible" if r.impossible else f"1 in {_one_in(r.p)}  ({r.p * 100:.6g} %)")
@@ -1524,8 +1871,52 @@ class LootPage(QWidget):
             self._impossible = True
             self.rarity.set_value(0.0, "never in these chests" if len(res) > 1 else "never in this chest")
         else:
-            sub = (f"≈ {pct(p)}" if best is None else f"{p * 100:.4g} %") + (f"\n{where}" if where else "")
+            ex, tip2 = _exists(p)
+            sub = ((f"≈ {pct(p)}" if best is None else _pct_plain(p)) + f"  ·  {ex}"
+                   + (f"\n{where}" if where else ""))
             self.rarity.set_value(p, sub)
+            self.rarity.setToolTip((self.rarity.toolTip() + "\n\n" if self.rarity.toolTip() else "") + tip2)
+        self._refresh_run()
+
+    def _odds_structure(self, q, row, approx):
+        """(15/11) « In the whole structure »: one structure in N, over all its chests
+        (it used to show one chest's odds: more than one chest can hold was
+        « impossible »)."""
+        _t, r, bio, exact, info = row
+        sets = info.get("chests") or []
+        full = [(c, sh) for c, sh in sets if c > 0]
+        none = sum(sh for c, sh in sets if c == 0)
+        if not full:
+            nch = "no chest"
+        else:
+            lo, hi = min(c for c, _s in full), max(c for c, _s in full)
+            nch = f"{lo} chest{'s' if lo != 1 else ''}" if lo == hi else f"{lo}–{hi} chests"
+            if none >= 0.005:
+                nch += f" · none in {none * 100:.0f} %"
+        where = nch + (" · in " + bio.replace("_", " ").title() if bio else "")
+        share = ", ".join(f"{c} chest{'s' if c != 1 else ''}: {sh * 100:.0f} %" for c, sh in sets)
+        self.rarity.setToolTip(
+            ("Exact: every draw of each chest's fill counted, " if exact else
+             "Simulated (a table the exact count cannot read), ")
+            + f"over the chests of {info.get('n', 0)} real structures ({share}).")
+        if r is None:
+            p, mx = (approx or 0.0), None
+        else:
+            p, mx = r
+        if q["mode"] == "most" and mx is not None:
+            if not mx:
+                self._impossible = True
+            mn = q["items"][0].get("min") or 1
+            self.rarity.set_value(p if mx else 0.0,
+                                  (f"≥ {mn}: 1 structure in {_one_in(p)}" if p > 0 else "")
+                                  + (f"\n{where}" if where else ""),
+                                  "THE MOST IN ONE STRUCTURE", big=(f"up to ×{mx}" if mx else None))
+        elif p <= 0:
+            self._impossible = r is not None
+            self.rarity.set_value(0.0, "never in this structure", "ONE STRUCTURE IN")
+        else:
+            sub = (f"≈ {pct(p)}" if r is None else _pct_plain(p)) + (f"\n{where}" if where else "")
+            self.rarity.set_value(p, sub, "ONE STRUCTURE IN")
         self._refresh_run()
 
     # ── results ──────────────────────────────────────────────────────────────
@@ -1551,7 +1942,8 @@ class LootPage(QWidget):
         self.table.setHorizontalHeaderLabels(["Seed", "Where", "Found"])
         self.table.horizontalHeaderItem(0).setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.table.verticalHeader().hide()
-        self.table.verticalHeader().setDefaultSectionSize(34)
+        self.table.verticalHeader().setDefaultSectionSize(40)
+        self.table.setMouseTracking(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1661,11 +2053,29 @@ class LootPage(QWidget):
         self.pv_copy.setEnabled(False)
         hd.addWidget(self.pv_copy)
         self.pv_map = QPushButton("  Open on the map"); self.pv_map.setProperty("kind", "primary")
-        icons.bind(self.pv_map, "map", 16, "#ffffff", "#ffffff")
+        icons.bind(self.pv_map, "map", 16, "on_accent", "on_accent")
         self.pv_map.clicked.connect(self._open_map)
         self.pv_map.setEnabled(False)
         hd.addWidget(self.pv_map)
         v.addLayout(hd)
+        # (15/11) what is wanted, counted over the whole structure; only the matching chests
+        tr = QHBoxLayout(); tr.setSpacing(6); tr.setContentsMargins(0, 0, 0, 0)
+        self.pv_tot_lab = QLabel("IN THE STRUCTURE"); self.pv_tot_lab.setObjectName("FieldLabel")
+        tr.addWidget(self.pv_tot_lab)
+        self.pv_totals = QHBoxLayout(); self.pv_totals.setSpacing(6)
+        tr.addLayout(self.pv_totals)
+        tr.addStretch(1)
+        from PySide6.QtCore import QSettings
+        self.pv_only = QToolButton(); self.pv_only.setText("Matching chests only")
+        self.pv_only.setObjectName("LpChip"); self.pv_only.setProperty("compact", True)
+        self.pv_only.setCheckable(True); self.pv_only.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.pv_only.setChecked(QSettings("SSA", "SimpleSeedAnalyser").value("loot/matching_only", False, type=bool))
+        self.pv_only.setToolTip("Show only the chests that have what you want (in yellow).")
+        self.pv_only.toggled.connect(self._only_toggled)
+        tr.addWidget(self.pv_only)
+        self.pv_tot_row = QWidget(); self.pv_tot_row.setLayout(tr)
+        self.pv_tot_row.hide()
+        v.addWidget(self.pv_tot_row)
         self.pv_area = QScrollArea(); self.pv_area.setWidgetResizable(True)
         self.pv_area.setFrameShape(QFrame.Shape.NoFrame)
         self.pv_area.setStyleSheet("QScrollArea { background: transparent; } QScrollArea > QWidget > QWidget { background: transparent; }")
@@ -1697,6 +2107,8 @@ class LootPage(QWidget):
         self.pv_sub.setText(f"Seed {seed}")
         import structure_loot as sl
         lk = lf.LOOT_KEY.get(key, key)
+        self._pv_last = None                             # (the totals of the previous one go)
+        self._fill_totals()
         w = QWidget(); lay = QVBoxLayout(w); m = QLabel("Computing the chests…"); m.setObjectName("LpMuted")
         lay.addWidget(m); lay.addStretch(1)
         self.pv_area.setWidget(w)
@@ -1710,19 +2122,9 @@ class LootPage(QWidget):
         def show(cards):
             if tok is not self._pv_tok:
                 return
-            from .loot_dialog import ChestCard
-            ww = QWidget(); ll = QVBoxLayout(ww); ll.setSpacing(12); ll.setContentsMargins(0, 0, 0, 0)
-            order = list(hits) + [i for i in range(len(cards or [])) if i not in hits]
-            for i in order:
-                if i >= len(cards) or cards[i].get("slots") is None:
-                    continue
-                c = ChestCard(cards[i], _version(q["mc"])[0], lk, self)
-                if i in hits:
-                    c.setStyleSheet("#LootCard { border: 2px solid #ffc928; }")
-                ll.addWidget(c)
-            ll.addStretch(1)
-            self.pv_area.setWidget(ww)
-            fade_in(ww, 240)
+            self._pv_last = (cards or [], list(hits), q, lk)
+            self._fill_totals()
+            self._render_chests(fade=True)
         if fut is None:
             show(sl.chests(lk, seed, q["mc"], x, z, q.get("sub")))
             return
@@ -1738,6 +2140,79 @@ class LootPage(QWidget):
             except Exception:                            # noqa: BLE001
                 pass
         QTimer.singleShot(30, poll)
+
+    def _render_chests(self, fade=False):
+        """the chests of the selected result: the matching ones first (in yellow), or
+        only them (« Matching chests only »)"""
+        last = getattr(self, "_pv_last", None)
+        if last is None:
+            return
+        cards, hits, q, lk = last
+        from .loot_dialog import ChestCard
+        ww = QWidget(); ll = QVBoxLayout(ww); ll.setSpacing(12); ll.setContentsMargins(0, 0, 0, 0)
+        only = self.pv_only.isChecked() and bool(hits)
+        order = list(hits) + ([] if only else [i for i in range(len(cards)) if i not in hits])
+        for i in order:
+            if i >= len(cards) or cards[i].get("slots") is None:
+                continue
+            c = ChestCard(cards[i], _version(q["mc"])[0], lk, self)
+            if i in hits:
+                c.setStyleSheet("#LootCard { border: 2px solid #ffc928; }")
+            ll.addWidget(c)
+        hidden = sum(1 for i in range(len(cards)) if i not in hits and cards[i].get("slots") is not None)
+        if only and hidden:
+            m = QLabel(f"{hidden} other chest{'s' * (hidden != 1)} hidden"); m.setObjectName("LpMuted")
+            m.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            ll.addWidget(m)
+        ll.addStretch(1)
+        self.pv_area.setWidget(ww)
+        if fade:
+            fade_in(ww, 240)
+
+    def _only_toggled(self, on):
+        from PySide6.QtCore import QSettings
+        QSettings("SSA", "SimpleSeedAnalyser").setValue("loot/matching_only", bool(on))
+        self._render_chests()
+
+    def _fill_totals(self):
+        """(15/11) each wanted item counted over the structure's chests (those of the
+        chests searched), e.g. 113 bones"""
+        while self.pv_totals.count():
+            it = self.pv_totals.takeAt(0)
+            if it.widget() is not None:
+                it.widget().deleteLater()
+        last = getattr(self, "_pv_last", None)
+        if last is None:
+            self.pv_tot_row.hide()
+            return
+        cards, _hits, q, _lk = last
+        items = q.get("items") or []
+        tabs = q.get("tables")
+        cs = [c for c in cards if c.get("slots") is not None
+              and (not tabs or str(c.get("table", "")).replace("chests/", "") in tabs)]
+        ver = _version(q["mc"])[0]
+        from .mc_widgets import icon as _icon
+        names = dict(_enchants(ver))
+        for w in items:
+            n = sum(lf._count(c["slots"], w) for c in cs)
+            chip = QFrame(); chip.setObjectName("LpTotal")
+            h = QHBoxLayout(chip); h.setContentsMargins(4, 1, 9, 1); h.setSpacing(4)
+            st = _Stub(w)
+            img = _icon(st, 40, ver)
+            nm = display_name(st, ver)
+            if img is not None:
+                ic = QLabel(); ic.setFixedSize(20, 20)
+                ic.setPixmap(_pm(img, 20))
+                h.addWidget(ic)
+            t = QLabel(f"{n:,}".replace(",", " ") + ("" if img is not None else f" {nm}"))
+            t.setFont(theme.num_font(9.5, QFont.Weight.DemiBold))
+            h.addWidget(t)
+            if w.get("ench"):
+                nm += f" ({names.get(w['ench'], w['ench'])}" + (f" {w.get('ench_lvl')}+" if (w.get("ench_lvl") or 1) > 1 else "") + ")"
+            chip.setToolTip(f"{n} {nm} in the structure")
+            self.pv_totals.addWidget(chip)
+        self.pv_tot_lab.setText("IN THE STRUCTURE" if len(cs) > 1 else "IN THE CHEST")
+        self.pv_tot_row.setVisible(bool(items))
 
     def open_table(self, table, focus_slots=None):          # ChestCard's « Loot table »
         from .loot_table_dialog import LootTableDialog
@@ -1762,8 +2237,8 @@ class LootPage(QWidget):
         def labeled(text, w, tip=None):
             c = QVBoxLayout(); c.setSpacing(2)
             lab = QLabel(text.upper()); lab.setObjectName("FieldLabel"); c.addWidget(lab); c.addWidget(w)
-            if tip:
-                w.setToolTip(tip); lab.setToolTip(tip)
+            if tip:                          # (19/11) on the control only
+                w.setToolTip(tip)
             row.addLayout(c)
         self.smode = ModePicker(_MODE_DESC, "Incremental")
         self.smode.changed.connect(lambda *_: self._sync_start_ui())
@@ -1782,11 +2257,11 @@ class LootPage(QWidget):
         dice.clicked.connect(lambda: (self.start_seed.setText(str(random_seed() >> 1)),
                                       self.start_src.edited(self.start_seed.text())))
         self.start_src.bind_dice(dice)
-        row.addLayout(self.start_src.layout(sw, "The first seed searched (Incremental)."))
+        row.addLayout(self.start_src.layout(sw))
         self.threads = QSpinBox(); self.threads.setRange(1, max(1, min(61, os.cpu_count() or 4)))
         self.threads.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.threads.setValue(max(1, (os.cpu_count() or 4) - 1))
-        labeled("Processes", self.threads, "Worker processes (every one is used).")
+        labeled("Processes", self.threads)
         self.rule_kind = QComboBox()
         for text, key in (("Never", "never"), ("Seeds searched", "seeds"),
                           ("Results found", "results"), ("Time", "time")):
@@ -1813,7 +2288,13 @@ class LootPage(QWidget):
         labeled("Source", self.list_btn)
         row.addStretch(1)
         self.b_start = AdaptiveButton("  Start"); self.b_start.setProperty("kind", "primary")
-        icons.bind(self.b_start, "play", 16, "#ffffff", "#ffffff")
+        from .widgets import accent_glow             # (14/11) as on the Sessions page
+        from .motion import Shine
+        self._start_glow = accent_glow(self.b_start, "loot")
+        self._start_shine = Shine(self.b_start, every=(8.0, 15.0))
+        from .motion import Spot                     # (15/11)
+        self._start_spot = Spot(self.b_start)
+        icons.bind(self.b_start, "play", 16, "on_accent", "on_accent")
         self.b_start.clicked.connect(self._start_or_resume)
         self.b_pause = AdaptiveButton("  Pause"); icons.bind(self.b_pause, "pause", 16)
         self.b_pause.clicked.connect(self._pause)
@@ -1825,8 +2306,8 @@ class LootPage(QWidget):
         prow = QHBoxLayout(); prow.setSpacing(12)
         self.prog = QProgressBar(); self.prog.setRange(0, 1000); self.prog.setTextVisible(False)
         self.prog.setFixedHeight(6); prow.addWidget(self.prog, 1)
-        self.stat = QLabel("Idle"); self.stat.setObjectName("Muted"); self.stat.setFont(theme.mono_font(9))
-        prow.addWidget(self.stat)
+        self.stat = _StatLabel("Idle"); self.stat.setObjectName("Muted"); self.stat.setFont(theme.mono_font(9))
+        prow.addWidget(self.stat, 2)
         self.engine_chip = QLabel("CPU · exact chests"); self.engine_chip.setObjectName("Chip")
         self.engine_chip.setProperty("state", "off")
         self.engine_chip.setToolTip("Every structure near the centre is generated with its chests,\n"
@@ -1847,6 +2328,12 @@ class LootPage(QWidget):
         for w in (self.rule_kind, self.rule_stack, self.list_btn):
             w.setEnabled(idle)
         self.threads.setEnabled(idle)
+        rev = self.smode.value() == "Reverse" and self.seed_list is None
+        if self.whole.isHidden() == rev:                # (15/11) the whole world: Reverse only
+            self.whole.setVisible(rev)
+            self.radius.setEnabled(not (rev and self.whole.isChecked()))
+            self._query_changed()
+        self.whole.setEnabled(idle)
         self._refresh_run()
 
     def _seed_list(self):
@@ -1894,17 +2381,33 @@ class LootPage(QWidget):
         ok = bool(q["items"]) or (q["mode"] == "layout" and any(c is not None for c in q["layout"]))
         running = self.search is not None
         never = getattr(self, "_impossible", False)
-        self.b_start.setEnabled(not running and ((ok and not never) or self.paused is not None))
+        why = self._reverse_why(q)
+        self.smode.set_available("Reverse", why is None, why or "")
+        rev_no = (self.smode.value() == "Reverse" and self.seed_list is None and why is not None
+                  and self.paused is None)
+        self.b_start.setEnabled(not running and ((ok and not never and not rev_no) or self.paused is not None))
         self.b_start.setText("  Resume" if (self.paused is not None and not running) else "  Start")
         self.b_pause.setEnabled(running)
         self.b_stop.setEnabled(running or self.paused is not None)
         if not running and self.paused is None:
+            idle = ("Add what you want", "Impossible in these chests: nothing to search")
             if not ok:
                 self.stat.setText("Add what you want")
             elif never:
                 self.stat.setText("Impossible in these chests: nothing to search")
-            elif self.stat.text() in ("Add what you want", "Impossible in these chests: nothing to search"):
+            elif rev_no:
+                self.stat.setText(why)
+            elif self.stat.text() in idle or getattr(self, "_rev_msg", None) == self.stat.text():
                 self.stat.setText("Idle")
+            self._rev_msg = why if rev_no else None
+
+    def _reverse_why(self, q):
+        """(15/11) None when the Reverse mode can search this query, else why not"""
+        try:
+            import loot_reverse as lr
+            return lr.supported(q, check_lib=False)
+        except Exception:                                # noqa: BLE001
+            return "Reverse is not available here."
 
     def _start_or_resume(self):
         if self.search is not None:
@@ -1924,6 +2427,17 @@ class LootPage(QWidget):
             source = ("list", self.seed_list)
         elif self.smode.value() == "Random":
             source = ("random", None)
+        elif self.smode.value() == "Reverse":
+            q0 = self.query()
+            try:
+                import loot_reverse as lr
+                why = lr.supported(q0)                  # (the library this time)
+            except Exception as e:                       # noqa: BLE001
+                why = f"Reverse is not available: {e}"
+            if why:
+                self.stat.setText(why)
+                return
+            source = ("reverse", None)
         else:
             source = ("range", parse_seed(self.start_seed.text()) or 0)
         q = self.query()
@@ -1934,8 +2448,16 @@ class LootPage(QWidget):
 
     def _launch(self, q, source, rule, state):
         bus = self.bus
-        s = lf.Search(q, self.threads.value(), lambda *h: bus.hit.emit(h),
-                      lambda *a: bus.progress.emit(a), source, rule, state)
+        if source[0] == "reverse":                       # (15/11) chests first, then seeds
+            import loot_reverse as lr
+            rr = rule                                    # « Never »: a pause every REVERSE_CAP results
+            if rule[0] == "never":
+                rr = ("results", int((state or {}).get("found", 0)) + REVERSE_CAP)
+            s = lr.ReverseSearch(q, self.threads.value(), lambda *h: bus.hit.emit(h),
+                                 lambda *a: bus.progress.emit(a), source, rr, state)
+        else:
+            s = lf.Search(q, self.threads.value(), lambda *h: bus.hit.emit(h),
+                          lambda *a: bus.progress.emit(a), source, rule, state)
         self.search = s
         self._run = (q, source, rule)
 
@@ -1951,10 +2473,15 @@ class LootPage(QWidget):
             vm = loot_native.available()
         except Exception:                                # noqa: BLE001
             vm = False
-        self.engine_chip.setText(f"{'C' if vm else 'Python'} · {self.threads.value()} processes")
-        self.engine_chip.setToolTip("The chests are filled and checked in C (lootvm), the same draws as "
-                                    "the game." if vm else "lootvm is not built: the chests are filled in "
-                                    "Python (slower). py tools/build_native.py --lootvm")
+        if source[0] == "reverse":
+            self.engine_chip.setText(f"Reverse · {self.threads.value()} processes")
+            self.engine_chip.setToolTip("The chests that have it are found first (every draw of the fill "
+                                        "traced back), then the structures and the seeds around them.")
+        else:
+            self.engine_chip.setText(f"{'C' if vm else 'Python'} · {self.threads.value()} processes")
+            self.engine_chip.setToolTip("The chests are filled and checked in C (lootvm), the same draws as "
+                                        "the game." if vm else "lootvm is not built: the chests are filled in "
+                                        "Python (slower). py tools/build_native.py --lootvm")
         self.engine_chip.setProperty("state", "ok")
         self.engine_chip.style().unpolish(self.engine_chip); self.engine_chip.style().polish(self.engine_chip)
         self.stat.setText("Starting…")
@@ -1981,11 +2508,21 @@ class LootPage(QWidget):
         done, total, rate, found, el = a
         from .sessions_page import fmt_int, fmt_rate, fmt_time
         if total:
-            self.prog.setRange(0, 1000); self.prog.setValue(int(1000 * done / max(1, total)))
+            if self.prog.maximum() != 1000:
+                self.prog.setRange(0, 1000)
+            self.prog.setValue(int(1000 * done / max(1, total)))
+        elif self.prog.maximum() != 0:
+            self.prog.setRange(0, 0)                     # busy (set once: no restart)
+        note = getattr(self.search, "note", None)          # (15/11) Reverse: where it is
+        note = note() if callable(note) else None
+        tip = REVERSE_SPEED_TIP if note else ""
+        if self.stat._tip != tip:
+            self.stat.setToolTip(tip)
+        if note and not done:                            # Reverse, still looking: its own figures
+            self.stat.setText(f"{fmt_time(el)} · {note}")
         else:
-            self.prog.setRange(0, 0)                     # busy
-        self.stat.setText(f"{fmt_int(done)} seeds · {fmt_time(el)} · {fmt_rate(rate)} · "
-                          f"{fmt_int(found)} found")
+            self.stat.setText(f"{fmt_int(done)} seeds · {fmt_time(el)} · {fmt_rate(rate)} · "
+                              f"{fmt_int(found)} found" + (f" · {note}" if note else ""))
 
     def _done(self, st):
         from .sessions_page import fmt_int, fmt_time
@@ -1994,18 +2531,28 @@ class LootPage(QWidget):
         self.engine_chip.setText("CPU · exact chests"); self.engine_chip.setProperty("state", "off")
         self.engine_chip.style().unpolish(self.engine_chip); self.engine_chip.style().polish(self.engine_chip)
         end = (st or {}).get("end", "stopped")
+        note = (st or {}).get("note")
+        rev = self._run[1][0] == "reverse"
         if st is not None and end in ("paused", "rule"):
             q, source, rule = self._run
             self.paused = (q, source, rule, st)
             why = "Paused" if end == "paused" else "Paused (stop rule — raise it to go on)"
+            if rev and end == "rule" and rule[0] == "never":
+                why = "Paused (Resume for more)"
             self.stat.setText(f"{why} · {fmt_int(st['done'])} seeds · {fmt_time(st['elapsed'])} · "
-                              f"{fmt_int(st['found'])} found")
+                              f"{fmt_int(st['found'])} found" + (f" · {note}" if rev and note else ""))
         else:
             self._ended(st)
             if st is not None:
                 self.prog.setValue(1000 if end == "done" else self.prog.value())
-                self.stat.setText(f"{'Done' if end == 'done' else 'Stopped'} · {fmt_int(st['done'])} seeds · "
-                                  f"{fmt_time(st['elapsed'])} · {fmt_int(st['found'])} found")
+                if rev and note == "impossible":
+                    self.stat.setText("No structure can have this: every chest of these tables was traced"
+                                      if self._run[0].get("scope") == "structure" else
+                                      "No chest can have this: every chest of these tables was traced")
+                else:
+                    self.stat.setText(f"{'Done' if end == 'done' else 'Stopped'} · {fmt_int(st['done'])} seeds · "
+                                      f"{fmt_time(st['elapsed'])} · {fmt_int(st['found'])} found"
+                                      + (f" · {note}" if rev and note else ""))
         self._sync_start_ui()
         self.status.emit(f"Loot: {len(self.hits)} seed(s)")
 

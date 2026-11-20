@@ -68,11 +68,17 @@ LABELS = {
 VALUES = {
     "restore_state": True,          # come back as SSA was closed (ui_state)
     "inertia": True,                # the map keeps sliding after a drag
+    "plans_enhanced": True,         # (15/11) structures on the map: coloured rim, clearer colours (off: as before)
+    "motion": True,                 # (14/11) animations: transitions, lights (qtui/motion.py)
+    "launch_anim": True,            # (20/11) SSA opens with its short animation (qtui/launch.py)
+    "tips": True,                   # (19/11) the help bubbles (tooltips, qtui/bubbles.py)
     "zoom_speed": 1.0,              # wheel zoom step factor
     "struct_max_bpp": 48.0,         # structures shown up to this zoom (blocks / pixel)
     "struct_max_bpp_by": "",        # (31/10) per structure: "key=bpp;key=bpp" ("" = all as above)
     "struct_boxes": True,           # (22/10) the footprint box of each structure when zoomed in
     "hide_structs_on_noise": False, # (22/10) no structures over a noise / height layer
+    "auto_names": True,             # (15/11) a condition without a label is named from its settings
+    "map_memory": 0,                # (15/11) MB the map may keep (0 = Auto: a share of the RAM, qtui/memory.py)
     "use_gpu": True,                # RESTART: NVIDIA GPU libraries
     "ui_scale": 100,                # RESTART: interface scale in %
     "java_home": "",                # JDK 17 for the Minecraft check ("" = automatic)

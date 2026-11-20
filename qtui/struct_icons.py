@@ -286,11 +286,13 @@ def _glyph(k: str, p: QPainter, ink: QColor, bg: QColor):
         path.quadTo(12, 3.5, 20.2, 12); path.quadTo(12, 20.5, 3.8, 12); p.drawPath(path)
         p.setBrush(QColor("#0f3b28")); p.drawEllipse(QPointF(12, 12), 3.6, 3.6)
         p.setBrush(QColor("#7ef0b4")); p.drawEllipse(QPointF(12, 12), 1.5, 1.5)
-    elif k == "origin":                              # crosshair
-        stroke(1.8)
-        p.drawEllipse(QPointF(12, 12), 5, 5)
-        p.drawLine(QPointF(12, 3.5), QPointF(12, 8)); p.drawLine(QPointF(12, 16), QPointF(12, 20.5))
-        p.drawLine(QPointF(3.5, 12), QPointF(8, 12)); p.drawLine(QPointF(16, 12), QPointF(20.5, 12))
+    elif k == "origin":                              # (19/11) a sight: ring, four ticks, a dot —
+        stroke(2.0)                                  # the same on the map and in the Layers panel
+        p.drawEllipse(QPointF(12, 12), 5.6, 5.6)
+        p.drawLine(QPointF(12, 2.6), QPointF(12, 7.2)); p.drawLine(QPointF(12, 16.8), QPointF(12, 21.4))
+        p.drawLine(QPointF(2.6, 12), QPointF(7.2, 12)); p.drawLine(QPointF(16.8, 12), QPointF(21.4, 12))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#ff5a5f"))
+        p.drawEllipse(QPointF(12, 12), 2.2, 2.2)
     elif k == "fortress":                            # battlements
         p.drawRect(QRectF(5, 10, 14, 8.5))
         for x in (5, 9.1, 13.2, 16.6):

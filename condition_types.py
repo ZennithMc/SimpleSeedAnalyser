@@ -62,6 +62,9 @@ CONDITION_TYPES = [
     {"key": "ruined_portal",    "name": "Ruined portal (overworld)", "category": "Structures", "icon": "🌀", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {"key": "shipwreck",        "name": "Shipwreck",         "category": "Structures", "icon": "⛵", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {"key": "treasure",         "name": "Buried treasure",   "category": "Structures", "icon": "💰", "desc": "", "params": {}},
+    # (15/11) the engine has always searched them (custom_search « mineshaft », the C builder,
+    # the cubiomes-viewer sessions); only the menu entry was missing
+    {"key": "mineshaft",        "name": "Mineshaft",         "category": "Structures", "icon": "⛏", "desc": "", "params": {}},
     {"key": "ancient_city",     "name": "Ancient city",      "category": "Structures", "icon": "🏛", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {"key": "trial_chambers",   "name": "Trial chambers",    "category": "Structures", "icon": "⚔", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},
     {"key": "ocean_ruin",       "name": "Ocean ruin",        "category": "Structures", "icon": "🌊", "desc": "", "params": {"use_gpu": {"type": "bool", "label": "GPU CUDA (48-bit only)", "default": False}}},

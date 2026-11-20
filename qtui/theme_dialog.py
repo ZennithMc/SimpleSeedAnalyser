@@ -39,7 +39,7 @@ class ThemeCard(QAbstractButton):
         self.setFixedSize(CARD_W, CARD_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.thumb = None
-        self.setToolTip(f"{name} — {theme.EXTRAS.get(name, {}).get('desc', '')}")
+        self.setToolTip(theme.EXTRAS.get(name, {}).get('desc', ''))     # (19/11) the card shows the name
 
     def sizeHint(self):
         return QSize(CARD_W, CARD_H)
@@ -67,6 +67,15 @@ class ThemeCard(QAbstractButton):
             g = QLinearGradient(top.topLeft(), top.bottomRight())
             g.setColorAt(0, QColor(t["base_top"])); g.setColorAt(1, QColor(t["base_bottom"]))
             p.fillRect(top, g)
+        ws = ex.get("ws") or {}
+        if ws and self.thumb is None:            # (14/11) a theme with a colour per workspace: its lights
+            from PySide6.QtGui import QRadialGradient
+            for key, fx, fy in (("map", 0.05, 0.0), ("loot", 0.98, 0.15), ("seedcrack", 0.55, 1.05)):
+                c = QColor((ws.get(key) or [t["accent"]])[0])
+                rg = QRadialGradient(top.left() + fx * top.width(), top.top() + fy * top.height(), top.width() * 0.55)
+                c.setAlphaF(0.42); rg.setColorAt(0, c)
+                c2 = QColor(c); c2.setAlphaF(0.0); rg.setColorAt(1, c2)
+                p.fillRect(top, rg)
         # a mini panel with two text lines and the accent
         panel = QRectF(top.left() + 14, top.top() + 16, top.width() - 28, top.height() - 32)
         pc = QColor(t["bg1"]); pc.setAlphaF(ex.get("panel", 1.0))
@@ -75,13 +84,23 @@ class ThemeCard(QAbstractButton):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(t["text"])); p.drawRoundedRect(QRectF(panel.left() + 10, panel.top() + 12, 70, 6), 3, 3)
         p.setBrush(QColor(t["text3"])); p.drawRoundedRect(QRectF(panel.left() + 10, panel.top() + 24, 46, 5), 2.5, 2.5)
-        acc = QRectF(panel.left() + 10, panel.bottom() - 22, 58, 14)
-        g = QLinearGradient(acc.topLeft(), acc.bottomRight())
-        g.setColorAt(0, QColor(t["accent"])); g.setColorAt(1, QColor(ex.get("accent2") or t["accent"]))
-        p.setBrush(g); p.drawRoundedRect(acc, 7, 7)
-        for i, k in enumerate(("ok", "warn", "danger")):
-            p.setBrush(QColor(t[k]))
-            p.drawEllipse(QRectF(panel.right() - 16 - i * 12, panel.bottom() - 19, 8, 8))
+        if ws:                                   # one pill per workspace
+            x = panel.left() + 10
+            for key in ("map", "sessions", "loot", "seedcrack", "drawing"):
+                pair = ws.get(key) or [t["accent"]]
+                pill = QRectF(x, panel.bottom() - 22, 25, 13)
+                g = QLinearGradient(pill.topLeft(), pill.bottomRight())
+                g.setColorAt(0, QColor(pair[0])); g.setColorAt(1, QColor(pair[-1]))
+                p.setBrush(g); p.drawRoundedRect(pill, 6.5, 6.5)
+                x += 29
+        else:
+            acc = QRectF(panel.left() + 10, panel.bottom() - 22, 58, 14)
+            g = QLinearGradient(acc.topLeft(), acc.bottomRight())
+            g.setColorAt(0, QColor(t["accent"])); g.setColorAt(1, QColor(ex.get("accent2") or t["accent"]))
+            p.setBrush(g); p.drawRoundedRect(acc, 7, 7)
+            for i, k in enumerate(("ok", "warn", "danger")):
+                p.setBrush(QColor(t[k]))
+                p.drawEllipse(QRectF(panel.right() - 16 - i * 12, panel.bottom() - 19, 8, 8))
         # caption
         cap = QRectF(r.left(), top.bottom(), r.width(), r.height() - THUMB_H)
         p.fillRect(cap, QColor(theme.BG2))
@@ -89,6 +108,13 @@ class ThemeCard(QAbstractButton):
         p.setFont(theme.ui_font(9.5, QFont.Weight.DemiBold))
         p.drawText(cap.adjusted(10, 5, -8, -20), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                    self.name)
+        if self.name == theme.DEFAULT_THEME:     # SSA's own
+            tw = p.fontMetrics().horizontalAdvance(self.name)
+            p.setFont(theme.ui_font(6.8, QFont.Weight.Bold))
+            tag = QRectF(cap.left() + 10 + tw + 8, cap.top() + 8, p.fontMetrics().horizontalAdvance("DEFAULT") + 12, 15)
+            tc = QColor(theme.ACCENT); tc.setAlphaF(0.20)
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(tc); p.drawRoundedRect(tag, 7.5, 7.5)
+            p.setPen(QColor(theme.ACCENT)); p.drawText(tag, Qt.AlignmentFlag.AlignCenter, "DEFAULT")
         p.setPen(QColor(theme.TEXT3)); p.setFont(theme.ui_font(8))
         d = p.fontMetrics().elidedText(ex.get("desc", ""), Qt.TextElideMode.ElideRight, int(cap.width() - 18))
         p.drawText(cap.adjusted(10, 22, -8, -4), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, d)
@@ -154,7 +180,7 @@ class ThemeDialog(QDialog):
         inner = QWidget(); iv = QVBoxLayout(inner); iv.setContentsMargins(0, 4, 8, 4); iv.setSpacing(10)
 
         self.cards = {}
-        groups = (("Plain & metal", ["Slate", "Midnight", "Daylight", "Graphite", "Copper"]),
+        groups = (("Plain & metal", ["Prism", "Slate", "Midnight", "Daylight", "Graphite", "Copper"]),
                   ("Marble", ["Obsidian Gold", "Carrara", "Emerald", "Lapis", "Rose Quartz",
                               "Arctic", "Glacier"]),
                   ("Minecraft", ["Deepslate", "Nether", "The End", "Mesa", "Amethyst",
@@ -303,7 +329,7 @@ class ThemeDialog(QDialog):
         c = self.cards.pop(old, None)
         if c is not None:
             c.name = new
-            c.setToolTip(f"{new} — {theme.EXTRAS.get(new, {}).get('desc', '')}")
+            c.setToolTip(theme.EXTRAS.get(new, {}).get('desc', ''))
             try:
                 c.clicked.disconnect()
             except (RuntimeError, TypeError):

@@ -91,9 +91,219 @@ def coord_dim(get, uid, depth=0):
     return cond_dim(c)
 
 
-def display_name(c: dict) -> str:
+def display_name(c: dict, zone=True) -> str:
+    """The custom label; without one, (15/11) a name made from the condition's own
+    settings (Settings → Searches: « Name the conditions from their settings »).
+    zone=False: without the area (the conditions list shows it in its own column)."""
     lab = (c.get("label") or "").strip()
-    return lab or type_name(c.get("type", ""))
+    if lab:
+        return lab
+    if _auto_on():
+        try:
+            return auto_name(c, zone)
+        except Exception:                            # noqa: BLE001 — never a broken list
+            pass
+    return type_name(c.get("type", ""))
+
+
+def _auto_on() -> bool:
+    try:
+        from . import prefs
+        return bool(prefs.get("auto_names"))
+    except Exception:                                # noqa: BLE001
+        return False
+
+
+def _n(v) -> str:
+    """12 000 · -11 500 · 0.25"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f == int(f):
+        return f"{int(f):,}".replace(",", " ")
+    return f"{f:g}"
+
+
+def _range(name, r, invert=False) -> str:
+    lo, hi = (list(r) + [None, None])[:2] if isinstance(r, (list, tuple)) else (None, None)
+    if lo is None and hi is None:
+        return name
+    if invert:
+        if lo is not None and hi is not None:
+            return f"{name} outside {_n(lo)}…{_n(hi)}"
+        return f"{name} < {_n(lo)}" if lo is not None else f"{name} > {_n(hi)}"
+    if lo is not None and hi is not None:
+        return f"{name} {_n(lo)}…{_n(hi)}"
+    return f"{name} ≥ {_n(lo)}" if lo is not None else f"{name} ≤ {_n(hi)}"
+
+
+def _biomes(ids, mc=None, most=2) -> str:
+    try:
+        from biome_catalog import biome_display_name
+        names = [biome_display_name(int(b), mc) for b in (ids or [])]
+    except Exception:                                # noqa: BLE001
+        names = [str(b) for b in (ids or [])]
+    if not names:
+        return ""
+    return ", ".join(names[:most]) + (f" +{len(names) - most}" if len(names) > most else "")
+
+
+def _yr(p, lo0, hi0, invert=False) -> str:
+    lo = p.get("y_min", lo0)
+    hi = p.get("y_max", hi0)
+    if lo is None or hi is None or (int(lo) <= lo0 and int(hi) >= hi0):
+        return ""
+    return ("Y outside " if invert else "Y ") + f"{_n(lo)}…{_n(hi)}"
+
+
+def auto_name(c: dict, zone=True) -> str:
+    """(15/11) A short name from the settings that tell this condition apart:
+    « Continentalness ≤ -11 500 · r 2 000 », « Village ×2 · abandoned · □ 512 »,
+    « Stronghold ≥ 10 eyes ». Shown wherever the condition is named while it has no
+    label of its own; nothing is stored (the session files do not change)."""
+    t = c.get("type", "")
+    p = c.get("params") or {}
+    name = type_name(t)
+    bits = []
+    variant = p.get("variant")
+    labels = {"abandoned": "abandoned", "not_abandoned": "not abandoned", "basement": "with basement",
+              "no_basement": "no basement", "dense": "dense", "with_ship": "with ship",
+              "without_ship": "no ship", "underground": "underground", "surface": "surface"}
+    if t in ("climate_minmax", "climate_center", "noise_sample"):
+        para = str(p.get("para") or "")
+        inv = bool(p.get("invert"))
+        if t == "climate_minmax":
+            name = para + (" min" if int(p.get("locate", 0) or 0) == 1 else " max")
+            name = _range(name, p.get("range"), inv)
+        else:
+            name = _range(para, p.get("range"), inv)
+            if t == "noise_sample":
+                name += f" {int(p.get('coverage_pct', 50) or 50)} %"
+            else:
+                name += " centre"
+    elif t == "crunchiness":
+        clim = {0: "Temperature", 1: "Humidity", 2: "Continentalness", 3: "Erosion", 5: "Weirdness"}
+        name = f"Crunchiness {clim.get(int(p.get('climate', 2) or 2), '')}".strip()
+        name += (" ≥ " if int(p.get("mode", 0) or 0) == 1 else " ≤ ") + _n(p.get("threshold", 0.1))
+    elif t in ("height", "precise_y"):
+        y = _yr(p, -64, 320, bool(p.get("invert")))
+        name = (("Exact " if t == "precise_y" else "Approx ") + y) if y else type_name(t)
+    elif t in ("dungeon", "lava_lake"):
+        y = _yr(p, 0, 255)
+        if variant in labels:
+            bits.append(labels[variant])
+        if y:
+            bits.append(y)
+    elif t == "biome_center":
+        b = _biomes([p.get("biome_id")]) if p.get("biome_id") is not None else ""
+        name = (b or name) + " centre"
+        if int(p.get("min_size", 1) or 1) > 1:
+            bits.append(f"≥ {_n(p['min_size'])} chunks²")
+        if int(p.get("count", 1) or 1) > 1:
+            bits.append(f"×{p['count']}")
+    elif t in ("biome_filter", "biome_sample", "nether_biomes", "end_biomes"):
+        inc = _biomes(p.get("biomes_incl"))
+        exc = _biomes(p.get("biomes_excl"))
+        if inc:
+            name = inc
+        if exc:
+            name = (name if inc else type_name(t)) + " · not " + exc
+        if t == "biome_sample":
+            if p.get("mode") == "min_count":
+                bits.append(f"≥ {_n(p.get('blocks_count', 0))} blocks")
+            else:
+                bits.append(f"{int(p.get('coverage_pct', 50) or 50)} %")
+    elif t == "first_stronghold":
+        name = "Stronghold"
+        if int(p.get("min_eyes", 0) or 0) > 0:
+            bits.append(f"{'=' if p.get('exact_eyes') else '≥'} {p['min_eyes']} eyes")
+        if p.get("maxy_enabled"):
+            bits.append(f"Y ≥ {p.get('min_max_y', 60)}")
+        if p.get("corrupt_enabled"):
+            bits.append("broken portal")
+    elif t == "elytra_spawn":
+        bits.append(f"≤ {_n(p.get('radius', 10000))}")
+    elif t == "spiral":
+        st = int(p.get("step", 16) or 16)
+        bits.append(f"step {_n(st)}")
+    elif t == "logic_or" and int(p.get("min_pass", 1) or 1) > 1:
+        bits.append(f"≥ {int(p['min_pass'])} pass")
+    else:
+        if variant in labels:
+            bits.append(labels[variant])
+        if t == "village":
+            for k, w in (("houses", "houses"), ("smiths", "forges")):
+                r = p.get(k)
+                if isinstance(r, (list, tuple)) and any(v is not None for v in r[:2]):
+                    bits.append(_range(w, r))
+        if t == "bastion" and p.get("starts"):
+            st = {"units": "housing", "hoglin_stable": "stables", "treasure": "treasure", "bridge": "bridge"}
+            bits.append("/".join(st.get(x, str(x)) for x in p["starts"]))
+    inst = c.get("instances", 1)
+    if t not in NO_INSTANCES and t not in NO_AREA:
+        try:
+            inst = int(inst)
+        except (TypeError, ValueError):
+            inst = 1
+        if inst == 0:
+            name = "No " + name[:1].lower() + name[1:]
+        elif inst > 1:
+            name += f" ×{inst}"
+    z = _zone_short(c) if zone else ""
+    out = " · ".join([name] + bits)
+    return out + (f" · {z}" if z else "")
+
+
+def named_auto(c: dict) -> bool:
+    """the condition is shown under its automatic name (no label of its own)"""
+    return not (c.get("label") or "").strip() and _auto_on()
+
+
+def detail_text(c: dict) -> str:
+    """(15/11) the list's second column: the area as before — or, under an automatic
+    name (which already holds the area, the count, the main settings), only what
+    the name does not say"""
+    if not named_auto(c):
+        return area_text(c)
+    t = c.get("type", "")
+    p = c.get("params") or {}
+    bits = []
+    if t == "climate_center":
+        sc = int(p.get("scale", 16) or 16)
+        mx = int(p.get("max_size", 0) or 0)
+        bits.append(f"≥ {int(p.get('min_size', 1) or 1)}" + (f"…{mx}" if mx else "") + f" cells 1:{sc}")
+    if t in ("climate_minmax", "climate_center", "noise_sample") and int(p.get("nmax", -1) or -1) >= 0:
+        bits.append(f"octaves ≤ {int(p['nmax'])}")
+    if t == "precise_y" and not p.get("caves", True):
+        bits.append("no caves")
+    if c.get("dy_on"):
+        bits.append(f"ΔY ≤ {int(c.get('dy_max', 0) or 0)}")
+    zs = _zone_short(c)
+    if zs == "box":
+        x1, z1, x2, z2 = (int(c.get(k, 0) or 0) for k in ("x1", "z1", "x2", "z2"))
+        zs = f"({x1}, {z1}) → ({x2}, {z2})"
+    elif zs.startswith("r "):
+        zs = "r ≤ " + zs[2:]
+    return " · ".join(([zs] if zs else []) + bits)
+
+
+def _zone_short(c: dict) -> str:
+    """r 2 000 · □ 512 · box — the area, in a few characters"""
+    t = c.get("type", "")
+    if t in NO_AREA or TYPE_INFO.get(t, {}).get("no_area") or t == "first_stronghold":
+        return ""
+    rmax = int(c.get("rmax", 0) or 0)
+    if not rmax and c.get("area_mode") == 0 and int(c.get("radial", 0) or 0) > 0:
+        rmax = int(c["radial"]) + 1
+    if rmax:
+        return f"r {_n(rmax - 1)}"
+    x1, z1, x2, z2 = (int(c.get(k, 0) or 0) for k in ("x1", "z1", "x2", "z2"))
+    if x1 == x2 and z1 == z2:
+        return ""
+    if x1 == -x2 and z1 == -z2 and x2 - x1 == z2 - z1:
+        return f"□ {_n(x2 - x1)}"
+    return "box"
 
 
 def area_text(c: dict) -> str:

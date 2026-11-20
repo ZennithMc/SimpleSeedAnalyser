@@ -2249,6 +2249,12 @@ def _validate_candidates_cpu(candidate_seeds, min_eyes, callback,
                     pass
         finally:
             try:
+                if _stopped():
+                    for pr in list((getattr(pool, "_processes", None) or {}).values()):
+                        try:
+                            pr.terminate()               # (19/11) Stop: no minute of CPU after it
+                        except Exception:                # noqa: BLE001
+                            pass
                 pool.shutdown(wait=not _stopped(), cancel_futures=True)
             except TypeError:
                 pool.shutdown(wait=not _stopped())
@@ -2710,6 +2716,19 @@ def _exact_eyes_worker(args):
     return out
 
 
+def _close_pool(pool, stop_event):
+    """(19/11) the end of a search's process pool: on Stop its processes are ended at
+    once (the jobs already running went on for up to a minute, the CPU at 100 %
+    after the page said « stopped »); otherwise the queued jobs are dropped"""
+    if stop_event is not None and stop_event.is_set():
+        for pr in list((getattr(pool, "_processes", None) or {}).values()):
+            try:
+                pr.terminate()
+            except Exception:                    # noqa: BLE001
+                pass
+    pool.shutdown(wait=False, cancel_futures=True)
+
+
 def _biome_gpu_128_pipeline(src, total, min_eyes, min_max_y, mc, nw,
                             callback, stop_event, progress_callback):
     """GPU biome-snap pipeline for the ALL-128 seedlist scan (1.13-1.17).
@@ -2725,64 +2744,103 @@ def _biome_gpu_128_pipeline(src, total, min_eyes, min_max_y, mc, nw,
     from collections import deque
     from concurrent.futures import ProcessPoolExecutor
 
-    GPU_BATCH = 20000     # seeds per GPU call (the host sub-batches by VRAM internally)
-    VAL_CHUNK = 2000      # survivor strongholds per CPU validation job
+    # (19/11) small batches and small validation jobs: with a 7-eye minimum ~5 % of the
+    # strongholds survive the GPU prefilter and each exact check is ~50 ms, so a
+    # 20 000-seed batch + 2 000-stronghold jobs left the progress at 0 (and the speed
+    # at 0 sps) for minutes, then a long tail on a few processes. Now a batch is
+    # counted done only when its validation is (the speed shown is the real one).
+    import time as _t
+    GPU_MIN, GPU_MAX = 256, 20000    # seeds per GPU call: sized to ~1 s of GPU work
+    VAL_CHUNK = 48        # survivor strongholds per CPU validation job (~2-3 s)
+    gpu_batch = GPU_MIN
     done = 0
 
     def _report():
         if progress_callback:
-            progress_callback(done, total if total is not None else done)
+            progress_callback(done, total if total is not None else 0)   # 0 = unknown (19/11: was done → « 100 % »)
 
     pool = ProcessPoolExecutor(max_workers=min(nw, 61))   # Windows limit: 61
     try:
-        in_flight = deque()
+        in_flight = deque()          # (seeds counted when this job ends, future | None)
 
-        def _drain_one():
-            fut = in_flight.popleft()
-            try:
-                for h in fut.result():
+        def _drain_one(block=True):
+            nonlocal done
+            n_seeds, fut = in_flight[0]
+            if fut is not None:
+                if not block and not fut.done():
+                    return False
+                try:
+                    res = fut.result(timeout=0.2)
+                except _cf.TimeoutError:
+                    return False
+                except Exception:
+                    res = []
+                for h in res:
                     callback(*h)
-            except Exception:
-                pass
+            in_flight.popleft()
+            if n_seeds:
+                done += n_seeds
+                _report()
+            return True
 
+        import concurrent.futures as _cf
+        exhausted = False
         while True:
             if stop_event is not None and stop_event.is_set():
                 break
-            batch = list(islice(src, GPU_BATCH))
-            if not batch:
-                break
-            # GPU only helps the eye path; Max Y (or GPU failure) -> CPU 128 worker.
-            res = None if min_max_y is not None else biome_gpu.strongholds128(mc, batch)
-            if res is None:
-                for i in range(0, len(batch), 256):
-                    sub = batch[i:i + 256]
-                    in_flight.append(pool.submit(
-                        _seed_list_128_worker, (sub, min_eyes, min_max_y, mc)))
-            else:
-                xs, zs, es = res
-                seeds_arr = np.asarray(batch, dtype=np.int64)
-                si, sj = np.nonzero(es >= int(min_eyes))   # survivors: prefilter >= min_eyes
-                if len(si):
-                    fss = np.ascontiguousarray(seeds_arr[si], dtype=np.int64)
-                    fx = np.ascontiguousarray(xs[si, sj], dtype=np.int32)
-                    fz = np.ascontiguousarray(zs[si, sj], dtype=np.int32)
-                    for k in range(0, len(fss), VAL_CHUNK):
-                        sl = slice(k, k + VAL_CHUNK)
-                        in_flight.append(pool.submit(
-                            _exact_eyes_worker,
-                            (fss[sl], fx[sl], fz[sl], min_eyes, min_max_y, mc)))
-            done += len(batch)
-            _report()
-            while len(in_flight) >= nw * 4:
-                _drain_one()
-        while in_flight:
-            if stop_event is not None and stop_event.is_set():
-                for f in in_flight:
-                    f.cancel()
+            if not exhausted and len(in_flight) < nw * 2:
+                batch = list(islice(src, gpu_batch))
+                if not batch:
+                    exhausted = True
+                    continue
+                t0 = _t.perf_counter()
+                # GPU only helps the eye path; Max Y (or GPU failure) -> CPU 128 worker.
+                res = None if min_max_y is not None else biome_gpu.strongholds128(mc, batch)
+                dt = _t.perf_counter() - t0
+                jobs = []
+                if res is None:
+                    for i in range(0, len(batch), 40):
+                        sub = batch[i:i + 40]
+                        jobs.append(pool.submit(_seed_list_128_worker, (sub, min_eyes, min_max_y, mc)))
+                else:
+                    xs, zs, es = res
+                    seeds_arr = np.asarray(batch, dtype=np.int64)
+                    si, sj = np.nonzero(es >= int(min_eyes))   # survivors: prefilter >= min_eyes
+                    if len(si):
+                        fss = np.ascontiguousarray(seeds_arr[si], dtype=np.int64)
+                        fx = np.ascontiguousarray(xs[si, sj], dtype=np.int32)
+                        fz = np.ascontiguousarray(zs[si, sj], dtype=np.int32)
+                        for k in range(0, len(fss), VAL_CHUNK):
+                            sl = slice(k, k + VAL_CHUNK)
+                            jobs.append(pool.submit(
+                                _exact_eyes_worker,
+                                (fss[sl], fx[sl], fz[sl], min_eyes, min_max_y, mc)))
+                    # the next batch: ~1 s of GPU, and survivors enough to keep every
+                    # process busy without a long queue
+                    surv = max(len(si), 1) / len(batch)
+                    want = nw * 6 * VAL_CHUNK / surv
+                    cap = len(batch) / dt if dt > 0 else GPU_MAX
+                    gpu_batch = int(max(GPU_MIN, min(GPU_MAX, want, cap)))
+                if jobs:                         # each job carries its share of the batch's seeds
+                    left = len(batch)
+                    for i, j in enumerate(jobs):
+                        share = left if i == len(jobs) - 1 else len(batch) // len(jobs)
+                        left -= share
+                        in_flight.append((share, j))
+                else:
+                    in_flight.append((len(batch), None))
+                while in_flight and _drain_one(block=False):
+                    pass
+                continue
+            if not in_flight:
                 break
             _drain_one()
+        if stop_event is not None and stop_event.is_set():
+            for _n, f in in_flight:
+                if f is not None:
+                    f.cancel()
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        _close_pool(pool, stop_event)
     _report()
 
 
@@ -2839,7 +2897,7 @@ def _gpu_eye_pipeline(src, total, min_eyes, mc, scan_128, nw,
 
     def _report():
         if progress_callback:
-            progress_callback(done, total if total is not None else done)
+            progress_callback(done, total if total is not None else 0)   # 0 = unknown (19/11: was done → « 100 % »)
 
     def _emit_positions(res):
         nseeds, fseed, fx, fz = res
@@ -2877,7 +2935,7 @@ def _gpu_eye_pipeline(src, total, min_eyes, mc, scan_128, nw,
             except StopIteration:
                 pass
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        _close_pool(pool, stop_event)
     _report()
 
 
@@ -2964,7 +3022,9 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
             # Scan ALL strongholds (up to 128) of each seed — 100% accurate,
             # native; ~128x the 1-stronghold work (handles both eye and Max Y).
             worker_fn = _seed_list_128_worker
-            CS = 40    # petits chunks → 1er résultat + Stop rapides sur une PLAGE
+            # (19/11) 8 seeds per job (~3 s): with a low eye minimum each seed costs
+            # ~0.4 s of exact checks — 40 per job left the speed at 0 for ~30 s
+            CS = 8
         elif min_max_y is not None:
             worker_fn = _seed_list_maxy_native_worker
             CS = 4000
@@ -3018,7 +3078,7 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
 
         def _report():
             if progress_callback:
-                progress_callback(done, total if total is not None else done)
+                progress_callback(done, total if total is not None else 0)   # 0 = unknown (19/11: was done → « 100 % »)
 
         if nw == 1:
             while True:
@@ -3077,7 +3137,7 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
                 except StopIteration:
                     pass
         finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+            _close_pool(pool, stop_event)
         _report()
         return
 
@@ -3258,7 +3318,7 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
             raise
         if pool is not None:
             try:
-                pool.shutdown(wait=False, cancel_futures=True)
+                _close_pool(pool, stop_event)
             except Exception:
                 pass
             pool = None
@@ -3281,7 +3341,10 @@ def search_end_portal_seeds(seed_start, seed_count, min_eyes,
         if pool is not None:
             try:
                 stopping = stop_event is not None and stop_event.is_set()
-                pool.shutdown(wait=not stopping, cancel_futures=True)
+                if stopping:
+                    _close_pool(pool, stop_event)
+                else:
+                    pool.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 pass
 

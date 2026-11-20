@@ -99,7 +99,7 @@ class StartSource(QObject):
         head = QHBoxLayout(); head.setSpacing(6); head.setContentsMargins(0, 0, 0, 0)
         lab = QLabel("START"); lab.setObjectName("FieldLabel")
         if tip:
-            lab.setToolTip(tip); self.edit.setToolTip(tip)
+            self.edit.setToolTip(tip)
         head.addWidget(lab); head.addStretch(1); head.addWidget(self.seg)
         col.addLayout(head); col.addWidget(field_widget)
         return col

@@ -31,6 +31,8 @@ FINDER = {
     "ocean_ruin": "ocean_ruin", "village": "village", "pillager_outpost": "pillager_outpost",
     "mansion": "mansion", "ancient_city": "ancient_city", "abandoned_camp": "abandoned_camp",
     "bastion": "bastion", "fortress": "fortress", "end_city": "end_city",
+    "stronghold": None, "mineshaft": None,             # (15/11) their own placements (below)
+    "dungeon": None,                                   # (20/11) a feature: the terrain decides (below)
 }
 # loot key used by structure_loot for each
 LOOT_KEY = {"buried_treasure": "treasure"}
@@ -190,10 +192,115 @@ def _c_positions(L):
     return _CPOS[k]
 
 
+# (15/11) the strongholds: rings around 0 0 (cubiomes' iterator, biome-snapped);
+# ring r is centred on 2048 + 3072 r blocks, ± 640 (+ 112 for the snap)
+_SH_RINGS = (3, 9, 19, 34, 55, 83, 128)
+
+
+def _stronghold_positions(seed, q, mc):
+    cx, cz, R = int(q.get("cx", 0)), int(q.get("cz", 0)), int(q.get("radius", 1000))
+    far = (cx * cx + cz * cz) ** 0.5 + R
+    if far < 2048 - 760:
+        return []
+    ring = max(0, min(len(_SH_RINGS) - 1, int((far - 2048 + 760) // 3072)))
+    g = _gen(mc, 0)
+    g.setup_and_seed(mc, seed, large_biomes=False, dim=0)
+    out = [(x, z) for x, z in g.find_strongholds(max_count=_SH_RINGS[ring])
+           if (x - cx) ** 2 + (z - cz) ** 2 <= R * R]
+    out.sort(key=lambda p: (p[0] - cx) ** 2 + (p[1] - cz) ** 2)
+    return out
+
+
+def _mineshaft_positions(seed, q, mc):
+    cx, cz, R = int(q.get("cx", 0)), int(q.get("cz", 0)), int(q.get("radius", 1000))
+    g = _gen(mc, 0)
+    g.setup_and_seed(mc, seed, large_biomes=False, dim=0)
+    out = [(x, z) for x, z in g.find_mineshafts(cx - R, cz - R, cx + R, cz + R, max_count=8192)
+           if (x + 8 - cx) ** 2 + (z + 8 - cz) ** 2 <= R * R]
+    out.sort(key=lambda p: (p[0] - cx) ** 2 + (p[1] - cz) ** 2)
+    return out
+
+
+def dungeon_chunks(q):
+    """(20/11) the chunks whose centre is within the radius, nearest first"""
+    cx, cz, R = int(q.get("cx", 0)), int(q.get("cz", 0)), int(q.get("radius", 200))
+    k = (cx, cz, R)
+    got = _DCH.get(k)
+    if got is None:
+        r = R // 16 + 2
+        x0, z0 = cx >> 4, cz >> 4
+        got = [(x, z) for x in range(x0 - r, x0 + r + 1) for z in range(z0 - r, z0 + r + 1)
+               if (x * 16 + 8 - cx) ** 2 + (z * 16 + 8 - cz) ** 2 <= (R + 12) ** 2]
+        got.sort(key=lambda c: (c[0] * 16 + 8 - cx) ** 2 + (c[1] * 16 + 8 - cz) ** 2)
+        _DCH[k] = got
+        if len(_DCH) > 8:
+            _DCH.clear()
+            _DCH[k] = got
+    return got
+
+
+_DCH = {}
+
+
+def dungeons(seed, q):
+    """(20/11) [(x, y, z, chests [(x, y, z, loot seed)])] of the dungeons within the radius,
+    nearest first — each chunk decorated alone (1.16 / 1.17: the C engine; 1.18+: the
+    map's dungeons, terrain by layers)"""
+    import dungeon_loot as dl
+    mc = int(q["mc"])
+    cx, cz, R = int(q.get("cx", 0)), int(q.get("cz", 0)), int(q.get("radius", 200))
+    out = []
+    if mc in dl.OLD:
+        for ch in dungeon_chunks(q):
+            for d in dl.chunk_dungeons(seed, mc, ch[0], ch[1], False) or ():
+                out.append((d[0], d[1], d[2], d[6]))
+    else:
+        for d in dl.area(seed, mc, cx - R, cz - R, cx + R, cz + R):
+            out.append((d[0], d[1], d[2], d[6]))
+    out = [d for d in out if (d[0] - cx) ** 2 + (d[2] - cz) ** 2 <= R * R]
+    out.sort(key=lambda d: (d[0] - cx) ** 2 + (d[2] - cz) ** 2)
+    return out
+
+
+def _dungeon_check(seed, q):
+    """(20/11) check_seed for the dungeons: their chests' contents first (the loot seeds of
+    the chunk decorated alone), then the cards the map shows (the main generation order)"""
+    import dungeon_loot as dl
+    import loot_engine as le
+    mc = int(q["mc"])
+    ver = le.loot_version(mc, q.get("sub"))
+    res = []
+    for x, y, z, chs in dungeons(seed, q):
+        pre = []
+        for cxp, cyp, czp, ls in chs:
+            slots, _ap = le.fill_chest("simple_dungeon", ls, ver)
+            pre.append({"slots": slots, "table": "chests/simple_dungeon"})
+        if not pre or not judge(pre, q)[0]:
+            continue
+        cards = dl.chests(seed, mc, x, z, ver, y)
+        main = []
+        for c in cards:                                  # the main order's cards come first
+            if c.get("exact", True) is False or "if this chunk" in str(c.get("name", "")):
+                break
+            main.append(c)
+        ok, score, hits = judge(main, q) if main else (False, 0, [])
+        if ok:
+            res.append((x, z, score, hits))
+            if q.get("mode") != "most":
+                break
+    return res
+
+
 def positions(seed, q):
     """the tries of the structure within radius of the centre that can spawn"""
     import cubiomes_wrap as cw
     key = q["key"]
+    if key == "dungeon":
+        return [(d[0], d[2]) for d in dungeons(seed, q)]
+    if key == "stronghold":
+        return _stronghold_positions(seed, q, int(q["mc"]))
+    if key == "mineshaft":
+        return _mineshaft_positions(seed, q, int(q["mc"]))
     st = cw.ALL_STRUCTURE_TYPES[FINDER[key]]
     mc = int(q["mc"])
     dim = DIM.get(key, 0)
@@ -291,6 +398,8 @@ def _treasure_positions(seed, q, g, L, st, mc, dim, cx, cz, R):
 def check_seed(seed, q):
     """[(x, z, score, matching card indexes)] for the structures of `seed` that match"""
     import structure_loot as sl
+    if q["key"] == "dungeon":
+        return _dungeon_check(seed, q)
     res = []
     lk = LOOT_KEY.get(q["key"], q["key"])
     fast = q["key"] in FAST
@@ -550,6 +659,8 @@ def odds_job(q, tables, version):
 
 def _odds_job(q, tables, version):
     import loot_exact as lx
+    if q.get("scope") == "structure" and q.get("mode") != "layout":
+        return _structure_odds(q, tables, version)
     try:
         res = lx.query_odds(q, tables, version)
     except Exception as e:                              # noqa: BLE001
@@ -559,3 +670,161 @@ def _odds_job(q, tables, version):
     if any(r is None for _t, r, _b, _x in res):
         approx = chest_odds(q, [t for t, r, _b, _x in res if r is None], version, n=3000)
     return res, approx
+
+
+# ── (15/11) « In the whole structure »: the odds over its chests ───────────────
+_CONF = {}
+STRUCT = "__structure__"
+
+
+def _tab_name(t):
+    return str(t or "").replace("minecraft:", "").replace("chests/", "")
+
+
+def _conf_path():
+    try:
+        import ssa_paths
+        return os.path.join(ssa_paths.data_dir(), "loot_structure_sets.json")
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+_SLOW = {"stronghold": (10.0, 40, 3000), "mineshaft": (12.0, 40, 300),   # budget, n, radius
+         "dungeon": (12.0, 40, 160)}
+
+
+def structure_configs(key, mc, sub, budget=4.0, n_max=120):
+    """{sorted tuple of a structure's chest tables: share}, from real structures of
+    random seeds (their chests exactly as the map shows them, terrain skipped where
+    the finder skips it; a structure without its chest — igloo without basement —
+    counts, empty); and how many structures were looked at. Measured once per
+    structure and version, kept in the user's data folder."""
+    import json
+    k = f"{key}|{int(mc)}|{sub or ''}"
+    got = _CONF.get(k)
+    if got is not None:
+        return got
+    path = _conf_path()
+    disk = {}
+    if path and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                disk = json.load(fh)
+        except Exception:                               # noqa: BLE001
+            disk = {}
+    if k in disk:
+        d = disk[k]
+        tot = sum(c for _t, c in d["sets"]) or 1
+        got = _CONF[k] = ({tuple(t): c / tot for t, c in d["sets"]}, int(d["n"]))
+        return got
+    import random
+    from collections import Counter
+    import structure_loot as sl
+    rad = 3000
+    if key in _SLOW:
+        budget, n_max, rad = _SLOW[key]
+    q = dict(key=key, mc=int(mc), sub=sub, cx=0, cz=0, radius=rad)
+    lk = LOOT_KEY.get(key, key)
+    cnt = Counter()
+    n = 0
+    r = random.Random(0x55A)
+    t0 = time.perf_counter()
+    tries = 0
+    while n < n_max and time.perf_counter() - t0 < budget and tries < 600:
+        tries += 1
+        seed = r.getrandbits(63)
+        if key == "dungeon":                            # (20/11) their chests, as found (no 2nd pass)
+            try:
+                for d in dungeons(seed, q)[:2]:
+                    cnt[tuple(["simple_dungeon"] * len(d[3]))] += 1
+                    n += 1
+            except Exception:                           # noqa: BLE001
+                pass
+            continue
+        try:
+            pos = positions(seed, q)
+        except Exception:                               # noqa: BLE001
+            continue
+        for x, z in pos[:2]:
+            try:
+                cards = sl.chests(lk, seed, int(mc), x, z, sub, fast=True)
+            except Exception:                           # noqa: BLE001
+                cards = None
+            if cards is None:
+                continue
+            cnt[tuple(sorted(_tab_name(c.get("table")) for c in cards
+                             if c.get("slots") is not None and c.get("table")))] += 1
+            n += 1
+    tot = sum(cnt.values())
+    conf = {t: c / tot for t, c in cnt.items()} if tot else {}
+    _CONF[k] = (conf, n)
+    if path and n >= (12 if key in _SLOW else 20):
+        disk[k] = dict(n=n, sets=[[list(t), c] for t, c in cnt.items()])
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(disk, fh)
+            os.replace(tmp, path)
+        except Exception:                               # noqa: BLE001
+            pass
+    return conf, n
+
+
+def _structure_odds(q, tables, version):
+    """[(STRUCT, (p, max), biome, exact, info)] — one structure in N"""
+    import loot_exact as lx
+    import loot_engine as le
+    conf, n = structure_configs(q["key"], q["mc"], q.get("sub"))
+    if not conf:
+        return "no structure found to measure", None
+    sel = {_tab_name(t) for t in (tables or [])}
+    use = {}
+    for tabs, share in conf.items():
+        t2 = tuple(t for t in tabs if not sel or t in sel)
+        use[t2] = use.get(t2, 0.0) + share
+    info = sorted(((len(t), share) for t, share in use.items()), key=lambda x: -x[1])
+    counts = {}
+    for c, sh in info:
+        counts[c] = counts.get(c, 0.0) + sh
+    info = dict(n=n, chests=sorted(counts.items()))
+    try:
+        r = lx.structure_prob(q, use, version)
+        bio = None
+        if r.p <= 0:
+            bios = set()
+            for tabs in use:
+                for t in tabs:
+                    tab = le.get_table(version, t)
+                    if tab is not None:
+                        bios |= lx.biomes_of(tab)
+            for b in sorted(bios):
+                r2 = lx.structure_prob(q, use, version, b)
+                if r2.p > 0:
+                    r, bio = r2, b
+                    break
+        return [(STRUCT, (float(r.p), r.max_count), bio, True, info)], None
+    except lx.Unsupported:
+        pass
+    except Exception as e:                              # noqa: BLE001
+        return repr(e), None
+    # a table the exact count cannot read: simulated structures (their real chest sets)
+    import random
+    rr = random.Random(7)
+    hit = tot = 0
+    best = 0
+    keys = list(use)
+    w = [use[k] for k in keys]
+    qq = dict(q)
+    for _ in range(1500):
+        tabs = rr.choices(keys, w)[0]
+        cards = []
+        for t in tabs:
+            slots, _ap = le.fill_chest(t, rr.getrandbits(63) or 1, version)
+            if slots is not None:
+                cards.append({"slots": slots, "table": t})
+        tot += 1
+        if cards:
+            ok, sc, _h = judge(cards, qq)
+            hit += ok
+            best = max(best, sc)
+    return [(STRUCT, None, None, False, info)], (hit / tot if tot else None)

@@ -354,41 +354,26 @@ class SeedcrackPage(QWidget):
         v.addWidget(self.chunk_hint)
 
         # (06/11) the End's pillars: ~16 more bits, any version
-        pc = QFrame(); pc.setObjectName("CrackPillars")
-        pc.setStyleSheet(f"#CrackPillars {{ background: {theme.BG2}; border: 1px solid {theme.LINE};"
-                         f" border-radius: 9px; }}")
-        ph = QHBoxLayout(pc); ph.setContentsMargins(10, 7, 8, 7); ph.setSpacing(8)
-        pv = QVBoxLayout(); pv.setSpacing(1)
-        pt = QLabel("End pillars"); f = pt.font(); f.setBold(True); pt.setFont(f)
-        pv.addWidget(pt)
+        from .crack_visuals import EmptyTrees, SourceCard     # (15/11) the page's pictures
         self.pillar_info = QLabel(); self.pillar_info.setObjectName("Muted")
-        pv.addWidget(self.pillar_info)
-        ph.addLayout(pv, 1)
-        self.pillar_btn = QPushButton("  Edit…"); icons.bind(self.pillar_btn, "target", 16)
+        self.pillar_btn = QPushButton("  Edit…")
         self.pillar_btn.setToolTip(
             "The 10 obsidian pillars of the End (their height order and cages) depend on the "
             "structure seed: about 16 more bits, to sort out the false seeds the trees leave.")
         self.pillar_btn.clicked.connect(self._edit_pillars)
-        ph.addWidget(self.pillar_btn)
+        pc = SourceCard("End pillars", "pillars", self.pillar_info, self.pillar_btn)
+        pc.setToolTip(self.pillar_btn.toolTip())
         v.addWidget(pc)
 
         # (06/11) structures: ~9 bits each, every version (the only way from 1.18 on)
-        sc_ = QFrame(); sc_.setObjectName("CrackStructs")
-        sc_.setStyleSheet(f"#CrackStructs {{ background: {theme.BG2}; border: 1px solid {theme.LINE};"
-                          f" border-radius: 9px; }}")
-        sh = QHBoxLayout(sc_); sh.setContentsMargins(10, 7, 8, 7); sh.setSpacing(8)
-        sv = QVBoxLayout(); sv.setSpacing(1)
-        st_ = QLabel("Structures"); f = st_.font(); f.setBold(True); st_.setFont(f)
-        sv.addWidget(st_)
         self.struct_info = QLabel(); self.struct_info.setObjectName("Muted")
-        sv.addWidget(self.struct_info)
-        sh.addLayout(sv, 1)
-        self.struct_btn = QPushButton("  Edit…"); icons.bind(self.struct_btn, "pin", 16)
+        self.struct_btn = QPushButton("  Edit…")
         self.struct_btn.setToolTip(
             "Villages, temples, shipwrecks, monuments… seen in the world: the chunk each one "
             "starts in depends on the structure seed — ~9 bits each, any version.")
         self.struct_btn.clicked.connect(self._edit_structures)
-        sh.addWidget(self.struct_btn)
+        sc_ = SourceCard("Structures", "structures", self.struct_info, self.struct_btn)
+        sc_.setToolTip(self.struct_btn.toolTip())
         v.addWidget(sc_)
 
         v.addSpacing(4)
@@ -407,7 +392,9 @@ class SeedcrackPage(QWidget):
         v.addWidget(self.tree_list, 1)
         self.empty_hint = body("No tree yet. Click “Add tree”, then the ground where a trunk "
                                "stands — or import a TreeCracker input.", muted=True, small=True)
-        v.addWidget(self.empty_hint)
+        self.empty_hint.hide()                   # (15/11) shown by the picture over the empty list
+        self.empty_trees = EmptyTrees(self.tree_list, self.empty_hint,
+                                      lambda: self.add_btn.setChecked(True), self._import_tc)
         cr = QLabel("Method of Andrew (Gaider10)'s TreeCracker")
         cr.setObjectName("Muted"); cr.setStyleSheet("font-size: 7.5pt;")
         cr.setToolTip("SSA's tree cracker follows the method of TreeCracker and PopulationCrr by "
@@ -472,11 +459,13 @@ class SeedcrackPage(QWidget):
     def _build_inspector(self):
         w = QWidget()
         v = QVBoxLayout(w); v.setContentsMargins(0, 4, 0, 0); v.setSpacing(8)
+        from .crack_visuals import LeafGuide
+        self.leaf_guide = LeafGuide()            # (15/11) what to look at on a tree, as a picture
+        v.addWidget(self.leaf_guide)
         self.insp_empty = body("Select a tree in the 3D view or the list — or place one with "
-                               "“Add tree”.\n\nFor each tree enter what you SAW: its type, the logs "
-                               "of its trunk and the 12 corner leaves (the corners of the 3 leaf "
-                               "layers under the top). A corner you can't see stays unknown.",
-                               muted=True)
+                               "“Add tree”.  ⓘ", muted=True)
+        self.insp_empty.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.insp_empty.setToolTip(self.leaf_guide.toolTip())
         v.addWidget(self.insp_empty)
         self.insp = QWidget()
         iv = QVBoxLayout(self.insp); iv.setContentsMargins(0, 0, 0, 0); iv.setSpacing(8)
@@ -583,6 +572,9 @@ class SeedcrackPage(QWidget):
         self.res_list.setFont(theme.mono_font(10))
         self.res_list.currentRowChanged.connect(self._seed_selected)
         v.addWidget(self.res_list, 2)
+        from .widgets import EmptyHint                     # (20/11)
+        self._res_empty = EmptyHint(self.res_list, "forest", "seedcrack", "No seed yet",
+                                    "Crack: the structure seeds that fit what you entered show up here.")
         acts = QGridLayout(); acts.setSpacing(6)
         self.b_copy = QPushButton("  Copy"); icons.bind(self.b_copy, "copy", 16)
         self.b_copy.clicked.connect(self._copy_seeds)
@@ -643,9 +635,17 @@ class SeedcrackPage(QWidget):
         col = QVBoxLayout(); col.setSpacing(1)
         self.info_title = QLabel(); f = self.info_title.font(); f.setBold(True); self.info_title.setFont(f)
         class _TipLabel(QLabel):                 # (13/11) clipped when narrow: full text on hover
-            def setText(self, t):
+            def setText(self, t):                # (19/11) …only when it IS clipped
                 super().setText(t)
-                self.setToolTip(t)
+                self._tip()
+
+            def resizeEvent(self, e):
+                super().resizeEvent(e)
+                self._tip()
+
+            def _tip(self):
+                t = self.text()
+                self.setToolTip(t if self.fontMetrics().horizontalAdvance(t) > self.width() else "")
         self.info_sub = _TipLabel(); self.info_sub.setObjectName("Muted")
         from PySide6.QtWidgets import QSizePolicy
         for lab in (self.info_title, self.info_sub):
@@ -654,7 +654,7 @@ class SeedcrackPage(QWidget):
         col.addWidget(self.info_title); col.addWidget(self.info_sub)
         h.addLayout(col, 1)
         self.meter = BitsMeter()
-        self.meter.setFixedWidth(220)
+        self.meter.setMinimumWidth(170); self.meter.setMaximumWidth(220)   # (14/11) gives way in a narrow window
         self.meter.setToolTip("Information of the main chunk, in bits. A structure seed is 48 bits: "
                               "below 48 the crack can't single it out; from 56 on, false seeds "
                               "become rare. A position ≈ 8 bits, a height ≈ 1.6, a seen corner 1.")
@@ -673,7 +673,7 @@ class SeedcrackPage(QWidget):
         h.addWidget(self.shared)
         dl = QLabel("Device"); dl.setObjectName("FieldLabel"); h.addWidget(dl)
         self.device = Segmented(["GPU", "CPU"], "GPU")
-        self.device.setFixedWidth(120)
+        self.device.setFixedWidth(150)             # (14/11) « GPU » / « CPU » were cut
         self.device.changed.connect(lambda *_: self._refresh_run())
         h.addWidget(self.device)
         tl = QLabel("Threads"); tl.setObjectName("FieldLabel"); h.addWidget(tl)
@@ -687,7 +687,7 @@ class SeedcrackPage(QWidget):
         self.prog.setTextVisible(False); self.prog.hide()
         h.addWidget(self.prog)
         self.run_btn = QPushButton("  Crack"); self.run_btn.setProperty("kind", "primary")
-        icons.bind(self.run_btn, "play", 16, "text", "text")
+        icons.bind(self.run_btn, "play", 16, "on_accent", "on_accent")
         self.run_btn.setMinimumWidth(120)
         self.run_btn.clicked.connect(self._run_clicked)
         h.addWidget(self.run_btn)
@@ -955,12 +955,14 @@ class SeedcrackPage(QWidget):
             self.tree_list.addItem(it)
         self.tree_list.setCurrentRow(self.sel)
         self.tree_list.blockSignals(False)
-        self.empty_hint.setVisible(not self.scene.trees)
+        self.empty_trees.set_shown(not self.scene.trees)
+        self.empty_trees.b_add.setEnabled(self.add_btn.isEnabled())
 
     def _fill_inspector(self):
         t = self._tree()
         self.insp.setVisible(t is not None)
         self.insp_empty.setVisible(t is None)
+        self.leaf_guide.setVisible(t is None)
         if t is None:
             return
         self._filling = True
@@ -1080,6 +1082,9 @@ class SeedcrackPage(QWidget):
                 "No tree yet. Click “Add tree”, then the ground where a trunk stands — or import "
                 "a TreeCracker input." if trees_ver else
                 "Java 1.18+: trees don't help — enter Structures (and the End pillars) above.")
+            if hasattr(self, "empty_trees"):
+                self.empty_trees.text.setText(self.empty_hint.text())
+                self.empty_trees.b_add.setEnabled(self.add_btn.isEnabled())
         best = tc.best_chunk(self._eff()) if trees_ver else None
         probs = tc.validate(self.scene)
         errs = [p for p in probs if p[0] == "error"]
@@ -1194,7 +1199,7 @@ class SeedcrackPage(QWidget):
             self.run_btn.setProperty("kind", "danger")
             self.run_btn.setEnabled(True)
         else:
-            self.run_btn.setText("  Crack"); icons.bind(self.run_btn, "play", 16, "text", "text")
+            self.run_btn.setText("  Crack"); icons.bind(self.run_btn, "play", 16, "on_accent", "on_accent")
             self.run_btn.setProperty("kind", "primary")
             self.run_btn.setEnabled(ok)
         self.run_btn.style().unpolish(self.run_btn); self.run_btn.style().polish(self.run_btn)

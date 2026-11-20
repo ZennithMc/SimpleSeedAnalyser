@@ -19,15 +19,15 @@ import math
 import time
 
 from PySide6.QtCore import QElapsedTimer, QObject, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import (QColor, QFont, QGuiApplication, QImage, QPainter, QPainterPath, QPen,
-                           QPixmap)
+from PySide6.QtGui import (QColor, QFont, QFontMetrics, QGuiApplication, QImage, QPainter,
+                           QPainterPath, QPen, QPixmap, QRegion)
 from PySide6.QtWidgets import QInputDialog, QLabel, QMenu, QToolButton, QVBoxLayout, QWidget
 
 import cubiomes_wrap as cw
 import noise_palettes as npal
 from . import struct_icons
 
-from . import icons, theme
+from . import icons, memory, theme
 from .map_engine import CLIMATE, SCALES, TILE, MapEngine, octave_arrays
 
 MIN_BPP, MAX_BPP = 1 / 32, 1024.0      # blocks per screen pixel
@@ -211,6 +211,7 @@ class MapView(QWidget):
         world.changed.connect(self._on_world)
 
         self._anim = QTimer(self, interval=15, timeout=self._animate)   # zoom easing + inertia
+        self._anim.setTimerType(Qt.TimerType.PreciseTimer)
         self._clock = QElapsedTimer(); self._clock.start()
         self._arrow_timer = QTimer(self, singleShot=True, interval=70, timeout=self._compute_arrows)
         self._hover_timer = QTimer(self, singleShot=True, interval=30, timeout=self._do_readout)
@@ -228,6 +229,37 @@ class MapView(QWidget):
         self._style["icon_px"] = int(v)
         if self.link is not None:
             self.link.repaint_all()
+
+    # (15/11) each structure's icon may be bigger or smaller than the others (the
+    # arrow of its chip in the Layers panel): a factor per layer key
+    _SCALE_OF = {"zombie_village": "village", "igloo_basement": "igloo", "end_city_ship": "end_city",
+                 "stronghold": "__strongholds", "spawn": "__spawn"}
+
+    def icon_scale(self, key):
+        sc = self._style.get("icon_scale") or {}
+        f = sc.get(key)
+        if f is None:
+            f = sc.get(self._SCALE_OF.get(key, key), 1.0)
+        return float(f)
+
+    def icon_size(self, key):
+        return max(8, int(round(self.icon_px * self.icon_scale(key))))
+
+    def set_icon_scale(self, key, factor):
+        sc = dict(self._style.get("icon_scale") or {})
+        if abs(float(factor) - 1.0) < 1e-6:
+            sc.pop(key, None)
+        else:
+            sc[key] = float(factor)
+        self._style["icon_scale"] = sc
+        if self.link is not None:
+            self.link.repaint_all()
+        else:
+            self.update()
+
+    def _icon_margin(self):
+        sc = self._style.get("icon_scale") or {}
+        return int(math.ceil(self.icon_px * max([1.0] + [float(v) for v in sc.values()])))
 
     # ── dimension (18/10) ───────────────────────────────────────────────────
     DIMS = {"Overworld": 0, "Nether": -1, "End": 1}
@@ -407,7 +439,17 @@ class MapView(QWidget):
         self._target_bpp = max(MIN_BPP, min(MAX_BPP, base * factor))
         self._zoom_anchor = anchor or QPointF(self.width() / 2, self.height() / 2)
         if not self._anim.isActive():
-            self._clock.restart(); self._anim.start()
+            self._clock.restart(); self._anim.start(self._frame_ms())
+
+    def _frame_ms(self):
+        """(15/11) the step of the zoom / inertia animations: one per refresh of the
+        screen (it was 15 ms = 66 images / s at most, even on a 144 or 360 Hz
+        screen). The frames follow as fast as the map draws them, up to the screen."""
+        try:
+            hz = float(self.screen().refreshRate())
+        except Exception:
+            hz = 60.0
+        return int(max(2, min(15, 1000.0 / max(30.0, hz))))
 
     def _animate(self):
         dt = min(0.05, self._clock.restart() / 1000.0)
@@ -481,13 +523,29 @@ class MapView(QWidget):
                 s = k
         return s
 
+    def _round_clip(self):
+        """(15/11) the rounded corners as a pixel region (rectangles): an antialiased clip
+        PATH made every drawing of the frame (thousands of icons, badges, tiles) go
+        through a mask — the map painted 2 to 3 times slower. The border drawn at the
+        end smooths the corners."""
+        key = (self.width(), self.height())
+        if getattr(self, "_clip_key", None) != key:
+            from PySide6.QtGui import QRegion
+            w, h, r = self.width(), self.height(), 10
+            reg = QRegion(r, 0, max(0, w - 2 * r), h) + QRegion(0, r, w, max(0, h - 2 * r))
+            for cx, cy in ((r, r), (w - r, r), (r, h - r), (w - r, h - r)):
+                reg += QRegion(cx - r, cy - r, 2 * r, 2 * r, QRegion.RegionType.Ellipse)
+            self._clip_reg, self._clip_key = reg, key
+        return self._clip_reg
+
+    _frame_hook = None                      # (15/11) its drawer: a frame of the map
+
     def paintEvent(self, _e):
+        if self._frame_hook is not None:
+            self._frame_hook()
         p = QPainter(self)
-        clip = QPainterPath(); clip.addRoundedRect(QRectF(self.rect()), 10, 10)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        p.setClipPath(clip)
+        p.setClipRegion(self._round_clip())
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        p.fillRect(self.rect(), QColor(theme.BG0))
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         self.engine.begin_frame()
         # with a noise layer the NOISE is computed first (it used to wait for
@@ -499,15 +557,10 @@ class MapView(QWidget):
         opaque = noise_on and self.ov["opacity"] >= 0.999
         if seed_view:                     # structure-seed view: no biomes (Alt+S)
             p.fillRect(self.rect(), QColor("#161c26" if not theme.IS_LIGHT else "#dfe3ea"))
-        else:
-            self._paint_layer(p, noise=False, fetch=not opaque, boost=-4 if noise_on else 0)
-        if noise_on:
-            p.setOpacity(self.ov["opacity"])
-            # magnified (< 1 block per pixel): crisp blocks, like cubiomes-viewer
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.bpp >= 1.0)
-            self._paint_layer(p, noise=True, boost=2)
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
-            p.setOpacity(1.0)
+        elif not self._paint_base_cached(p, noise_on, opaque):
+            self._base = None
+            p.fillRect(self.rect(), QColor(theme.BG0))
+            self._paint_base(p, noise_on, opaque)
         self.engine.end_frame()
         self._paint_grid(p)
         self._paint_origin(p)
@@ -535,6 +588,83 @@ class MapView(QWidget):
         p.end()
         n = self.engine.pending_count()
         self.status.emit(f"Generating… {n} job{'s' if n > 1 else ''} left" if n else "")
+
+    def _paint_base(self, p, noise_on, opaque):
+        """The biomes, and the noise layer over them."""
+        self._layer_full = True
+        self._paint_layer(p, noise=False, fetch=not opaque, boost=-4 if noise_on else 0)
+        if noise_on:
+            p.setOpacity(self.ov["opacity"])
+            # magnified (< 1 block per pixel): crisp blocks, like cubiomes-viewer
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.bpp >= 1.0)
+            self._paint_layer(p, noise=True, boost=2)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+            p.setOpacity(1.0)
+
+    _base = None
+
+    def _paint_base_cached(self, p, noise_on, opaque):
+        """(15/11) While the map pans at a fixed zoom over places already computed, the
+        picture of the tiles (biomes + noise) is kept: the next frame scrolls it by the
+        whole device pixels moved and only draws the strips that came into view (the
+        tiles were stretched again on the whole screen at every frame). A tile received,
+        a zoom, a palette, a layer, the size: drawn again in full. While the zoom
+        animates: as before. False = not handled (the caller draws as before)."""
+        if self._target_bpp is not None or self.width() < 8 or self.height() < 8:
+            return False
+        d = max(1.0, self.devicePixelRatioF())
+        W, H = int(math.ceil(self.width() * d)), int(math.ceil(self.height() * d))
+        ov = self.ov
+        key = (self.bpp, self.dim, W, H, d, self.engine.epoch, self.engine.palette, self.engine.tile_ver,
+               theme.BG0, opaque, noise_on and (ov.get("noise"), ov.get("octave"), ov.get("caves"),
+                                                ov.get("palette"), ov.get("opacity")))
+        # the view's top-left corner in device pixels of this zoom, rounded: the picture
+        # sits on whole device pixels (at most half a pixel from the exact place)
+        X = round((self.cx / self.bpp - self.width() / 2) * d)
+        Z = round((self.cz / self.bpp - self.height() / 2) * d)
+        cx_, cz_ = self.cx, self.cz
+        b = self._base
+        try:
+            # the centre that puts the corner exactly on (X, Z)
+            self.cx = (X / d + self.width() / 2) * self.bpp
+            self.cz = (Z / d + self.height() / 2) * self.bpp
+            if b is not None and b[1] == key and b[4] and abs(X - b[2]) < W // 2 and abs(Z - b[3]) < H // 2:
+                pm = b[0]
+                dx, dz = X - b[2], Z - b[3]
+                if dx or dz:
+                    pm.scroll(-dx, -dz, pm.rect())
+                    q = QPainter(pm)
+                    q.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+                    # the strips uncovered (device pixels → the painter's units), 1 px more
+                    reg = QRegion()
+                    if dx > 0:
+                        reg += QRegion(W - dx - 1, 0, dx + 1, H)
+                    elif dx < 0:
+                        reg += QRegion(0, 0, -dx + 1, H)
+                    if dz > 0:
+                        reg += QRegion(0, H - dz - 1, W, dz + 1)
+                    elif dz < 0:
+                        reg += QRegion(0, 0, W, -dz + 1)
+                    q.scale(1 / d, 1 / d)
+                    q.setClipRegion(reg)
+                    q.scale(d, d)
+                    q.fillRect(QRectF(0, 0, self.width(), self.height()), QColor(theme.BG0))
+                    self._paint_base(q, noise_on, opaque)
+                    q.end()
+                    self._base = (pm, key, X, Z, self._layer_full)
+            else:
+                pm = b[0] if b is not None and b[0].width() == W and b[0].height() == H else QPixmap(W, H)
+                pm.setDevicePixelRatio(d)
+                pm.fill(QColor(theme.BG0))
+                q = QPainter(pm)
+                q.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+                self._paint_base(q, noise_on, opaque)
+                q.end()
+                self._base = (pm, key, X, Z, self._layer_full)
+        finally:
+            self.cx, self.cz = cx_, cz_
+        p.drawPixmap(0, 0, self._base[0])
+        return True
 
     def _visible_tiles(self, s, ring=0):
         span = TILE * s
@@ -586,6 +716,8 @@ class MapView(QWidget):
             if pm is not None:
                 p.drawPixmap(target, pm, QRectF(pm.rect()))
             else:
+                if fetch:
+                    self._layer_full = False          # (15/11) a tile still missing: drawn again
                 self._paint_fallback(p, noise, s, tx, tz, target)
         if not animating and fetch and not exact:                  # prefetch ring
             ring, _ = self._visible_tiles(s, ring=1)
@@ -699,20 +831,17 @@ class MapView(QWidget):
         if self.visible.get("__origin"):
             ox, oy = self.to_screen(0, 0)
             if -20 < ox < self.width() + 20 and -20 < oy < self.height() + 20:
-                # an × (the cursor is a +): dark halo, then white
-                p.save()
-                p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                for pen in (QPen(QColor(0, 0, 0, 150), 3.2), QPen(QColor(255, 255, 255, 215), 1.5)):
-                    p.setPen(pen)
-                    p.drawLine(QPointF(ox - 6, oy - 6), QPointF(ox + 6, oy + 6))
-                    p.drawLine(QPointF(ox - 6, oy + 6), QPointF(ox + 6, oy - 6))
-                p.restore()
+                # (19/11) the same icon as its chip in the Layers panel (struct_icons « origin »)
+                pm = self._icon("origin")
+                h = pm.width() / pm.devicePixelRatio() / 2
+                p.drawPixmap(QRectF(ox - h, oy - h, 2 * h, 2 * h), pm, QRectF(pm.rect()))
 
     def _icon(self, key):
-        k = (key, self.icon_px)
+        sz = self.icon_size(key)
+        k = (key, sz)
         pm = self._icon_cache.get(k)
         if pm is None:
-            pm = struct_icons.pixmap(key, self.icon_px, max(2.0, self.devicePixelRatioF()))
+            pm = struct_icons.pixmap(key, sz, max(2.0, self.devicePixelRatioF()))
             self._icon_cache[k] = pm
         return pm
 
@@ -721,7 +850,7 @@ class MapView(QWidget):
         if pm is None:
             return
         sx, sy = self.to_screen(x, z)
-        h = self.icon_px / 2
+        h = self.icon_size(key) / 2
         if key == "spawn":                       # a pin points at the spot with its tip
             sy -= h * 0.85
         if -h <= sx <= self.width() + h and -h <= sy <= self.height() + h:
@@ -998,6 +1127,53 @@ class MapView(QWidget):
             return None
         for b_ in ([data] if kind == "bb" else data):              # (31/10) right-click
             self._area_hits.append((b_[0], b_[1], b_[2], b_[3], key, int(x), int(z), None))
+        if not self._new_look():                 # (15/11) Settings → Map: the drawings as before
+            return self._draw_cv_pieces_classic(p, key, kind, data)
+        # (14/11 bis) same boxes as cubiomes-viewer, drawn in the structure's own colour:
+        # filled pieces with a bright edge instead of thin dark red lines
+        col = self._struct_qcolor(key)
+        edge = QColor(col).lighter(135); edge.setAlpha(235)
+        fill = QColor(col); fill.setAlpha(64)
+        dark = QColor(0, 0, 0, 110)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, self.bpp < 2.0)
+        k = 1.0 / self.bpp                                  # pixels per block
+        centre = None
+        if kind == "bb":
+            bx0, bz0, bx1, bz1 = data
+            sx0, sy0 = self.to_screen(bx0, bz0)
+            r = QRectF(int(sx0), int(sy0), int((bx1 - bx0 + 1) * k), int((bz1 - bz0 + 1) * k))
+            rad = min(5.0, r.width() / 6, r.height() / 6)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(dark, 3.4)); p.drawRoundedRect(r, rad, rad)
+            p.setBrush(fill)
+            p.setPen(QPen(edge, 1.6)); p.drawRoundedRect(r, rad, rad)
+            centre = ((bx0 + bx1 + 1) / 2.0, (bz0 + bz1 + 1) / 2.0)
+        else:
+            p.setPen(QPen(edge, 1.0))
+            p.setBrush(fill)
+            spawners = []
+            for (a0, c0, a1, c1, typ, rot, _y0, _y1) in data:
+                px, py = self.to_screen(a0, c0)
+                dx, dy = (a1 - a0 + 1) * k, (c1 - c0 + 1) * k
+                p.drawRect(QRectF(int(px), int(py), int(dx), int(dy)))
+                if key == "fortress" and typ == FORTRESS_BRIDGE_SPAWNER:
+                    off = ((0, -1), (1, 0), (0, 1), (-1, 0))[rot & 3]
+                    ox = off[0] - (1 if a0 < 0 else 0)
+                    oz = off[1] - (1 if c0 < 0 else 0)
+                    r = QRectF(int(px), int(py), k, k)
+                    r.translate((dx - k) / 2 + k * ox, (dy - k) / 2 + k * oz)
+                    spawners.append(r)
+            if spawners:                                     # the blaze spawners stand out
+                p.setPen(QPen(QColor(40, 20, 0, 220), 1.0))
+                p.setBrush(QColor(255, 196, 60, 235))
+                for r in spawners:
+                    m = max(0.0, (4.0 - r.width()) / 2)      # never smaller than 4 px
+                    p.drawRect(r.adjusted(-m, -m, m, m))
+        p.restore()
+        return centre
+
+    def _draw_cv_pieces_classic(self, p, key, kind, data):
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -1026,6 +1202,133 @@ class MapView(QWidget):
         p.restore()
         return centre
 
+    @staticmethod
+    def _new_look():
+        """(15/11) Settings → Map → « New look of the structures »: the plans with their
+        coloured rim and clearer colours, the new boxes. Off: everything as before."""
+        try:
+            from . import prefs
+            return bool(prefs.get("plans_enhanced"))
+        except Exception:
+            return True
+
+    # (15/11) the plans' new look ─ (gamma < 1 lifts the dark ones, saturation)
+    _PLAN_TONE = {"ancient_city": (0.60, 1.25), "fortress": (0.52, 1.35), "ruined_portal": (0.68, 1.30),
+                  "ruined_portal_nether": (0.68, 1.30), "bastion": (0.78, 1.20), "mineshaft": (0.86, 1.15),
+                  "jungle_temple": (0.88, 1.30), "mansion": (0.90, 1.20), "stronghold": (0.92, 1.10),
+                  "trail_ruins": (0.85, 1.25), "swamp_hut": (0.90, 1.20)}
+
+    # (15/11) a noisy texture softened (share of a 3 × 3 average), and the light from the top
+    # left that gives the flat roofs some volume (± this share across the plan)
+    _PLAN_SOFT = {"jungle_temple": 0.70, "trail_ruins": 0.35, "desert_pyramid": 0.30}
+    _PLAN_LIGHT = {"mansion": 0.20, "swamp_hut": 0.16, "end_city": 0.12, "monument": 0.10,
+                   "jungle_temple": 0.14, "igloo": 0.08, "bastion": 0.10}
+
+    def _plan_enhance(self, key, raw, w, h, s=1):
+        """The plan's picture with clearer colours and a rim of the structure's colour
+        around its outline (it then stands out on any biome and is colour-coded like its
+        icon). raw: RGBA bytes, s: pixels per block. → (bytes, width, height, margin in pixels)"""
+        import numpy as np
+        a = np.frombuffer(bytes(raw), dtype=np.uint8).reshape(h, w, 4)
+        rgb = a[..., :3].astype(np.float32)
+        gamma, sat = self._PLAN_TONE.get(key, (1.0, 1.12))
+        if gamma != 1.0:
+            rgb = 255.0 * (rgb / 255.0) ** gamma
+        lum = rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114
+        rgb = lum[..., None] + (rgb - lum[..., None]) * sat
+        soft = self._PLAN_SOFT.get(key, 0.0)
+        if soft and w > 2 and h > 2:             # the average of the solid neighbours only
+            m = (a[..., 3] >= 250).astype(np.float32)
+            pr = np.pad(rgb * m[..., None], ((s, s), (s, s), (0, 0)))
+            pm_ = np.pad(m, ((s, s), (s, s)))
+            acc = np.zeros_like(rgb)
+            cnt = np.zeros_like(m)
+            for dy in (0, s, 2 * s):
+                for dx in (0, s, 2 * s):
+                    acc += pr[dy:dy + h, dx:dx + w]
+                    cnt += pm_[dy:dy + h, dx:dx + w]
+            blur = acc / np.maximum(cnt, 1.0)[..., None]
+            rgb = np.where(m[..., None] > 0, rgb * (1.0 - soft) + blur * soft, rgb)
+        yy, xx = np.mgrid[0:h, 0:w]
+        t = (xx / max(1.0, w - 1.0) + yy / max(1.0, h - 1.0)) / 2.0      # 0 top left … 1 bottom right
+        rgb = rgb * (1.0 + self._PLAN_LIGHT.get(key, 0.06) * (1.0 - 2.0 * t))[..., None]
+        rgb = np.clip(rgb, 0, 255)
+        r2 = 2 * s
+        r1 = max(1, s)
+        pad = r2 + 1
+        H, W = h + 2 * pad, w + 2 * pad
+        out = np.zeros((H, W, 4), dtype=np.uint8)
+        out[pad:pad + h, pad:pad + w, :3] = rgb.astype(np.uint8)
+        out[pad:pad + h, pad:pad + w, 3] = a[..., 3]
+        solid = np.zeros((H, W), dtype=bool)
+        solid[pad:pad + h, pad:pad + w] = a[..., 3] >= 250          # (its sun shadow is not the outline)
+
+        def grow(m, r):                          # square dilation, separable
+            g = m.copy()
+            for d in range(1, r + 1):
+                g[:, d:] |= m[:, :-d]; g[:, :-d] |= m[:, d:]
+            v = g.copy()
+            for d in range(1, r + 1):
+                v[d:, :] |= g[:-d, :]; v[:-d, :] |= g[d:, :]
+            return v
+        # the rim follows the OUTER outline only: the small gaps inside the structure (between
+        # the pieces of a bastion, of trail ruins…) are closed first and keep their own look
+        solid = ~grow(~grow(solid, r2), r2)
+        near, far = grow(solid, r1), grow(solid, r2)
+        c = self._struct_qcolor(key)
+        col = (int(c.red() * 0.55 + 115), int(c.green() * 0.55 + 115), int(c.blue() * 0.55 + 115))
+        ring2 = far & ~near
+        ring1 = near & ~solid
+        out[ring2] = (col[0], col[1], col[2], 110)
+        out[ring1] = (col[0], col[1], col[2], 245)
+        return out.tobytes(), W, H, pad
+
+    def _plan_show(self, key, plan, which, raw, hd):
+        """(pixmap, margin in blocks) to draw for this plan: as before, or with the new look"""
+        if hd is None:
+            pm = self._plan_pixmap(plan, which, raw)
+            s = 1
+        else:
+            pm, s = hd, max(1, round(hd.width() / max(1, plan["w"])))
+        if not self._new_look():
+            return pm, 0.0
+        cache = self.__dict__.setdefault("_plan_new", {})
+        k = (id(plan), which, hd is not None)
+        got = cache.get(k)
+        if got is None or got[0] is not plan:
+            try:
+                from PySide6.QtGui import QImage
+                img = pm.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+                w, h = img.width(), img.height()
+                data = bytes(img.constBits())[: img.bytesPerLine() * h]
+                if img.bytesPerLine() != w * 4:
+                    data = b"".join(data[y * img.bytesPerLine(): y * img.bytesPerLine() + w * 4] for y in range(h))
+                b, W, H, pad = self._plan_enhance(key, data, w, h, s)
+                new = QPixmap.fromImage(QImage(b, W, H, W * 4, QImage.Format.Format_RGBA8888).copy())
+                got = (plan, new, pad / float(s))
+            except Exception:
+                got = (plan, pm, 0.0)
+            while len(cache) >= memory.plan_count(48):   # (an HD one is a few MB; 15/11 the RAM)
+                cache.pop(next(iter(cache)))
+            cache[k] = got
+        return got[1], got[2]
+
+    _SCOL = {}
+
+    @classmethod
+    def _struct_qcolor(cls, key):
+        c = cls._SCOL.get(key)
+        if c is None:
+            from . import struct_icons
+            c = cls._SCOL[key] = QColor(struct_icons.color(key)) if struct_icons.known(key) \
+                else QColor(255, 110, 60)
+        return c
+
+    def _plan_pending(self, key, x, z):
+        """(15/11) its top view is being computed right now"""
+        eng = self.engine
+        return (getattr(eng, "epoch", None), "jig", key, int(x), int(z)) in getattr(eng, "pieces_pending", ())
+
     def _draw_footprint(self, p: QPainter, key, x, z):
         """Real size of a structure: solid = exact, dashed = approximate."""
         from .struct_boxes import footprint
@@ -1033,7 +1336,7 @@ class MapView(QWidget):
         if fp is None:
             return
         for one in (fp if isinstance(fp, list) else [fp]):
-            self._draw_box(p, *one)
+            self._draw_box(p, *one, key=key)
             self._area_hits.append((one[0], one[1], one[2], one[3], key, int(x), int(z), None))
 
     _JIG_COL = {"street": (150, 140, 120), "center": (255, 200, 60), "house": (255, 110, 60),
@@ -1065,7 +1368,7 @@ class MapView(QWidget):
             from PySide6.QtGui import QImage
             img = QImage(raw if raw is not None else plan["rgba"], plan["w"], plan["h"], plan["w"] * 4,
                          QImage.Format.Format_RGBA8888).copy()
-            if len(cache) > 300:
+            if len(cache) > memory.plan_count(300):
                 cache.clear()
             got = cache[k] = (plan, QPixmap.fromImage(img))
         return got[1]
@@ -1089,7 +1392,7 @@ class MapView(QWidget):
             return None
         from PySide6.QtGui import QImage
         img = QImage(r[0], r[1], r[2], r[1] * 4, QImage.Format.Format_RGBA8888).copy()
-        while len(cache) >= 40:
+        while len(cache) >= memory.plan_count(40):
             cache.pop(next(iter(cache)))
         cache[id(plan)] = (plan, QPixmap.fromImage(img))
         return cache[id(plan)][1]
@@ -1106,13 +1409,13 @@ class MapView(QWidget):
         hd = self._plan_hd(plan) if self.bpp <= PLAN_HD_BPP and which == 0 else None
         self._area_hits.append((x0, z0, x0 + w - 1, z0 + h - 1, key, int(x), int(z), (plan, raw)))
         p.save()
-        if hd is not None:                # (05/11) zoomed in: the blocks' textures (4 px / block)
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.bpp > 1.0 / 4)
-            p.drawPixmap(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0), hd, QRectF(0, 0, hd.width(), hd.height()))
-        else:
-            pm = self._plan_pixmap(plan, which, raw)
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.bpp > 1.0)
-            p.drawPixmap(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0), pm, QRectF(0, 0, w, h))
+        pm, mg = self._plan_show(key, plan, which, raw, hd)   # (15/11) as before, or with the new look
+        e = mg / self.bpp                 # its rim goes a little beyond the plan
+        # (05/11) zoomed in: the blocks' textures (4 px / block)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,
+                        self.bpp > (1.0 / 4 if hd is not None else 1.0))
+        p.drawPixmap(QRectF(sx0 - e, sy0 - e, sx1 - sx0 + 2 * e, sy1 - sy0 + 2 * e), pm,
+                     QRectF(0, 0, pm.width(), pm.height()))
         if self.bpp <= PLAN_CHEST_BPP and chests:
             p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             s = 1.0 / self.bpp
@@ -1191,7 +1494,7 @@ class MapView(QWidget):
             return self._draw_jigsaw_(p, boxes)
         cache = self.__dict__.setdefault("_jig_pm", {})
         dpr = max(1.0, self.devicePixelRatioF())
-        k = (id(boxes), len(boxes), x0, z0, self.bpp, dpr)
+        k = (id(boxes), len(boxes), x0, z0, self.bpp, dpr, self._new_look())
         pm = cache.get(k)
         if pm is None:
             pm = QPixmap(int(wpx * dpr) + 1, int(hpx * dpr) + 1)
@@ -1207,7 +1510,7 @@ class MapView(QWidget):
             finally:
                 self.cx, self.cz = cx_, cz_
             q.end()
-            if len(cache) > 400:
+            if len(cache) > memory.plan_count(400):
                 cache.clear()
             cache[k] = pm
         p.drawPixmap(int(round(sx0)) - 2, int(round(sy0)) - 2, pm)
@@ -1215,42 +1518,85 @@ class MapView(QWidget):
     def _draw_jigsaw_(self, p: QPainter, boxes, clip=True):
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        new = self._new_look()
         for (bx0, bz0, bx1, bz1, kind, _y0, _y1) in boxes:
             sx0, sy0 = self.to_screen(bx0, bz0)
             sx1, sy1 = self.to_screen(bx1 + 1, bz1 + 1)
             if clip and (sx1 < 0 or sy1 < 0 or sx0 > self.width() or sy0 > self.height()):
                 continue
             r, g, b = self._JIG_COL.get(kind, (255, 110, 60))
-            col = QColor(r, g, b, 200 if kind != "street" else 150)
-            p.setPen(QPen(col, 1.0 if kind == "street" else 1.4))
-            fill = QColor(r, g, b, 60 if kind != "street" else 45)
-            p.setBrush(fill)
+            if not new:                                # (15/11) as before
+                col = QColor(r, g, b, 200 if kind != "street" else 150)
+                p.setPen(QPen(col, 1.0 if kind == "street" else 1.4))
+                p.setBrush(QColor(r, g, b, 60 if kind != "street" else 45))
+            elif kind in ("street", "corridor"):       # (14/11 bis) paths: a plain band, no outline
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(r, g, b, 120))
+            else:                                      # buildings / rooms: filled, a crisp darker edge
+                p.setPen(QPen(QColor(int(r * 0.45), int(g * 0.45), int(b * 0.45), 235), 1.0))
+                p.setBrush(QColor(r, g, b, 150))
             p.drawRect(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0))
         p.restore()
 
     _BOX_PENS = {}
 
-    def _draw_box(self, p: QPainter, bx0, bz0, bx1, bz1, exact):
+    def _draw_box(self, p: QPainter, bx0, bz0, bx1, bz1, exact, key=None):
+        """(14/11 bis) in the structure's colour, over a dark edge that keeps it readable on
+        any biome. Exact footprint: a soft filled frame. Approximate: only its four corners
+        (« about here, about this size ») instead of a dashed rectangle."""
         sx0, sy0 = self.to_screen(bx0, bz0)
         sx1, sy1 = self.to_screen(bx1 + 1, bz1 + 1)
         if sx1 < 0 or sy1 < 0 or sx0 > self.width() or sy0 > self.height():
             return
         if sx1 - sx0 < 3 and sy1 - sy0 < 3:          # (29/10) under the icon anyway
             return
-        st = self._BOX_PENS.get(bool(exact))
-        if st is None:
-            col = QColor(255, 110, 60, 230 if exact else 170)
-            pen = QPen(col, 1.6 if exact else 1.2)
-            if not exact:
-                pen.setStyle(Qt.PenStyle.DashLine)
-            fill = QColor(col); fill.setAlpha(28 if exact else 14)
-            st = self._BOX_PENS[bool(exact)] = (pen, fill)
-        if self._box_state is not st:                  # (29/10) no save / restore per box
+        if not self._new_look():                     # (15/11) as before: orange, dashed when approximate
+            st = self._BOX_PENS.get(bool(exact))
+            if st is None:
+                col = QColor(255, 110, 60, 230 if exact else 170)
+                pen = QPen(col, 1.6 if exact else 1.2)
+                if not exact:
+                    pen.setStyle(Qt.PenStyle.DashLine)
+                fill = QColor(col); fill.setAlpha(28 if exact else 14)
+                st = self._BOX_PENS[bool(exact)] = (pen, fill)
             p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
             p.setPen(st[0])
             p.setBrush(st[1])
-            self._box_state = st
-        p.drawRect(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0))
+            self._box_state = None
+            p.drawRect(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0))
+            return
+        st = self._BOX_PENS.get((key, bool(exact)))
+        if st is None:
+            base = self._struct_qcolor(key)            # towards white: readable on a biome of its own colour
+            col = QColor(int(base.red() * 0.6 + 102), int(base.green() * 0.6 + 102), int(base.blue() * 0.6 + 102))
+            col.setAlpha(245 if exact else 235)
+            fill = QColor(col); fill.setAlpha(44 if exact else 0)
+            dark = QPen(QColor(0, 0, 0, 120), 3.6)
+            pen = QPen(col, 1.7)
+            for q in (dark, pen):
+                q.setCapStyle(Qt.PenCapStyle.RoundCap)
+                q.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            st = self._BOX_PENS[(key, bool(exact))] = (pen, fill, dark)
+        self._box_state = None                         # (pens are set here for every box)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0)
+        if exact:
+            rad = min(4.0, r.width() / 5, r.height() / 5)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(st[2]); p.drawRoundedRect(r, rad, rad)
+            p.setBrush(st[1])
+            p.setPen(st[0]); p.drawRoundedRect(r, rad, rad)
+            return
+        n = max(4.0, min(16.0, min(r.width(), r.height()) * 0.24))
+        corners = []
+        for cx, cy, dx, dy in ((r.left(), r.top(), 1, 1), (r.right(), r.top(), -1, 1),
+                               (r.right(), r.bottom(), -1, -1), (r.left(), r.bottom(), 1, -1)):
+            corners.append([QPointF(cx + dx * n, cy), QPointF(cx, cy), QPointF(cx, cy + dy * n)])
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for pen in (st[2], st[0]):
+            p.setPen(pen)
+            for c in corners:
+                p.drawPolyline(c)
 
     # (18/10) the special piece of each kind: stronghold portal room, End ship
     _PIECE_KINDS = {
@@ -1263,15 +1609,19 @@ class MapView(QWidget):
         city nearest to the centre; pieces: (x0, y0, z0, x1, y1, z1, type)."""
         import stronghold_eyes as se
         special = se.PORTAL_ROOM if kind == "stronghold" else self._PIECE_KINDS[kind]["special"]
+        # (19/11) over a plan in the new look the pieces are not coloured by height:
+        # no height legend (its gradient was the old colours), only the labels
+        plan_new = chips and self._new_look()
         d = min(abs(q[0] - self.cx) + abs(q[2] - self.cz) for q in pieces)
-        if d < getattr(self, "_legend_d", 1e18):
+        if not plan_new and d < getattr(self, "_legend_d", 1e18):
             self._legend_d = d
             self._legend_range = (min(q[4] for q in pieces), max(q[4] for q in pieces))
             self._legend_kind = kind
             pr = next((q for q in pieces if q[6] == special), None)
             self._legend_portal = ((pr[4], pr[1] + 3) if kind == "stronghold" else (pr[4], pr[1])) \
                 if pr else None
-        self._pieces_shown = True
+        if not plan_new:
+            self._pieces_shown = True
         if chips:                         # (05/11) over a plan: the same labels
             from .struct_boxes import grad_rgb
             spec = self._PIECE_KINDS[kind]
@@ -1285,6 +1635,7 @@ class MapView(QWidget):
                                     QColor(*spec["col"])))
             if pr is None or top is not pr:
                 self._chips.append((self._srect(top[0], top[2], top[3], top[5]), f"max Y {top[4]}",
+                                    QColor(214, 222, 234) if plan_new else
                                     QColor(*grad_rgb((top[4] - ylo) / span))))
 
     def _draw_pieces(self, p: QPainter, pieces, kind="stronghold"):
@@ -1314,8 +1665,12 @@ class MapView(QWidget):
             sx0, sy0 = self.to_screen(x0, z0)
             sx1, sy1 = self.to_screen(x1 + 1, z1 + 1)
             r, g, b = height_rgb(y1)
-            p.setPen(QPen(QColor(r, g, b, 235), 1))
-            p.setBrush(QColor(r, g, b, 60))
+            if self._new_look():
+                p.setPen(QPen(QColor(int(r * 0.5), int(g * 0.5), int(b * 0.5), 240), 1))   # (14/11 bis) filled
+                p.setBrush(QColor(r, g, b, 135))
+            else:                                      # (15/11) as before
+                p.setPen(QPen(QColor(r, g, b, 235), 1))
+                p.setBrush(QColor(r, g, b, 60))
             p.drawRect(QRectF(sx0, sy0, sx1 - sx0, sy1 - sy0))
         if portal is not None:
             x0, y0, z0, x1, y1, z1, t = portal
@@ -1456,90 +1811,146 @@ class MapView(QWidget):
     def _paint_icon_blocks(self, p, x0, z0, x1, z1, counts, fetch, show_z, dim_types):
         """(29/10) zoomed out: the icons of each structure block drawn once into a
         pixmap (per zoom / icon size / layers / data), then blitted; while the zoom
-        animates, the last pixmap of the block is drawn scaled."""
+        animates, the last pixmap of the block is drawn scaled.
+        (15/11) far out, n x n blocks share one pixmap (a block was ~85 px wide at
+        1:48: 300 small pictures per frame, each with its margin), and the state of
+        each block is remembered until one of its results arrives."""
         B = self.engine.STRUCT_BLOCK
-        cache = self.__dict__.setdefault("_iblk", {})
-        last = self.__dict__.setdefault("_iblk_last", {})
+        eng = self.engine                     # (15/11) shared by the linked maps (one budget)
+        cache = eng.__dict__.setdefault("_iblk", {})
+        last = eng.__dict__.setdefault("_iblk_last", {})
         keys = [k for k, on in self.visible.items()
                 if on and not k.startswith("__") and k in dim_types and self.world.structure_available(k)]
         dpr = max(1.0, self.devicePixelRatioF())
-        m = self.icon_px                                   # pixel margin around the block
+        m = self._icon_margin()                            # pixel margin around the block
         animating = self._anim.isActive()
-        base = (self.world.key, self.dim, self.engine.seed_view, self.icon_px, dpr, tuple(keys), show_z)
+        if not animating or getattr(self, "_iblk_nbpp", None) is None:
+            self._iblk_nbpp = self.bpp                     # the grouping changes only at rest
+        n = 1
+        while n < 16 and n * B / self._iblk_nbpp < 240:
+            n *= 2
+        S = B * n
+        base = (self.world.key, self.dim, self.engine.seed_view, self.icon_px, dpr, tuple(keys), show_z,
+                tuple(sorted((self._style.get("icon_scale") or {}).items())))
+        memo = self.__dict__.setdefault("_iblk_sig", {})
+        if getattr(self, "_iblk_sig_base", None) != (base, self.engine.epoch):
+            memo.clear()
+            self._iblk_sig_base = (base, self.engine.epoch)
+        ver = self.engine.block_ver
         budget = [ANIM_ICON_BUDGET]
-        for bz in range(math.floor(z0 / B), math.floor(z1 / B) + 1):
-            for bx in range(math.floor(x0 / B), math.floor(x1 / B) + 1):
-                sig = []
-                for key in keys:
-                    pts = self.engine.structures(key, bx, bz, fetch)
-                    if pts is None:
-                        sig.append(None)
-                        continue
-                    sig.append((id(pts), len(pts),
-                                id(self.engine.abandoned(bx, bz)) if key == "village" else 0,
-                                id(self.engine.with_basement(bx, bz)) if key == "igloo" else 0,
-                                id(self.engine.with_ship(bx, bz)) if key == "end_city" else 0))
-                bsig = (bx, bz) + base + (tuple(sig),)
+        used = 0
+        icpm = {}
+        for sbz in range(math.floor(z0 / S), math.floor(z1 / S) + 1):
+            for sbx in range(math.floor(x0 / S), math.floor(x1 / S) + 1):
+                sigs = []
+                for bz in range(sbz * n, sbz * n + n):
+                    for bx in range(sbx * n, sbx * n + n):
+                        inside = x0 - B < bx * B <= x1 and z0 - B < bz * B <= z1
+                        want = fetch and inside
+                        v = ver.get((bx, bz), 0)
+                        mm = memo.get((bx, bz))
+                        if mm is not None and mm[0] == v and (mm[1] or not want):
+                            sigs.append(mm[2])
+                            continue
+                        sig = []
+                        for key in keys:
+                            pts = self.engine.structures(key, bx, bz, want)
+                            if pts is None:
+                                sig.append(None)
+                                continue
+                            sig.append((id(pts), len(pts),
+                                        id(self.engine.abandoned(bx, bz)) if key == "village" else 0,
+                                        id(self.engine.with_basement(bx, bz)) if key == "igloo" else 0,
+                                        id(self.engine.with_ship(bx, bz)) if key == "end_city" else 0))
+                        sig = tuple(sig)
+                        memo[(bx, bz)] = (v, want, sig)
+                        sigs.append(sig)
+                if len(memo) > 20000:
+                    memo.clear()
+                bsig = (sbx, sbz, n) + base + (tuple(sigs),)
                 ck = bsig + (self.bpp,)
-                ent = cache.get(ck)
+                ent = cache.pop(ck, None)
+                if ent is not None:
+                    cache[ck] = ent                        # the most recent last (dropped last)
                 if ent is None and animating:
                     lk = last.get(bsig)
                     ent = cache.get(lk) if lk is not None else None
                 if ent is None:
-                    lists = [self._block_icons(key, bx, bz, False, show_z)[0] or [] for key in keys]
-                    ent = self._build_icon_block(bx, bz, lists, m, dpr)
+                    lists = []
+                    for bz in range(sbz * n, sbz * n + n):
+                        for bx in range(sbx * n, sbx * n + n):
+                            lists += [self._block_icons(key, bx, bz, False, show_z)[0] or [] for key in keys]
+                    ent = self._build_icon_block(sbx * S, sbz * S, S, lists, m, dpr)
                     cache[ck] = ent
                     last[bsig] = ck
-                    self._iblk_bytes = getattr(self, "_iblk_bytes", 0) + ent[3]
-                    while self._iblk_bytes > ICON_CACHE_BYTES and len(cache) > 1:
+                    eng._iblk_bytes = getattr(eng, "_iblk_bytes", 0) + ent[3]
+                    # never below what two frames need (a fine zoom on a HiDPI screen)
+                    lim = max(ICON_CACHE_BYTES, 2 * getattr(self, "_iblk_frame", 0))
+                    while eng._iblk_bytes > lim and len(cache) > 1:
                         old = next(iter(cache))
-                        self._iblk_bytes -= cache.pop(old)[3]
+                        eng._iblk_bytes -= cache.pop(old)[3]
+                    if len(last) > 4 * len(cache) + 2000:
+                        for lk in [lk for lk, ck_ in last.items() if ck_ not in cache]:
+                            del last[lk]
                 pm, ebpp, hits, _nb, tot = ent
+                used += ent[3]
                 sc = ebpp / self.bpp
-                sx, sy = self.to_screen(bx * B, bz * B)
+                sx, sy = self.to_screen(sbx * S, sbz * S)
                 if sc == 1.0:
                     p.drawPixmap(int(round(sx)) - m, int(round(sy)) - m, pm)
                 elif len(hits) <= budget[0]:
                     # (31/10) while the zoom animates: each icon at its own size (a
                     # scaled block made them grow / shrink until the zoom stopped)
+                    # (15/11) the loop without calls (thousands of icons per frame)
                     budget[0] -= len(hits)
-                    h = self.icon_px / 2
-                    W, H = self.width() + h, self.height() + h
+                    h = self._icon_margin() / 2                       # the biggest half size
+                    ib = 1.0 / self.bpp
+                    ox = self.width() / 2 - self.cx * ib               # = to_screen(x)
+                    oy = self.height() / 2 - self.cz * ib
+                    xmax, ymax = self.width() + h, self.height() + h
+                    dp = p.drawPixmap
                     for (wx, wz, k, _rx, _rz) in hits:
-                        ix, iy = self.to_screen(wx, wz)
-                        if -h <= ix <= W and -h <= iy <= H:
-                            ic = self._icon(k)
-                            if ic is not None:
-                                p.drawPixmap(int(ix - h), int(iy - h), ic)
+                        ix = wx * ib + ox
+                        if -h <= ix <= xmax:
+                            iy = wz * ib + oy
+                            if -h <= iy <= ymax:
+                                got = icpm.get(k)
+                                if got is None:
+                                    got = icpm[k] = (self._icon(k), self.icon_size(k) / 2)
+                                ic, hk = got
+                                if ic is not None:
+                                    dp(int(ix - hk), int(iy - hk), ic)
                 else:
                     w = pm.width() / pm.devicePixelRatio()
                     p.drawPixmap(QRectF(sx - m * sc, sy - m * sc, w * sc, w * sc), pm,
                                  QRectF(0, 0, pm.width(), pm.height()))
                 self._icon_hits_w.append(hits)
                 # the legend counts what is on screen
-                if x0 <= bx * B and bx * B + B - 1 <= x1 and z0 <= bz * B and bz * B + B - 1 <= z1:
-                    for k, n in tot.items():
-                        counts[k] = counts.get(k, 0) + n
+                if x0 <= sbx * S and sbx * S + S - 1 <= x1 and z0 <= sbz * S and sbz * S + S - 1 <= z1:
+                    for k, c in tot.items():
+                        counts[k] = counts.get(k, 0) + c
                 else:
                     for (wx, wz, k, _rx, _rz) in hits:
                         if x0 <= wx <= x1 and z0 <= wz <= z1:
                             counts[k] = counts.get(k, 0) + 1
+        self._iblk_frame = used
 
-    def _build_icon_block(self, bx, bz, lists, m, dpr):
-        B = self.engine.STRUCT_BLOCK
-        side = int(math.ceil(B / self.bpp)) + 2 * m
+    def _build_icon_block(self, ox, oz, size, lists, m, dpr):
+        side = int(math.ceil(size / self.bpp)) + 2 * m
         pm = QPixmap(int(side * dpr), int(side * dpr))
         pm.setDevicePixelRatio(dpr)
         pm.fill(Qt.GlobalColor.transparent)
         q = QPainter(pm)
         hits, tot = [], {}
-        ox, oz = bx * B, bz * B
-        h = self.icon_px / 2
+        half = {}
         for icons in lists:
             for (x, z, k) in icons:
                 ic = self._icon(k)
                 if ic is None:
                     continue
+                h = half.get(k)
+                if h is None:
+                    h = half[k] = self.icon_size(k) / 2
                 lx, ly = (x - ox) / self.bpp + m, (z - oz) / self.bpp + m
                 q.drawPixmap(int(lx - h), int(ly - h), ic)
                 hits.append((x, z, k, int(math.floor(x)), int(math.floor(z))))
@@ -1582,7 +1993,7 @@ class MapView(QWidget):
             # (31/10) each structure up to its own zoom (Settings → Map)
             dim_types = {k: v for k, v in dim_types.items() if self.bpp <= _struct_limit(k)}
             # (29/10) only what can show: the view + the icon (+ pieces / boxes zoomed in)
-            mg = self.icon_px * self.bpp + (PIECE_MARGIN if self.bpp <= BOX_MAX_BPP else 0)
+            mg = self._icon_margin() * self.bpp + (PIECE_MARGIN if self.bpp <= BOX_MAX_BPP else 0)
             vx0, vz0, vx1, vz1 = x0 - mg, z0 - mg, x1 + mg, z1 + mg
             if self.bpp >= ICON_CACHE_BPP:
                 self._paint_icon_blocks(p, x0, z0, x1, z1, counts, fetch, show_z, dim_types)
@@ -1739,7 +2150,9 @@ class MapView(QWidget):
                                     for b_ in jp:
                                         self._area_hits.append((b_[0], b_[1], b_[2], b_[3], k, int(x),
                                                                 int(z), None))
-                                else:
+                                elif not self._plan_pending(key, x, z):
+                                    # (15/11) no box while its plan is being computed (it flashed
+                                    # for a moment before the plan); the box stays where no plan comes
                                     self._draw_footprint(p, key, x, z)
                             self._draw_icon(p, k, ix, iz, ref=(x, z))
         if self.dim != 0:                 # (18/10) no 1.16 features / landmarks there
@@ -1754,9 +2167,12 @@ class MapView(QWidget):
             info = lm.get("sh_info", {})
             show_eyes = self.bpp <= 64
             pieces_on = self.bpp <= PIECES_MAX_BPP
+            cull = max(200.0, (self.icon_size("stronghold") + 48) * self.bpp)   # (15/11) icon + badge
             for (x, z) in lm.get("strongholds", ()):
                 if x0 <= x <= x1 and z0 <= z <= z1:
                     counts["stronghold"] = counts.get("stronghold", 0) + 1
+                if not (x0 - cull <= x <= x1 + cull and z0 - cull <= z <= z1 + cull):
+                    continue                      # off screen: nothing to draw (128 of them)
                 near = x0 - 200 <= x <= x1 + 200 and z0 - 200 <= z <= z1 + 200
                 if near and self.bpp <= PLAN_MAX_BPP and \
                         isinstance(self.engine.jigsaw_pieces("stronghold", x, z,
@@ -2198,17 +2614,30 @@ class MapView(QWidget):
         sx, sy = self.to_screen(x, z)
         if not (-40 <= sx <= self.width() + 40 and -40 <= sy <= self.height() + 40):
             return
-        p.save()
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        f = p.font(); f.setPointSizeF(7.5); f.setBold(True); p.setFont(f)
-        txt = f"{eyes}/12"
-        w = p.fontMetrics().horizontalAdvance(txt) + 10
-        r = QRectF(sx - w / 2, sy + self.icon_px / 2 + 1, w, 14)
-        p.setPen(QPen(QColor(0, 0, 0, 170), 1)); p.setBrush(QColor(eye_color(eyes)))
-        p.drawRoundedRect(r, 7, 7)
-        p.setPen(QColor("#10131a") if eyes >= 5 else QColor("#ffffff"))
-        p.drawText(r, Qt.AlignmentFlag.AlignCenter, txt)
-        p.restore()
+        # (15/11) the pill drawn once per eye count into a pixmap, then blitted: 128
+        # strongholds zoomed out were 128 antialiased pills + texts each frame
+        dpr = max(1.0, self.devicePixelRatioF())
+        cache = self.__dict__.setdefault("_eye_pm", {})
+        ent = cache.get((eyes, dpr))
+        if ent is None:
+            f = QFont(self.font()); f.setPointSizeF(7.5); f.setBold(True)
+            txt = f"{eyes}/12"
+            w = QFontMetrics(f).horizontalAdvance(txt) + 10
+            pm = QPixmap(int(math.ceil((w + 2) * dpr)), int(math.ceil(16 * dpr)))
+            pm.setDevicePixelRatio(dpr)
+            pm.fill(Qt.GlobalColor.transparent)
+            q = QPainter(pm)
+            q.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            q.setFont(f)
+            r = QRectF(1, 1, w, 14)
+            q.setPen(QPen(QColor(0, 0, 0, 170), 1)); q.setBrush(QColor(eye_color(eyes)))
+            q.drawRoundedRect(r, 7, 7)
+            q.setPen(QColor("#10131a") if eyes >= 5 else QColor("#ffffff"))
+            q.drawText(r, Qt.AlignmentFlag.AlignCenter, txt)
+            q.end()
+            ent = cache[(eyes, dpr)] = (pm, w)
+        pm, w = ent
+        p.drawPixmap(QPointF(sx - w / 2 - 1, sy + self.icon_size("stronghold") / 2), pm)
 
     # ── (18/10) a clicked structure: bigger icon + bubble with its details ──
     def _iter_hits(self):
@@ -2237,10 +2666,11 @@ class MapView(QWidget):
         return None
 
     def icon_hit_at(self, sx, sy):
-        best, bd = None, max(10.0, self.icon_px * 0.6) ** 2
+        best, bd = None, None
         for (hx, hy, key, x, z) in self._iter_hits():
             d = (hx - sx) ** 2 + (hy - sy) ** 2
-            if d <= bd:
+            lim = max(10.0, self.icon_size(key) * 0.6) ** 2      # (15/11) its own size
+            if d <= lim and (bd is None or d < bd):
                 best, bd = (key, x, z), d
         return best
 
@@ -2406,7 +2836,7 @@ class MapView(QWidget):
                 self._sbubble.hide()
             return
         sx, sy, key = self._sel_screen()
-        big = int(round(self.icon_px * 1.6))
+        big = int(round(self.icon_size(key) * 1.6))
         pm = struct_icons.pixmap(key, big, max(2.0, self.devicePixelRatioF()))
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -3005,7 +3435,7 @@ class MapView(QWidget):
             if time.perf_counter() - self._last_move[1] > 0.08:   # stopped before release
                 self._vel = (0.0, 0.0)
             if abs(self._vel[0]) > 40 or abs(self._vel[1]) > 40:
-                self._clock.restart(); self._anim.start()
+                self._clock.restart(); self._anim.start(self._frame_ms())
             else:
                 self._vel = (0.0, 0.0)
 

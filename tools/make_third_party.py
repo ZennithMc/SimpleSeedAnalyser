@@ -72,6 +72,8 @@ Unsplash photos published before June 8, 2017 are CC0 (public domain). The later
 ones are under the Unsplash License (https://unsplash.com/license): free to use,
 modify and redistribute, not to be sold as they are. Sources and licences as listed
 by the elementary OS and Pop!_OS wallpaper collections.""")
+sec("Inter typeface — The Inter Project Authors (SIL Open Font License 1.1)\nhttps://github.com/rsms/inter  ·  assets/fonts (the application's font, unmodified)",
+    read(os.path.join(ROOT, "assets", "fonts", "Inter-LICENSE.txt")))
 sec('Minecraft game data — Mojang Studios (loot_tables/)',
     "SSA reproduces Minecraft's world generation. To do so, loot_tables/ holds data\nread from the game's files (loot tables, structure templates' sizes, jigsaw pools\nand block lists, enchantment tables) and tests/server_truth/ holds what real\nservers generated. This data belongs to Mojang Studios / Microsoft; it is not\ncovered by SSA's GPL licence and is only used for compatibility. No game code,\ntexture or sound is shipped: the item and block pictures are read from the user's\nown Minecraft installation. SSA is not affiliated with Mojang Studios or Microsoft.")
 sec("PyInstaller bootloader — GPL-2.0 with the PyInstaller bootloader exception",

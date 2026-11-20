@@ -57,6 +57,29 @@ STRUCT_TABLE = {"desert_pyramid": "desert_pyramid", "jungle_temple": "jungle_tem
 
 
 # the tables a structure's containers can use (its own group)
+# (15/11) the structure of a loot table, for its icon in the list (first match wins)
+_TABLE_STRUCT = [("desert_pyramid", "desert_pyramid"), ("jungle_temple", "jungle_temple"), ("igloo", "igloo"),
+                 ("shipwreck", "shipwreck"), ("underwater_ruin", "ocean_ruin"), ("village", "village"),
+                 ("pillager_outpost", "pillager_outpost"), ("abandoned_mineshaft", "mineshaft"),
+                 ("ruined_portal", "ruined_portal"), ("end_city", "end_city"), ("nether_bridge", "fortress"),
+                 ("bastion", "bastion"), ("woodland_mansion", "mansion"), ("buried_treasure", "buried_treasure"),
+                 ("simple_dungeon", "dungeon"), ("stronghold", "stronghold"), ("ancient_city", "ancient_city"),
+                 ("trial_chambers", "trial_chambers"), ("trail_ruins", "trail_ruins"), ("desert_well", "desert_well")]
+_SPIX: dict = {}
+
+
+def _struct_pix(tid, size):
+    from . import struct_icons
+    t = str(tid)
+    key = next((k for frag, k in _TABLE_STRUCT if frag in t), None)
+    if key is None or not struct_icons.known(key):
+        return None
+    pm = _SPIX.get((key, size))
+    if pm is None:
+        pm = _SPIX[(key, size)] = struct_icons.pixmap(key, size)
+    return pm
+
+
 STRUCT_SCOPE = {"desert_pyramid": ("desert_pyramid",), "jungle_temple": ("jungle_temple",),
                 "igloo": ("igloo_chest",), "shipwreck": ("shipwreck_",), "ocean_ruin": ("underwater_ruin_",),
                 "village": ("village/",), "pillager_outpost": ("pillager_outpost",),
@@ -277,11 +300,17 @@ class LootTablesView(QWidget):
         self.scope_on = bool(structure)
         self.focus_items = {getattr(x, "item", None) for x in (focus_slots or []) if x is not None}
         acc = theme.ACCENT or "#7c9cff"
+        # (15/11) SSA's theme: glass panels (the lights of the page show through), no black slab
+        live = theme.is_live()
+        side_bg = theme._rgba(theme.BG2, 0.80) if live else theme.BG2
+        panel_bg = (f"qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {theme._rgba(theme._mix(theme.BG1, acc, 0.06), 0.86)}, "
+                    f"stop:0.25 {theme._rgba(theme.BG1, 0.82)}, stop:1 {theme._rgba(theme.BG1, 0.78)})"
+                    if live else (theme.BG0 or theme.BG1))
         self.setStyleSheet(
-            f"#LtSide {{ background: {theme.BG2}; border: 1px solid {theme.LINE2}; border-radius: 14px; }}"
+            f"#LtSide {{ background: {side_bg}; border: 1px solid {theme.LINE2}; border-radius: 14px; }}"
             f"#LtList {{ background: transparent; border: none; outline: none; font-size: 10pt; }}"
             f"#LtList::item {{ padding: 7px 8px; border-radius: 8px; color: {theme.TEXT}; }}"
-            f"#LtList::item:selected {{ background: {acc}; color: white; }}"
+            f"#LtList::item:selected {{ background: {acc}; color: {theme.on_accent(acc)}; }}"
             f"#LtList::item:hover:!selected {{ background: {theme.BG3}; }}"
             f"#LtTile {{ background: {theme.BG2}; border: 1px solid {theme.LINE2}; border-radius: 14px; }}"
             f"#LtHead {{ font-size: 17pt; font-weight: 700; }}"
@@ -289,7 +318,7 @@ class LootTablesView(QWidget):
             f"#LtPill {{ background: {theme.BG2}; border: 1px solid {theme.LINE2}; border-radius: 11px;"
             f" padding: 3px 10px; color: {theme.TEXT2}; font-size: 8.5pt; }}"
             f"#LtHint {{ color: {theme.TEXT3}; font-size: 8.5pt; }}"
-            f"#LtPanel {{ background: {theme.BG0 or theme.BG1}; border: 1px solid {theme.LINE2}; border-radius: 14px; }}")
+            f"#LtPanel {{ background: {panel_bg}; border: 1px solid {theme.LINE2}; border-radius: 14px; }}")
         v = QHBoxLayout(self); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(16)
         side = QFrame(); side.setObjectName("LtSide"); self.side = side
         side.setFixedWidth(250)
@@ -442,7 +471,7 @@ class LootTablesView(QWidget):
             if k:
                 it.setToolTip(f"{k} container{'s' * (k != 1)} of this structure")
             it.setData(Qt.ItemDataRole.UserRole, tid)
-            pm = _icon_pix(table_kind(tid), 22, ver)
+            pm = _struct_pix(tid, 22) or _icon_pix(table_kind(tid), 22, ver)
             ic = QIcon()
             for mode in (QIcon.Mode.Normal, QIcon.Mode.Selected, QIcon.Mode.Active):
                 ic.addPixmap(pm, mode)
@@ -518,7 +547,8 @@ class LootTableDialog(QDialog):
         av = scr.availableGeometry()
         self.resize(min(1120, int(av.width() * 0.85)), min(880, int(av.height() * 0.88)))
         self.setMinimumSize(560, 420)
-        self.setStyleSheet(f"QDialog {{ background: {theme.BG1 or '#1b1f27'}; }}")
+        if not theme.is_live():                  # (15/11) SSA's theme: the dialogs' own colours
+            self.setStyleSheet(f"QDialog {{ background: {theme.BG1 or '#1b1f27'}; }}")
         lay = QVBoxLayout(self); lay.setContentsMargins(16, 16, 16, 16)
         self.view = LootTablesView(version, table, self, structure, focus_slots, tables, compute)
         lay.addWidget(self.view)

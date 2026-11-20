@@ -9,9 +9,10 @@ qtui/layers_panel.py — right-hand "Layers" panel of the map: what to show and 
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QIcon
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+                               QSizePolicy,
                                QPushButton, QScrollArea, QToolButton, QVBoxLayout, QWidget)
 
 import cubiomes_wrap as cw
@@ -22,6 +23,25 @@ from .palette_combo import fill_palette_combo
 from .map_engine import CLIMATE, palette_names
 from .map_view import ARROW_UNIFORM
 from .widgets import LabeledSlider, Segmented, body, hline, section_title
+
+def _qa(col, a):
+    """a QColor with alpha (theme._rgba gives a stylesheet string)"""
+    c = QColor(col)
+    c.setAlphaF(max(0.0, min(1.0, a)))
+    return c
+
+
+def _save_icon_style(style):
+    """(15/11) the icons' size (and each structure's) come back at the next launch"""
+    try:
+        import json
+        from PySide6.QtCore import QSettings
+        qs = QSettings("SSA", "SimpleSeedAnalyser")
+        qs.setValue("map/icon_px", int(style.get("icon_px", 22)))
+        qs.setValue("map/icon_scale", json.dumps(style.get("icon_scale") or {}))
+    except Exception:                                   # noqa: BLE001
+        pass
+
 
 LANDMARKS = [("__spawn", "Spawn", "spawn"), ("__strongholds", "Strongholds", "stronghold"),
              ("__origin", "Origin (0, 0)", "origin_cross")]
@@ -41,6 +61,258 @@ def _qicon(key: str) -> QIcon:
     return struct_icons.icon(key, 18)
 
 
+class LayerChip(QCheckBox):
+    """(14/11) A layer of the map as a chip: its icon and name, lit in its own
+    colour when shown. Still a QCheckBox (isChecked / toggled / setEnabled /
+    tooltip are the ones the panel has always used); only its look changes."""
+
+    sizeRequested = Signal(object)          # (15/11) the chip asks for its icon-size popup
+
+    def __init__(self, label, icon, color):
+        super().__init__(label)
+        self._icon, self._col = icon, QColor(color)
+        self._t = 0.0
+        self._hv = False
+        self._an = None
+        self.size_tag = ""                      # "S", "L", "XL"… when its icon is resized
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.toggled.connect(self._glide)
+
+    def sizeHint(self):
+        return QSize(self.fontMetrics().horizontalAdvance(self.text()) + 44, 30)
+
+    def minimumSizeHint(self):
+        return QSize(64, 30)
+
+    def hitButton(self, pos):                    # the whole chip is the switch
+        return self.rect().contains(pos) and not self._in_size(pos)
+
+    def _size_zone(self):
+        """(15/11) the small arrow on the right of a chip that is on: its icon's size"""
+        return QRectF(self.width() - 20, 0, 20, self.height())
+
+    def _in_size(self, pos):
+        return self.isChecked() and self.isEnabled() and self._size_zone().contains(QPointF(pos))
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self._in_size(e.position()):
+            e.accept()
+            self.sizeRequested.emit(self)
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        super().mouseMoveEvent(e)
+        hz = self._in_size(e.position())
+        if hz != getattr(self, "_hz", False):
+            self._hz = hz
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setToolTip("Icon size" if hz else getattr(self, "_tip", ""))
+            self.update()
+
+    def setToolTip(self, t):
+        if t != "Icon size":
+            self._tip = t
+        super().setToolTip(t)
+
+    def _glide(self, on):
+        from . import motion
+        to = 1.0 if on else 0.0
+        if self._an is not None:
+            try:
+                self._an.stop()
+            except RuntimeError:
+                pass
+            self._an = None
+        if not motion.enabled() or not self.isVisible():
+            self._t = to
+            self.update()
+            return
+        t0 = self._t
+
+        def step(t):
+            self._t = t0 + (to - t0) * t
+            self.update()
+        self._an = motion.run(self, 150, step)
+
+    def enterEvent(self, e):
+        super().enterEvent(e)
+        self._hv = True
+        self.update()
+
+    def leaveEvent(self, e):
+        super().leaveEvent(e)
+        self._hv = False
+        if getattr(self, "_hz", False):
+            self._hz = False
+            super().setToolTip(getattr(self, "_tip", ""))
+        self.update()
+
+    def paintEvent(self, e):
+        if self._an is None:
+            self._t = 1.0 if self.isChecked() else 0.0
+        # (15/11) the chip floats over the map: every frame of the map (pan, zoom)
+        # repainted the 20+ chips — each state is now drawn once, then blitted
+        dpr = max(1.0, self.devicePixelRatioF())
+        key = (self.width(), self.height(), dpr, round(self._t, 3), self._hv, self.isEnabled(),
+               self.hasFocus(), self.text(), self.font().key(), theme.BG2, theme.LINE2,
+               theme.HOVER_LINE, theme.TEXT, theme.TEXT2, self.size_tag, getattr(self, "_hz", False))
+        if getattr(self, "_pm_key", None) != key:
+            pm = QPixmap(int(self.width() * dpr), int(self.height() * dpr))
+            pm.setDevicePixelRatio(dpr)
+            pm.fill(Qt.GlobalColor.transparent)
+            q = QPainter(pm)
+            self._paint_chip(q)
+            q.end()
+            self._pm, self._pm_key = pm, key
+        QPainter(self).drawPixmap(0, 0, self._pm)
+
+    def _paint_chip(self, p):
+        t, on = self._t, self.isEnabled()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if not on:
+            p.setOpacity(0.38)
+        r = QRectF(self.rect()).adjusted(0.5, 1.5, -0.5, -1.5)
+        c = self._col.name()
+        base = QColor(theme.BG2)                 # (15/11) an opaque base: the panel floats over the map,
+        base.setAlphaF(0.94)                     # the chips must read whatever is behind
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(base)
+        p.drawRoundedRect(r, 9, 9)
+        bg = QColor(self._col)
+        bg.setAlphaF(0.20 * t + (0.07 if self._hv and on else 0.0))
+        line = QColor(theme._mix(theme.HOVER_LINE if self._hv and on else theme.LINE2, c, 0.66 * t))
+        if self.hasFocus():
+            line = QColor(theme.TEXT2)
+        p.setBrush(bg)
+        p.setPen(QPen(line, 1))
+        p.drawRoundedRect(r, 9, 9)
+        pm = self._icon.pixmap(36, 36)
+        p.setOpacity((0.38 if not on else 1.0) * (0.62 + 0.38 * t))
+        p.drawPixmap(QRectF(r.left() + 7, r.center().y() - 9, 18, 18), pm, QRectF(pm.rect()))
+        p.setOpacity(0.38 if not on else 1.0)
+        f = QFont(self.font())
+        f.setPointSizeF(8.25)
+        f.setWeight(QFont.Weight.DemiBold if t > 0.5 else QFont.Weight.Medium)
+        p.setFont(f)
+        # (15/11) on: a small arrow on the right for the icon's size (its size when changed)
+        glyph = t > 0.5 and on and (self._hv or self.size_tag)
+        if glyph:
+            z = self._size_zone().adjusted(0, 4, -3, -4)
+            hz = getattr(self, "_hz", False)
+            if hz:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(_qa(self._col, 0.28))
+                p.drawRoundedRect(z, 6, 6)
+            col = QColor(theme._mix(theme.TEXT2, c, 0.55)) if not hz else QColor(theme.TEXT)
+            if self.size_tag:
+                g = QFont(self.font()); g.setPointSizeF(6.6); g.setBold(True)
+                p.setFont(g); p.setPen(col)
+                p.drawText(z.adjusted(0, -5, 0, -5), Qt.AlignmentFlag.AlignCenter, self.size_tag)
+                cy = z.center().y() + 5
+            else:
+                cy = z.center().y()
+            p.setPen(QPen(col, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            cx = z.center().x()
+            p.drawLine(QPointF(cx - 3, cy - 1.5), QPointF(cx, cy + 1.5))
+            p.drawLine(QPointF(cx, cy + 1.5), QPointF(cx + 3, cy - 1.5))
+            p.setFont(f)
+        p.setPen(QColor(theme._mix(theme.TEXT2, theme.TEXT, t)))
+        tr = QRectF(r.left() + 29, r.top(), r.width() - 33 - (14 if t > 0.5 and on else 0), r.height())
+        while p.fontMetrics().horizontalAdvance(self.text()) > tr.width() and f.pointSizeF() > 7.3:
+            f.setPointSizeF(f.pointSizeF() - 0.25)           # a long name is set a little smaller
+            p.setFont(f)
+        p.drawText(tr, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   p.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight, int(tr.width())))
+
+
+ICON_SIZES = [(0.7, "S"), (1.0, "M"), (1.3, "L"), (1.6, "XL"), (2.0, "XXL")]
+
+
+def size_tag(factor):
+    f = float(factor)
+    best = min(ICON_SIZES, key=lambda x: abs(x[0] - f))
+    return "" if abs(f - 1.0) < 1e-6 else best[1]
+
+
+class _SizeCell(QWidget):
+    """one size of the popup: the structure's icon at that size, its letter"""
+    picked = Signal(float)
+
+    def __init__(self, icon_key, px, factor, tag, color, current):
+        super().__init__()
+        self.f, self.tag, self.col, self.cur = factor, tag, QColor(color), current
+        self.pm = struct_icons.pixmap(icon_key, max(10, min(46, int(round(px * factor)))), 2.0)
+        self._hv = False
+        self.setFixedSize(54, 74)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def enterEvent(self, e):
+        self._hv = True; self.update()
+
+    def leaveEvent(self, e):
+        self._hv = False; self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.picked.emit(self.f)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        if self.cur or self._hv:
+            p.setPen(QPen(_qa(self.col, 0.75 if self.cur else 0.35), 1.2))
+            p.setBrush(_qa(self.col, 0.22 if self.cur else 0.10))
+            p.drawRoundedRect(r, 10, 10)
+        if self.pm is not None:
+            w = self.pm.width() / self.pm.devicePixelRatio()
+            p.drawPixmap(QPointF(r.center().x() - w / 2, 27 - w / 2), self.pm)
+        f = QFont(self.font()); f.setPointSizeF(7.6); f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(theme.TEXT if self.cur else theme.TEXT2))
+        p.drawText(QRectF(r.left(), r.bottom() - 20, r.width(), 16), Qt.AlignmentFlag.AlignCenter, self.tag)
+
+
+class _SizePopup(QWidget):
+    """(15/11) the size of one structure's icons on the map: five sizes, shown"""
+    picked = Signal(float)
+
+    def __init__(self, parent, icon_key, label, px, factor, color):
+        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.col = QColor(color)
+        v = QVBoxLayout(self); v.setContentsMargins(12, 10, 12, 10); v.setSpacing(6)
+        t = QLabel(f"{label.upper()} · ICON SIZE")
+        tf = theme.ui_font(7.0); tf.setBold(True); tf.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
+        t.setFont(tf); t.setStyleSheet(f"color: {theme.TEXT2}; background: transparent;")
+        v.addWidget(t)
+        row = QHBoxLayout(); row.setSpacing(4)
+        cur = min(ICON_SIZES, key=lambda x: abs(x[0] - float(factor)))[0]
+        for f, tag in ICON_SIZES:
+            c = _SizeCell(icon_key, px, f, tag, color, f == cur)
+            c.picked.connect(self._pick)
+            row.addWidget(c)
+        v.addLayout(row)
+
+    def _pick(self, f):
+        self.picked.emit(f)
+        self.close()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        base = QColor(theme.BG2); base.setAlphaF(0.98)
+        p.setBrush(base)
+        p.setPen(QPen(_qa(self.col, 0.45), 1))
+        p.drawRoundedRect(r, 12, 12)
+
+
 class LayersPanel(QWidget):
     changed = Signal()
 
@@ -48,7 +320,8 @@ class LayersPanel(QWidget):
         super().__init__(parent)
         self.setObjectName("SidePanel")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setFixedWidth(288)
+        self.setFixedWidth(304)             # (14/11) two chips side by side
+        self.setProperty("float", "1")      # (15/11) over the map: less transparent than the other panels
         self.map = map_view
         self.world = world
         self.boxes: dict = {}
@@ -79,25 +352,37 @@ class LayersPanel(QWidget):
             bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(4)
             return w, bl
 
+        class _Grid(QGridLayout):                # (14/11) the chips two by two
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.setContentsMargins(0, 0, 0, 0); self.setSpacing(4)
+                self.setColumnStretch(0, 1); self.setColumnStretch(1, 1)
+                self.n = 0
+
+            def put(self, wd):
+                self.addWidget(wd, self.n // 2, self.n % 2)
+                self.n += 1
+
         # ── landmarks & structures ──────────────────────────────────────
         self._lm_box, lml = _box()
         lay.addWidget(self._lm_box)
         lml.addWidget(section_title("Landmarks"))
+        lmg = _Grid(); lml.addLayout(lmg)
         for key, label, ikey in LANDMARKS:
             tg = self._toggle(key, label, ikey)
             if key != "__strongholds":
-                lml.addWidget(tg)
+                lmg.put(tg)
                 continue
-            # (22/10) the list of the 128 strongholds: a small button on the row
-            # (was a line of text under it)
-            srow = QHBoxLayout(); srow.setSpacing(4); srow.setContentsMargins(0, 0, 0, 0)
-            srow.addWidget(tg); srow.addStretch(1)
+            # (22/10) the list of the 128 strongholds: a small button on the chip's side
+            srow = QHBoxLayout(); srow.setSpacing(2); srow.setContentsMargins(0, 0, 0, 0)
+            srow.addWidget(tg, 1)
             sh = QToolButton(); icons.bind(sh, "more", 16)
-            sh.setAutoRaise(True); sh.setFixedSize(22, 22)
+            sh.setAutoRaise(True); sh.setFixedSize(22, 26)
             sh.setToolTip("All strongholds of the seed: eyes, top Y, broken portals…")
             sh.clicked.connect(lambda: self.map.show_all_strongholds())
             srow.addWidget(sh)
-            lml.addLayout(srow)
+            hold = QWidget(); hold.setLayout(srow)
+            lmg.put(hold)
         lml.addSpacing(10)
         row = QHBoxLayout(); row.setSpacing(4)
         row.addWidget(section_title("Structures")); row.addStretch(1)
@@ -109,7 +394,7 @@ class LayersPanel(QWidget):
         lay.addLayout(row)
         from condition_types import DISABLED_TYPES
         self._sboxes = {}
-        sb0, sl0 = _box(); lay.addWidget(sb0); self._sboxes[0] = sb0
+        sb0 = QWidget(); sl0 = _Grid(sb0); lay.addWidget(sb0); self._sboxes[0] = sb0
         for key in SURFACE:
             if key in DISABLED_TYPES:            # temporarily hidden (abandoned camp, 01/10)
                 self.map.visible[key] = False
@@ -120,9 +405,9 @@ class LayersPanel(QWidget):
                 if key == "village":             # abandoned villages: own icon, same switch (01/10)
                     tg.setToolTip("Also shows abandoned (zombie) villages, ≈ 2 % of villages,\n"
                                   "with their own icon.")
-                sl0.addWidget(tg)
+                sl0.put(tg)
         for d in (-1, 1):                        # (18/10) Nether / End structures
-            sbd, sld = _box(); lay.addWidget(sbd); self._sboxes[d] = sbd
+            sbd = QWidget(); sld = _Grid(sbd); lay.addWidget(sbd); self._sboxes[d] = sbd
             for key in cw.DIM_STRUCTURE_TYPES[d]:
                 tg = self._toggle(key, struct_icons.label(key), key)
                 if key == "end_city":
@@ -134,7 +419,7 @@ class LayersPanel(QWidget):
                 elif key == "end_gateway":
                     tg.setToolTip("Scattered return gateways of the outer islands (not the\n"
                                   "20 that appear when the dragon dies).")
-                sld.addWidget(tg)
+                sld.put(tg)
         # (10/10) 1.16 dungeons / lava lakes, with a Y range
         self._f116_box, f116l = _box()
         lay.addWidget(self._f116_box)
@@ -253,7 +538,8 @@ class LayersPanel(QWidget):
         ed.setToolTip("Palette editor: create / edit your own noise palettes")
         ed.clicked.connect(self.open_palette_editor)
         prow.addWidget(ed)
-        nl.addLayout(prow)
+        pal_row = QWidget(); prow.setContentsMargins(0, 6, 0, 0); pal_row.setLayout(prow)
+        lay.addWidget(pal_row)                   # (15/11) the palette can be chosen while the overlay is off
         self.opacity = LabeledSlider("Opacity", 5, 100, self.map.ov["opacity"] * 100, "{:.0f} %")
         self.opacity.changed.connect(lambda v: self.map.set_overlay(opacity=v / 100.0))
         nl.addWidget(self.opacity)
@@ -345,6 +631,7 @@ class LayersPanel(QWidget):
         self.size = LabeledSlider("Icon size", 12, 40, self.map.icon_px, "{:.0f} px")
         self.size.changed.connect(self._on_size)
         lay.addWidget(self.size)
+        self.size.hide()           # (19/11) sizes: the arrow of each chip, and Settings → Map → Icon size
         lay.addStretch(1)
 
         world.changed.connect(self._refresh_availability)
@@ -501,13 +788,30 @@ class LayersPanel(QWidget):
 
     # ── landmarks / structures ─────────────────────────────────────────────
     def _toggle(self, key, label, icon_key):
-        cb = QCheckBox(label)
-        cb.setIcon(_qicon(icon_key))
+        cb = LayerChip(label, _qicon(icon_key),
+                       struct_icons.color(icon_key) if struct_icons.known(icon_key) else theme.TEXT2)
         cb.setChecked(bool(self.map.visible.get(key, False)))
-        cb.setStyleSheet("QCheckBox { padding: 3px 0; }")
         cb.toggled.connect(lambda on, k=key: self._on_toggle(k, on))
+        if key != "__origin":                       # (15/11) its icon's size: the chip's arrow
+            cb.size_tag = size_tag(self.map.icon_scale(key))
+            cb.sizeRequested.connect(lambda chip, k=key, ik=icon_key, lb=label: self._size_popup(chip, k, ik, lb))
         self.boxes[key] = cb
         return cb
+
+    def _size_popup(self, chip, key, icon_key, label):
+        col = struct_icons.color(icon_key) if struct_icons.known(icon_key) else theme.ACCENT
+        pop = _SizePopup(self, icon_key, label, self.map.icon_px, self.map.icon_scale(key), col)
+        pop.picked.connect(lambda f, k=key, c=chip: self._set_icon_scale(k, f, c))
+        pop.adjustSize()
+        g = chip.mapToGlobal(chip.rect().bottomRight())
+        pop.move(g.x() - pop.width() + 4, g.y() + 4)
+        pop.show()
+
+    def _set_icon_scale(self, key, f, chip):
+        self.map.set_icon_scale(key, f)
+        chip.size_tag = size_tag(f)
+        chip.update()
+        _save_icon_style(self.map._style)
 
     def _on_toggle(self, key, on):
         self.map.visible[key] = on
@@ -572,6 +876,7 @@ class LayersPanel(QWidget):
     def _on_size(self, v):
         self.map.icon_px = int(v)
         self.map.update()
+        _save_icon_style(self.map._style)
 
     def _refresh_availability(self):
         for key, cb in self.boxes.items():
